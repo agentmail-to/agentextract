@@ -5,8 +5,7 @@ history — the "On … wrote:" reply chain, forwarded blocks, `>`-quotes — al
 boilerplate noise, leaving just the sender's new content. It's pure string/regex with no DOM parser
 and no ML, so it runs cheaply on a Lambda Node.js runtime.
 
-Email is the first content type it handles; the API is named to leave room for extracting from other
-content later, such as text-like attachments.
+AgentExtract is maintained and used by [AgentMail](https://www.agentmail.to).
 
 ## Install
 
@@ -63,6 +62,3 @@ from_header 89/84/81, gt_quote 85/77/76, foreign_verb 87/61/26, inline 91/38/22,
 npm install
 npm test
 ```
-
-The evaluation/audit harness (the `eval_*.ts` scripts) is intentionally **not** included here — it
-depends on a ~1.2GB message corpus and large answer-key files that don't belong in source control.
