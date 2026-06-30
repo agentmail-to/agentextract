@@ -9,9 +9,9 @@ import { extractEmailBody, stripNoise } from '../agentextract'
 // Build a multi-line body without fighting template-literal indentation.
 const t = (...lines: string[]) => lines.join('\n')
 // Run the text path and return just the extracted text.
-const ex = (text: string) => extractEmailBody({ text }).extracted_text
+const ex = (text: string) => extractEmailBody({ text }).extractedText
 // Run the HTML path and return just the extracted html.
-const exHtml = (html: string) => extractEmailBody({ html }).extracted_html
+const exHtml = (html: string) => extractEmailBody({ html }).extractedHtml
 
 // Plain Text Tests
 
@@ -1851,21 +1851,21 @@ describe('stripNoise', () => {
 
     // extractEmailBody NOW strips noise inline (text path): the quote is cut, then stripNoise removes
     // the trailing mobile auto-signature.
-    it('extractEmailBody strips trailing noise from extracted_text', () => {
+    it('extractEmailBody strips trailing noise from extractedText', () => {
         const raw = t('Thanks!', '', 'Sent from my iPhone')
-        expect(extractEmailBody({ text: raw }).extracted_text).toBe('Thanks!')
+        expect(extractEmailBody({ text: raw }).extractedText).toBe('Thanks!')
     })
     // HTML path strips noise too, via stripNoiseHtml (block-aware).
-    it('extractEmailBody strips trailing noise from extracted_html', () => {
+    it('extractEmailBody strips trailing noise from extractedHtml', () => {
         const html = '<div>Thanks!</div><div>Sent from my iPhone</div><div>This email is confidential.</div>'
-        expect(extractEmailBody({ html }).extracted_html).toBe('<div>Thanks!</div>')
+        expect(extractEmailBody({ html }).extractedHtml).toBe('<div>Thanks!</div>')
     })
     // GUARD: noise stripping must NOT eat a real reply that merely mentions a noise word in a sentence.
     it('does not strip a reply that mentions "confidential"/"unsubscribe" in a sentence', () => {
         const html = '<div>Please keep this confidential between us.</div>'
-        expect(extractEmailBody({ html }).extracted_html).toBe(html)
+        expect(extractEmailBody({ html }).extractedHtml).toBe(html)
         const text = 'Can you unsubscribe me from the weekly list?'
-        expect(extractEmailBody({ text }).extracted_text).toBe(text)
+        expect(extractEmailBody({ text }).extractedText).toBe(text)
     })
 })
 
