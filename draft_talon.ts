@@ -1,6 +1,5 @@
 // PLAIN TEXT VERSION 
 
-//
 const ATTRIBUTION_WRAP_WINDOW = 2
 
 // An "On ... wrote:" attribution can get glued onto the sender's reply text.
@@ -378,7 +377,7 @@ export const stripNoise = (text: string): string => {
     return lines.slice(0, cut).join('\n').trim()
 }
 
-// HTML counterpart to stripNoise — same NOISE_MARKERS, but block-aware. Walk the blocks top-down
+// HTML counterpart to stripNoise — same NOISE_MARKERS; block-aware. Walk the blocks top-down
 // and cut at the FIRST one whose visible text is boilerplate noise (mobile sig, footer, disclaimer),
 // dropping it and everything after. Mirrors stripNoise's "cut at the first noise line" on HTML.
 export const stripNoiseHtml = (html: string): string => {
