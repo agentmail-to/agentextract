@@ -1,5 +1,6 @@
-// PLAIN TEXT VERSION 
+// PLAIN TEXT VERSION
 
+// Max extra lines to stitch onto an "On … wrote:" attribution when it wraps across lines.
 const ATTRIBUTION_WRAP_WINDOW = 2
 
 // An "On ... wrote:" attribution can get glued onto the sender's reply text.
