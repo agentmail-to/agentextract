@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.DS_Store
+dist/
+coverage/
+
+# Large eval data (never commit) — corpus, answer keys, cached engine outputs
+*.jsonl
+threads.jsonl

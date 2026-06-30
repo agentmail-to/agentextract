@@ -1,0 +1,15 @@
+{
+  "name": "talon-extractor",
+  "version": "1.0.0",
+  "description": "In-house email quote/signature extractor — strips quoted history, keeps the sender's new content. Drop-in replacement for talonjs.",
+  "type": "commonjs",
+  "main": "draft_talon.ts",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.2"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
