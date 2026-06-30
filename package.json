@@ -1,7 +1,7 @@
 {
   "name": "agentextract",
   "version": "1.0.0",
-  "description": "In-house email quote/signature extractor — strips quoted history, keeps the sender's new content. Drop-in replacement for talonjs.",
+  "description": "In-house email quote/signature extractor — strips quoted history, keeps the sender's new content.",
   "type": "commonjs",
   "main": "agentextract.ts",
   "scripts": {

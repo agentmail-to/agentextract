@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 
-import { extractContent, stripNoise } from '../agentextract'
+import { extractEmailBody, stripNoise } from '../agentextract'
 
 // ---------------------------------------------------------------------------
 // Synthetic Tests for my code (agentextract.ts)
@@ -9,13 +9,13 @@ import { extractContent, stripNoise } from '../agentextract'
 // Build a multi-line body without fighting template-literal indentation.
 const t = (...lines: string[]) => lines.join('\n')
 // Run the text path and return just the extracted text.
-const ex = (text: string) => extractContent({ text }).extracted_text
+const ex = (text: string) => extractEmailBody({ text }).extracted_text
 // Run the HTML path and return just the extracted html.
-const exHtml = (html: string) => extractContent({ html }).extracted_html
+const exHtml = (html: string) => extractEmailBody({ html }).extracted_html
 
 // Plain Text Tests
 
-describe('extractContent — plain text — core signals', () => {
+describe('extractEmailBody — plain text — core signals', () => {
     // The one big CHANGE (from our data). Agent-generated mail uses ISO timestamps
     // with NO comma: "On 2025-05-15T17:36:04.391Z ... wrote:". Talon's attribution
     // regex requires a comma (it was built for human-written mail), so it never
@@ -281,7 +281,7 @@ describe('extractContent — plain text — core signals', () => {
 // require "foreign verb somewhere, ':' at the end". We deliberately do NOT key on begin-
 // words (Le/Il/Am) — too common, too false-positive-prone. Spanish + Italian are bonus:
 // Python-Talon misses those too, so we beat both libs. Source: our data (scan_corpus_langs.js).
-describe('extractContent — plain text — foreign-language attributions', () => {
+describe('extractEmailBody — plain text — foreign-language attributions', () => {
     const cases: Array<[string, string]> = [
         ['French', 'Le dim. 13 avr. 2025 à 12:24, Hunter <hunter@hunterscouts.co> a écrit :'],
         ['Spanish', 'El 13 abr 2025 a las 12:24, Hunter <hunter@hunterscouts.co> escribió:'],
@@ -307,7 +307,7 @@ describe('extractContent — plain text — foreign-language attributions', () =
 // one line too LOW and KEEPING the lead-in ("El mar, ... Hunter (email)") as if it were sender content
 // (over-keep). Signal 6b mirrors Signal 3's wrap window, anchored on the date fingerprint (year + clock),
 // to cut at the lead-in instead. Source: foreign_verb over-keep residuals (31 cases).
-describe('extractContent — plain text — WRAPPED foreign attributions', () => {
+describe('extractEmailBody — plain text — WRAPPED foreign attributions', () => {
     it('cuts at the LEAD-IN line of a wrapped Spanish "escribió:" attribution', () => {
         const text = t(
             'Yeah! Do you think that you can give me a call?',
@@ -360,7 +360,7 @@ describe('extractContent — plain text — WRAPPED foreign attributions', () =>
 //   - 发件人 ("From") header at start of line:     "发件人：Marco F. <...>"
 // Both markers are distinctive (they don't occur in normal content), so no guard needed
 // beyond anchoring 写道 to the end. Source: our data (scan_chinese.js).
-describe('extractContent — plain text — Chinese', () => {
+describe('extractEmailBody — plain text — Chinese', () => {
     // 写道 (wrote) reply attribution — verb at the end, full-width colon.
     it('cuts at a Chinese "写道：" (wrote) attribution line', () => {
         const text = t(
@@ -411,7 +411,7 @@ describe('extractContent — plain text — Chinese', () => {
 // Arabic (RTL). كتب ("wrote") is verb-last like Chinese 写道, with the colon at the LOGICAL end of
 // the stored string. We key on verb + end-colon only, so RTL order and Arabic-Indic date digits
 // (٢٠٢٥) never matter. Source: our data (discover_patterns.ts — Arabic attributions survived).
-describe('extractContent — plain text — Arabic', () => {
+describe('extractEmailBody — plain text — Arabic', () => {
     // كتب: attribution (verb-last, ASCII colon at the logical end).
     it('cuts at an Arabic "… كتب:" (wrote) attribution', () => {
         const text = t(
@@ -436,7 +436,7 @@ describe('extractContent — plain text — Arabic', () => {
 // GUARD asymmetry: from/von cut on email OR a following localized Sent/Date; the short common-
 // word labels de/van/da require an EMAIL on the line (no Sent/Date-only path), since "de"/"van"/
 // "da" are everyday words. Source: our data (combined_audit.ts) + the de/van/da over-cut audit.
-describe('extractContent — plain text — localized headers', () => {
+describe('extractEmailBody — plain text — localized headers', () => {
     // CUT: German Von: header, email on the line.
     it('cuts at a German "Von:" header block (email on the line)', () => {
         const text = t(
@@ -613,7 +613,7 @@ describe('extractContent — plain text — localized headers', () => {
 // as "<date+time> Name <email>:" — no "wrote", so the On/verb signals miss it. We require all
 // three fingerprints (year + clock time + trailing "<email>:") to keep the over-cut risk low.
 // Source: our data (discover_patterns.ts — Cyrillic 0.19% surviving) + Talon's date+email splitters.
-describe('extractContent — plain text — date-led attributions (no verb)', () => {
+describe('extractEmailBody — plain text — date-led attributions (no verb)', () => {
     // Russian Gmail attribution — ends in "<email>:", no verb.
     it('cuts at a Russian "<date>, Name <email>:" attribution (no verb)', () => {
         const text = t(
@@ -653,7 +653,7 @@ describe('extractContent — plain text — date-led attributions (no verb)', ()
 // Dashed Android attribution (Signal 9). The Android client wraps the attribution in dashes and
 // drops the colon: "---- On <date> … wrote ----". Signal 3 misses it (no leading "On", no
 // trailing "wrote:"). Safety hedge: a colon-less "wrote" is accepted ONLY when wrapped in dashes.
-describe('extractContent — plain text — dashed Android attribution', () => {
+describe('extractEmailBody — plain text — dashed Android attribution', () => {
     // CUT: the real Android format — "---- On <date> Name <email> wrote ----" (no colon).
     it('cuts at a dashed "---- On … wrote ----" attribution (no colon)', () => {
         const text = t(
@@ -687,7 +687,7 @@ describe('extractContent — plain text — dashed Android attribution', () => {
 
 // Defensive client formats — ABSENT in our corpus but real clients in the wild, so adding them can't regress
 // (0 cases here) yet gives coverage for clients this dataset didn't include. Source: Talon SPLITTER_PATTERNS.
-describe('extractContent — plain text — defensive client formats', () => {
+describe('extractEmailBody — plain text — defensive client formats', () => {
     // Exim / some clients render "On <date> <somebody> sent:" instead of "wrote:". Signal 3 accepts "sent:"
     // too — but only with an attribution marker (an email) in the window, since "sent:" is common in prose.
     it('cuts at an "On … <email> sent:" attribution (sent-verb variant)', () => {
@@ -728,7 +728,7 @@ describe('extractContent — plain text — defensive client formats', () => {
 
 // Talon-parity regression locks. We already pass these implicitly; the tests exist so a future
 // change can't silently break behaviors Talon explicitly covers. Source: talon-python tests.
-describe('extractContent — plain text — Talon-parity regression locks', () => {
+describe('extractEmailBody — plain text — Talon-parity regression locks', () => {
     // 3-line wrapped attribution: a long sender pushes "wrote:" onto a 3rd line. Our window is
     // ATTRIBUTION_WRAP_WINDOW=2 (this line + 2 = 3 lines), so the contiguous join still matches.
     // Mirrors Talon's test_quotation_separator_takes_3_lines.
@@ -768,7 +768,7 @@ describe('extractContent — plain text — Talon-parity regression locks', () =
 
 // Newly folded-in additions (from the fresh eval residual scan): lone/nested ">"-quoted attributions,
 // Turkish/Romanian foreign verbs, Office-365 / "rejected your message" bounces, and FW:/Fwd: forwards.
-describe('extractContent — plain text — lone/nested ">" attributions', () => {
+describe('extractEmailBody — plain text — lone/nested ">" attributions', () => {
     // A LONE ">" line (no run of two) that is itself a quoted attribution must still cut — otherwise the
     // run-of-2 guard leaves a dangling "> On … wrote:" orphan. We de-quote the line and re-test the signals.
     it('cuts a LONE ">"-quoted "On … wrote:" attribution (no run of two)', () => {
@@ -797,7 +797,7 @@ describe('extractContent — plain text — lone/nested ">" attributions', () =>
     })
 })
 
-describe('extractContent — plain text — Turkish / Romanian attributions', () => {
+describe('extractEmailBody — plain text — Turkish / Romanian attributions', () => {
     // Turkish: verb-last "şunu yazdı:" ("wrote"), with a Turkish date lead-in ("… tarihinde …"). Same shape
     // as the French/Spanish batch, so it slots into the foreign-verb signal.
     it('cuts at a Turkish "… yazdı:" attribution line', () => {
@@ -819,7 +819,7 @@ describe('extractContent — plain text — Turkish / Romanian attributions', ()
     })
 })
 
-describe('extractContent — plain text — Office-365 / inline bounces kept whole', () => {
+describe('extractEmailBody — plain text — Office-365 / inline bounces kept whole', () => {
     // Office-365 bounce that LEADS with a logo-URL line before the headline — isTrueDsn skips the decorative
     // line and matches "Your message TO <addr> couldn't be delivered" (recipient text between message+verb).
     it('keeps an Office-365 bounce whole even when it leads with a logo-URL line', () => {
@@ -861,7 +861,7 @@ describe('extractContent — plain text — Office-365 / inline bounces kept who
     })
 })
 
-describe('extractContent — plain text — FW:/Fwd: pasted forwards kept whole', () => {
+describe('extractEmailBody — plain text — FW:/Fwd: pasted forwards kept whole', () => {
     // A body that LEADS with "FW:"/"Fwd:" is a pasted forward; its inner From: header must not chop the
     // forwarded body. CEO decision: forwards are KEPT whole.
     it('keeps a "FW:" pasted forward whole (inner From: header does not cut)', () => {
@@ -893,7 +893,7 @@ describe('extractContent — plain text — FW:/Fwd: pasted forwards kept whole'
     })
 })
 
-describe('extractContent — new outbound Gmail/UTC attribution format', () => {
+describe('extractEmailBody — new outbound Gmail/UTC attribution format', () => {
     // Our outbound attribution moved from the ISO timestamp to the Gmail-style "On <wkday>, <Mon> <d>, <year>
     // at <h>:<mm> <AM/PM> UTC … wrote:" form. It carries a comma + "wrote:", so Signal 3 catches it directly.
     it('cuts at the new "On … at … UTC … wrote:" outbound attribution (text)', () => {
@@ -916,7 +916,7 @@ describe('extractContent — new outbound Gmail/UTC attribution format', () => {
 
 // Keep / Guard Tests
 
-describe('extractContent — plain text — keep / guard', () => {
+describe('extractEmailBody — plain text — keep / guard', () => {
     // No quote signal anywhere -> return the whole email untouched. This is the
     // large "no quote" share of real mail (~55%). Source: our golden-set email [1]
     // ("Hello ... Cheers, Nel").
@@ -1078,7 +1078,7 @@ describe('extractContent — plain text — keep / guard', () => {
 // anchored on the FIRST non-blank line (bounce headline or bare report field), so a real bounce is kept
 // whole while a reply that merely QUOTES a bounce (sender prose on top) still strips normally. Source: the
 // DSN corpus audit — the answer key wrongly discarded/chopped most true bounces; CEO says keep them whole.
-describe('extractContent — plain text — DSN bounces kept whole', () => {
+describe('extractEmailBody — plain text — DSN bounces kept whole', () => {
     // Gmail bounce — leads with "** Address not found **". Kept whole (Example B from the audit).
     it('keeps a Gmail "** Address not found **" bounce whole', () => {
         const text = t(
@@ -1160,7 +1160,7 @@ describe('extractContent — plain text — DSN bounces kept whole', () => {
 // RFC-3676 "-- " delimiter and reattaches from it to the end — but ONLY when the block between the cut and
 // the "-- " is >=50% ">"-prefixed, so the "-- " is unambiguously the SENDER's sig trailing a real quote.
 // Source: ~578 text splits in our corpus (verify_cuts.ts) + the gpt-4o key's mislabeling of these.
-describe('extractContent — plain text — trailing-signature rescue', () => {
+describe('extractEmailBody — plain text — trailing-signature rescue', () => {
     // CORE: reply, an "On...wrote:" quote, then a bare "-- " signature below it. We keep the reply AND the
     // signature, dropping only the quote in the middle (a hole, not a single trailing cut).
     it('reattaches a trailing "-- " signature below a ">" quote (the split rescue)', () => {
@@ -1251,7 +1251,7 @@ describe('extractContent — plain text — trailing-signature rescue', () => {
 // quote), a single cut would drop the inline prose and lose meaning. So we KEEP THE WHOLE message (like
 // forwards/DSN). Safe by construction — keeping whole never loses content. We fire ONLY on ">"-RUN quotes,
 // not attribution-only quoting, and only on blank-separated substantial prose (so wrapped quotes don't count).
-describe('extractContent — plain text — inline-reply guard', () => {
+describe('extractEmailBody — plain text — inline-reply guard', () => {
     // CORE: new prose between two ">"-quote blocks → keep the whole message.
     it('keeps an interleaved reply whole (prose sandwiched between ">" blocks)', () => {
         const text = t(
@@ -1332,7 +1332,7 @@ describe('extractContent — plain text — inline-reply guard', () => {
 })
 
 // DSN bounces in HTML — same CEO keep-whole rule, anchored on the first visible (de-tagged) line.
-describe('extractContent — HTML — DSN bounces kept whole', () => {
+describe('extractEmailBody — HTML — DSN bounces kept whole', () => {
     it('keeps an HTML bounce whole even with an embedded From: header (would otherwise cut at marker #5)', () => {
         const html =
             '<div>Delivery has failed to these recipients or groups:</div>' +
@@ -1359,7 +1359,7 @@ describe('extractContent — HTML — DSN bounces kept whole', () => {
 // slice the HTML before it, then clean (strip comments) + trim. Quotes are overwhelmingly
 // TRAILING siblings after the reply, so a slice works for the bulk. We work biggest→smallest
 // marker, same as text. Source: our data (scan_html2.js) + Talon's cut_* selectors.
-describe('extractContent — HTML — quote markers', () => {
+describe('extractEmailBody — HTML — quote markers', () => {
     // #1 by volume (44.5% of HTML mail): Gmail wraps quoted history in a trailing
     // <div class="gmail_quote ..."> (modern Gmail adds "gmail_quote_container", so we match
     // gmail_quote as a SUBSTRING of the class, not the exact class). Slice before that div.
@@ -1712,7 +1712,7 @@ describe('extractContent — HTML — quote markers', () => {
 // HTML trailing-signature REATTACH — one test per regex/guard in reattachTrailingSignature +
 // trimTrailingNoise. The cutter slices at the quote; this rescues a sender signature stranded BELOW
 // it (reply → quote → sig) but never a forward/more-quote, and trims any legal footer glued under it.
-describe('extractContent — HTML — trailing-signature reattach (guards)', () => {
+describe('extractEmailBody — HTML — trailing-signature reattach (guards)', () => {
     // looksLikeSig signal #1 — RFC-3676 "-- " delimiter (non-Gmail clients).
     it('reattaches a sig marked only by a "-- " delimiter', () => {
         expect(exHtml('<div>My reply.</div><blockquote>old quoted</blockquote><div>-- </div><div>John Doe</div><div>john@acme.com</div>'))
@@ -1791,7 +1791,7 @@ describe('extractContent — HTML — trailing-signature reattach (guards)', () 
 
 /////////////////////////////////////////////////////////////
 
-// stripNoise — now applied INSIDE extractContent (text path; stripNoiseHtml for HTML). Tested here in
+// stripNoise — now applied INSIDE extractEmailBody (text path; stripNoiseHtml for HTML). Tested here in
 // isolation. We KEEP meaning (the message + the sender's name/title/company) and drop only trailing
 // BOILERPLATE noise: mobile auto-sigs, marketing/list footers, legal disclaimers.
 // Keep-by-default. This replaces the old blanket "--" cut, which deleted the meaningful name.
@@ -1849,23 +1849,23 @@ describe('stripNoise', () => {
         expect(stripNoise(t('Can you unsubscribe me from the weekly list?'))).toBe('Can you unsubscribe me from the weekly list?')
     })
 
-    // extractContent NOW strips noise inline (text path): the quote is cut, then stripNoise removes
+    // extractEmailBody NOW strips noise inline (text path): the quote is cut, then stripNoise removes
     // the trailing mobile auto-signature.
-    it('extractContent strips trailing noise from extracted_text', () => {
+    it('extractEmailBody strips trailing noise from extracted_text', () => {
         const raw = t('Thanks!', '', 'Sent from my iPhone')
-        expect(extractContent({ text: raw }).extracted_text).toBe('Thanks!')
+        expect(extractEmailBody({ text: raw }).extracted_text).toBe('Thanks!')
     })
     // HTML path strips noise too, via stripNoiseHtml (block-aware).
-    it('extractContent strips trailing noise from extracted_html', () => {
+    it('extractEmailBody strips trailing noise from extracted_html', () => {
         const html = '<div>Thanks!</div><div>Sent from my iPhone</div><div>This email is confidential.</div>'
-        expect(extractContent({ html }).extracted_html).toBe('<div>Thanks!</div>')
+        expect(extractEmailBody({ html }).extracted_html).toBe('<div>Thanks!</div>')
     })
     // GUARD: noise stripping must NOT eat a real reply that merely mentions a noise word in a sentence.
     it('does not strip a reply that mentions "confidential"/"unsubscribe" in a sentence', () => {
         const html = '<div>Please keep this confidential between us.</div>'
-        expect(extractContent({ html }).extracted_html).toBe(html)
+        expect(extractEmailBody({ html }).extracted_html).toBe(html)
         const text = 'Can you unsubscribe me from the weekly list?'
-        expect(extractContent({ text }).extracted_text).toBe(text)
+        expect(extractEmailBody({ text }).extracted_text).toBe(text)
     })
 })
 

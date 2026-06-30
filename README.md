@@ -3,15 +3,17 @@
 In-house email quote & signature extractor. Given an email's `text` and/or `html`, it strips the
 quoted history — the "On … wrote:" reply chain, forwarded blocks, `>`-quotes — along with trailing
 boilerplate noise, leaving just the sender's new content. It's pure string/regex with no DOM parser
-and no ML, so it runs cheaply on a Lambda Node.js runtime. Built as a drop-in replacement for
-[talonjs](https://www.npmjs.com/package/talonjs).
+and no ML, so it runs cheaply on a Lambda Node.js runtime.
+
+Email is the first content type it handles; the API is named to leave room for extracting from other
+content later, such as text-like attachments.
 
 ## Usage
 
 ```ts
-import { extractContent } from './agentextract'
+import { extractEmailBody } from './agentextract'
 
-const { extracted_text, extracted_html } = extractContent({
+const { extracted_text, extracted_html } = extractEmailBody({
   text: 'Sounds good!\n\nOn Mon, Jun 1 Bob <bob@x.com> wrote:\n> old quoted message',
   html: '<div>Sounds good!</div><blockquote>old quoted message</blockquote>',
 })
@@ -20,9 +22,9 @@ const { extracted_text, extracted_html } = extractContent({
 
 ## API
 
-`extractContent({ text?, html? })` → `{ extracted_text?, extracted_html? }` is the main entry point.
-It runs the quote cut and noise-strip on whichever fields you pass; a field that throws is dropped
-from the result rather than failing the whole call.
+`extractEmailBody({ text?, html? })` → `{ extracted_text?, extracted_html? }` is the main entry
+point. It runs the quote cut and noise-strip on whichever fields you pass; a field that throws is
+dropped from the result rather than failing the whole call.
 
 The underlying stages are exported too, if you need them on their own:
 
