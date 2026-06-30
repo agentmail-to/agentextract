@@ -1,9 +1,12 @@
 {
   "name": "agentextract",
-  "version": "1.0.0",
+  "version": "0.1.0",
   "description": "Email quote & signature extractor — strips quoted history and boilerplate, keeping the sender's new content. Pure regex: no DOM parser, no ML.",
   "license": "MIT",
-  "author": "AgentMail",
+  "author": {
+    "name": "AgentMail",
+    "url": "https://www.agentmail.to"
+  },
   "homepage": "https://github.com/agentmail-to/agentextract#readme",
   "repository": {
     "type": "git",
