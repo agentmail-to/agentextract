@@ -18,16 +18,16 @@ npm install agentextract
 ```ts
 import { extractEmailBody } from 'agentextract'
 
-const { extracted_text, extracted_html } = extractEmailBody({
+const { extractedText, extractedHtml } = extractEmailBody({
   text: 'Sounds good!\n\nOn Mon, Jun 1 Bob <bob@x.com> wrote:\n> old quoted message',
   html: '<div>Sounds good!</div><blockquote>old quoted message</blockquote>',
 })
-// extracted_text === 'Sounds good!'
+// extractedText === 'Sounds good!'
 ```
 
 ## API
 
-`extractEmailBody({ text?, html? })` → `{ extracted_text?, extracted_html? }` is the main entry
+`extractEmailBody({ text?, html? })` → `{ extractedText?, extractedHtml? }` is the main entry
 point. It runs the quote cut and noise-strip on whichever fields you pass; a field that throws is
 dropped from the result rather than failing the whole call.
 

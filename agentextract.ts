@@ -397,12 +397,12 @@ export const stripNoiseHtml = (html: string): string => {
 // body. Named extractEmailBody (rather than a generic "extract") to leave room for
 // future extractors over non-email content, e.g. text-like attachments.
 export const extractEmailBody = ({ text, html }: { text?: string; html?: string }) => {
-    const result: { extracted_text?: string; extracted_html?: string } = {}
+    const result: { extractedText?: string; extractedHtml?: string } = {}
 
     if (text) {
         try {
             // Cut the quote, then strip trailing boilerplate noise (mobile sigs, footers, disclaimers).
-            result.extracted_text = stripNoise(extractNewContent(text))
+            result.extractedText = stripNoise(extractNewContent(text))
         } catch (error) {
             console.warn('extractEmailBody failed on text:', error)
         }
@@ -410,7 +410,7 @@ export const extractEmailBody = ({ text, html }: { text?: string; html?: string 
 
     if (html) {
         try {
-            result.extracted_html = stripNoiseHtml(extractFromHtml(html))
+            result.extractedHtml = stripNoiseHtml(extractFromHtml(html))
         } catch (error) {
             console.warn('extractEmailBody failed on html:', error)
         }
