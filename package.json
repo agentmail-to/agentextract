@@ -1,15 +1,53 @@
 {
   "name": "agentextract",
   "version": "1.0.0",
-  "description": "In-house email quote/signature extractor — strips quoted history, keeps the sender's new content.",
+  "description": "Email quote & signature extractor — strips quoted history and boilerplate, keeping the sender's new content. Pure regex: no DOM parser, no ML.",
+  "license": "MIT",
+  "author": "AgentMail",
+  "homepage": "https://github.com/agentmail-to/agentextract#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentmail-to/agentextract.git"
+  },
+  "bugs": {
+    "url": "https://github.com/agentmail-to/agentextract/issues"
+  },
+  "keywords": [
+    "email",
+    "quote",
+    "signature",
+    "reply",
+    "quoted-text",
+    "extract",
+    "quotation",
+    "talon",
+    "text",
+    "html"
+  ],
   "type": "commonjs",
-  "main": "agentextract.ts",
+  "main": "dist/agentextract.js",
+  "types": "dist/agentextract.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/agentextract.d.ts",
+      "default": "./dist/agentextract.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
-    "test": "vitest run"
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run test"
   },
   "devDependencies": {
+    "typescript": "^6.0.3",
     "vitest": "^4.1.2"
-  },
-  "license": "UNLICENSED",
-  "private": true
+  }
 }

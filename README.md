@@ -1,17 +1,23 @@
 # AgentExtract
 
-In-house email quote & signature extractor. Given an email's `text` and/or `html`, it strips the
-quoted history — the "On … wrote:" reply chain, forwarded blocks, `>`-quotes — along with trailing
+Email quote & signature extractor. Given an email's `text` and/or `html`, it strips the quoted
+history — the "On … wrote:" reply chain, forwarded blocks, `>`-quotes — along with trailing
 boilerplate noise, leaving just the sender's new content. It's pure string/regex with no DOM parser
 and no ML, so it runs cheaply on a Lambda Node.js runtime.
 
 Email is the first content type it handles; the API is named to leave room for extracting from other
 content later, such as text-like attachments.
 
+## Install
+
+```sh
+npm install agentextract
+```
+
 ## Usage
 
 ```ts
-import { extractEmailBody } from './agentextract'
+import { extractEmailBody } from 'agentextract'
 
 const { extracted_text, extracted_html } = extractEmailBody({
   text: 'Sounds good!\n\nOn Mon, Jun 1 Bob <bob@x.com> wrote:\n> old quoted message',
