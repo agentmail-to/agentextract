@@ -6,6 +6,6 @@
         "declaration": true,
         "noEmit": false
     },
-    "include": ["agentextract.ts"],
+    "include": ["agentextract.ts", "attachextract.ts"],
     "exclude": ["node_modules", "dist", "tests"]
 }
