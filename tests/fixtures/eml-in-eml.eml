@@ -1,0 +1,37 @@
+From: alice@example.com
+To: bob@example.com
+Subject: Fwd: inner thread
+Date: Mon, 1 Jan 2024 10:00:00 +0000
+Message-ID: <outer-1@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="OUTER"
+
+--OUTER
+Content-Type: text/plain; charset=utf-8
+
+Forwarding the thread below.
+
+--OUTER
+Content-Type: message/rfc822
+Content-Disposition: attachment; filename="inner.eml"
+
+From: carol@example.com
+To: alice@example.com
+Subject: Inner subject
+Date: Mon, 1 Jan 2024 09:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="INNER"
+
+--INNER
+Content-Type: text/plain; charset=utf-8
+
+Inner email body text.
+
+--INNER
+Content-Type: text/plain; name="deep.txt"
+Content-Disposition: attachment; filename="deep.txt"
+
+This deep attachment must not be descended into.
+--INNER--
+
+--OUTER--

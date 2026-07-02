@@ -1,0 +1,13 @@
+From: alice@example.com
+To: bob@example.com
+Subject: Meeting notes
+Date: Mon, 1 Jan 2024 10:00:00 +0000
+Message-ID: <plain-1@example.com>
+Content-Type: text/plain; charset=utf-8
+
+Hello Bob,
+
+Here are the notes from our meeting.
+
+Thanks,
+Alice

@@ -1,0 +1,19 @@
+From: alice@example.com
+To: bob@example.com
+Subject: Report attached
+Date: Mon, 1 Jan 2024 10:00:00 +0000
+Message-ID: <nested-1@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="BOUNDARY123"
+
+--BOUNDARY123
+Content-Type: text/plain; charset=utf-8
+
+Please find the attached report.
+
+--BOUNDARY123
+Content-Type: text/plain; charset=utf-8; name="report.txt"
+Content-Disposition: attachment; filename="report.txt"
+
+Quarterly report contents: revenue up twenty percent.
+--BOUNDARY123--

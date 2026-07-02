@@ -306,3 +306,57 @@ describe('attachextract — image-awareness signals', () => {
         expect(r.lowTextDensity).toBeFalsy()
     })
 })
+
+// EML handler (nested email) -------------------------------------------------
+
+describe('attachextract — eml handler', () => {
+    // Subject + text body of a forwarded email.
+    it('extracts subject and text body', async () => {
+        const r = await extractAttachment({ content: fixture('plain.eml'), contentType: 'message/rfc822', filename: 'plain.eml' })
+        expect(r.status).toBe('extracted')
+        expect(r.detectedType).toBe('eml')
+        expect(r.extractedText).toContain('Meeting notes') // subject
+        expect(r.extractedText).toContain('notes from our meeting') // body
+    })
+
+    // No text part -> the html body is flattened through the shared HTML path.
+    it('falls back to the html body when there is no text part', async () => {
+        const r = await extractAttachment({ content: fixture('html-only.eml'), contentType: 'message/rfc822' })
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText).toContain('HTML only email body')
+    })
+
+    // A forwarded email's own attachment is recursed back through the pipeline.
+    it('recurses into inner attachments as children', async () => {
+        const r = await extractAttachment({ content: fixture('nested-attachment.eml'), contentType: 'message/rfc822' })
+        expect(r.extractedText).toContain('Please find the attached report')
+        expect(r.children).toHaveLength(1)
+        expect(r.children?.[0].detectedType).toBe('text')
+        expect(r.children?.[0].status).toBe('extracted')
+        expect(r.children?.[0].extractedText).toContain('Quarterly report')
+    })
+
+    // Depth cap: an email nested inside an email is body-read, but we do NOT descend
+    // into its own attachments (deep.txt must never appear).
+    it('stops at one level of nesting (MAX_NESTING_DEPTH)', async () => {
+        const r = await extractAttachment({ content: fixture('eml-in-eml.eml'), contentType: 'message/rfc822' })
+        expect(r.children).toHaveLength(1)
+        const inner = r.children![0]
+        expect(inner.detectedType).toBe('eml')
+        expect(inner.extractedText).toContain('Inner email body text')
+        expect(inner.children).toBeUndefined() // deep.txt NOT descended into
+        expect(JSON.stringify(r)).not.toContain('descended') // deep.txt content never surfaces
+    })
+
+    // Routing: recognized by extension when the type lies.
+    it('routes an eml by extension', async () => {
+        const r = await extractAttachment({ content: fixture('plain.eml'), contentType: 'application/octet-stream', filename: 'forward.eml' })
+        expect(r.routedBy).toBe('extension')
+        expect(r.detectedType).toBe('eml')
+    })
+
+    // NB: there is no "inner attachment over 10 MB" test on purpose — an inner attachment
+    // is always a subset of the (<=10 MB) outer email, so the outer size gate trips first
+    // and the inner cap is unreachable in a single eml. Each child still runs the same
+    // gated pipeline via extractAt(depth + 1).
+})

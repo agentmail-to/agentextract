@@ -224,25 +224,30 @@ const textHandler: Handler = {
 // that only ever sees text attachments never pays to load pdf.js / mammoth, and so
 // the ESM-only `unpdf` loads cleanly from this CommonJS module.
 
+// Shared HTML -> visible-text flattening, used by the html handler and reused by the
+// eml handler for html-only forwarded bodies. Never regex-strips tags — html-to-text
+// walks the DOM; script/style/img are dropped and hrefs ignored.
+const flattenHtml = async (html: string): Promise<string> => {
+    const { convert } = await import('html-to-text')
+    return convert(html, {
+        wordwrap: false,
+        selectors: [
+            { selector: 'img', format: 'skip' },
+            { selector: 'a', options: { ignoreHref: true } },
+            { selector: 'script', format: 'skip' },
+            { selector: 'style', format: 'skip' },
+        ],
+    })
+}
+
 const htmlHandler: Handler = {
     kind: 'html',
     contentTypes: ['text/html', 'application/xhtml+xml'],
     extensions: ['.html', '.htm', '.xhtml'],
-    // HTML bytes can be non-utf8 too, so decode with the same charset logic first,
-    // then flatten. Never regex-strip tags — html-to-text walks the DOM.
+    // HTML bytes can be non-utf8 too, so decode with the same charset logic first.
     extract: async ({ content, charsetHint }) => {
         const { text: decoded, charset } = decodeText(content, charsetHint)
-        const { convert } = await import('html-to-text')
-        const text = convert(decoded, {
-            wordwrap: false,
-            selectors: [
-                { selector: 'img', format: 'skip' },
-                { selector: 'a', options: { ignoreHref: true } },
-                { selector: 'script', format: 'skip' },
-                { selector: 'style', format: 'skip' },
-            ],
-        })
-        return { text, charset }
+        return { text: await flattenHtml(decoded), charset }
     },
 }
 
@@ -284,7 +289,50 @@ const docxHandler: Handler = {
     },
 }
 
-const REGISTRY: Handler[] = [textHandler, htmlHandler, pdfHandler, docxHandler]
+const emlHandler: Handler = {
+    kind: 'eml',
+    contentTypes: ['message/rfc822'],
+    extensions: ['.eml'],
+    // A forwarded/attached email. Take its subject + text body (html body flattened via
+    // the shared HTML path when there's no text part), then recurse each inner attachment
+    // back through the pipeline. MAX_NESTING_DEPTH bounds this: an email nested inside an
+    // email is body-read, but its own attachments are not descended into (email-bomb guard).
+    extract: async ({ content, depth }) => {
+        const { simpleParser } = await import('mailparser')
+        // Skip mailparser's own html<->text synthesis so our HTML handler owns that path.
+        const parsed = await simpleParser(content, {
+            skipHtmlToText: true,
+            skipTextToHtml: true,
+            skipImageLinks: true,
+            skipTextLinks: true,
+        })
+
+        const body = parsed.text?.trim() ? parsed.text : parsed.html ? await flattenHtml(parsed.html) : ''
+        const text = [parsed.subject, body].filter((part) => part && part.trim().length > 0).join('\n\n')
+
+        // Each inner attachment is a first-class attachment: its own size cap, routing, and
+        // fail-open handling, via the same entry point at depth + 1.
+        const children =
+            depth < MAX_NESTING_DEPTH && parsed.attachments.length > 0
+                ? await Promise.all(
+                      parsed.attachments.map((attachment) =>
+                          extractAt(
+                              {
+                                  content: attachment.content,
+                                  filename: attachment.filename,
+                                  contentType: attachment.contentType,
+                              },
+                              depth + 1
+                          )
+                      )
+                  )
+                : undefined
+
+        return { text, children }
+    },
+}
+
+const REGISTRY: Handler[] = [textHandler, htmlHandler, pdfHandler, docxHandler, emlHandler]
 
 const findHandler = (kind: HandlerKind): Handler | undefined => REGISTRY.find((h) => h.kind === kind)
 
