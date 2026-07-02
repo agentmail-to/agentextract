@@ -261,3 +261,48 @@ describe('attachextract — docx handler', () => {
         expect(r.status).toBe('extracted')
     })
 })
+
+// Image-awareness signals (for a future OCR pass) ----------------------------
+// We never read the images (no OCR), but we label docs that likely hold unread text.
+
+describe('attachextract — image-awareness signals', () => {
+    // Normal text PDF: real text, no image pages, no flag.
+    it('does not flag a normal text PDF', async () => {
+        const r = await extractAttachment({ content: fixture('sample.pdf'), contentType: 'application/pdf' })
+        expect(r.status).toBe('extracted')
+        expect(r.lowTextDensity).toBeFalsy()
+        expect(r.pageCount).toBe(1)
+        expect(r.emptyPageCount).toBe(0)
+    })
+
+    // Sparse PDF: real text is KEPT (not discarded), but flagged as likely image-heavy.
+    it('keeps sparse PDF text but flags lowTextDensity', async () => {
+        const r = await extractAttachment({ content: fixture('sparse.pdf'), contentType: 'application/pdf' })
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText).toContain('Hi')
+        expect(r.lowTextDensity).toBe(true)
+    })
+
+    // Text-less (scanned-style) PDF: extracted_empty, with page counts reported so an
+    // OCR pass knows how many pages to render.
+    it('reports a text-less PDF as extracted_empty with page counts', async () => {
+        const r = await extractAttachment({ content: fixture('blank.pdf'), contentType: 'application/pdf' })
+        expect(r.status).toBe('extracted_empty')
+        expect(r.pageCount).toBe(1)
+        expect(r.emptyPageCount).toBe(1)
+    })
+
+    // DOCX with an embedded image but little text: content is probably in the image.
+    it('flags a docx with images and little text', async () => {
+        const r = await extractAttachment({ content: fixture('image.docx'), contentType: DOCX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText).toContain('Report')
+        expect(r.lowTextDensity).toBe(true)
+    })
+
+    // A text-rich docx (no media) is not flagged.
+    it('does not flag a text-only docx', async () => {
+        const r = await extractAttachment({ content: fixture('sample.docx'), contentType: DOCX_TYPE })
+        expect(r.lowTextDensity).toBeFalsy()
+    })
+})

@@ -49,9 +49,15 @@ const SNIFF_TEXT_RATIO = 0.85
 const DETECT_SAMPLE_BYTES = 64 * 1024
 const DETECT_MIN_CONFIDENCE = 0.7
 
-// Scanned PDFs carry an image layer but little/no text. Below this average number of
-// characters per page we report extracted_empty rather than returning stray noise.
+// Below this average characters/page, a PDF that still has *some* text is flagged
+// lowTextDensity (likely image-heavy) — not discarded. A PDF with zero text is
+// extracted_empty instead. Both are OCR candidates downstream.
 const PDF_MIN_CHARS_PER_PAGE = 50
+
+// A .docx is a zip; embedded images live under word/media/. extractRawText drops them,
+// so if a docx carries media but little text, its content is probably in the images.
+const DOCX_MEDIA_MARKER = Buffer.from('word/media/')
+const DOCX_MIN_TEXT_CHARS = 200
 
 /////////////////////////////////////////////////////////////
 // TYPES
@@ -87,6 +93,13 @@ export interface ExtractionResult {
     extractedText?: string // set on 'extracted'
     extractionVersion: string
     children?: ExtractionResult[] // .eml only — one result per inner attachment (later step)
+    // Image-awareness signals. We never read the images themselves (no OCR), but we flag
+    // when a document likely holds text we could not reach, so a future OCR pass can target
+    // exactly these attachments/pages. OCR-candidate rule downstream: status ===
+    // 'extracted_empty' (image-only) OR lowTextDensity === true (mixed/sparse).
+    lowTextDensity?: boolean // real text obtained, but sparse / some pages had none — likely image-heavy
+    pageCount?: number // PDF only — total pages
+    emptyPageCount?: number // PDF only — pages with no extractable text (likely image pages)
 }
 
 // A handler does ONLY bytes -> text. Safety and assembly are the entry point's job.
@@ -102,6 +115,9 @@ interface HandlerOutput {
     charset?: string // text handlers report the charset they decoded with
     empty?: boolean // handler's own emptiness call; defaults to text.trim() === ''
     children?: ExtractionResult[] // eml only (later step)
+    lowTextDensity?: boolean // image-awareness signal (pdf/docx)
+    pageCount?: number // pdf only
+    emptyPageCount?: number // pdf only
 }
 
 interface Handler {
@@ -234,17 +250,22 @@ const pdfHandler: Handler = {
     kind: 'pdf',
     contentTypes: ['application/pdf'],
     extensions: ['.pdf'],
-    // Per-page (mergePages: false) so the char-density heuristic below can tell a
-    // scanned/image-only PDF (extracted_empty) from a real text PDF.
+    // Per-page (mergePages: false) so we can distinguish a truly text-less PDF
+    // (extracted_empty) from one with real text plus image pages we didn't read.
     extract: async ({ content }) => {
         const { getDocumentProxy, extractText } = await import('unpdf')
         const pdf = await getDocumentProxy(new Uint8Array(content))
         const { totalPages, text } = await extractText(pdf, { mergePages: false })
         const pages = text.map((page) => page.trim())
         const joined = pages.join('\n\n').trim()
+        const emptyPageCount = pages.filter((page) => page.length === 0).length
         const chars = pages.reduce((sum, page) => sum + page.length, 0)
-        const empty = joined.length === 0 || (totalPages > 0 && chars / totalPages < PDF_MIN_CHARS_PER_PAGE)
-        return { text: joined, empty }
+        // Zero text -> image-only/scanned -> extracted_empty. Otherwise keep the real
+        // text, but flag when some pages had no text or the overall density is low —
+        // those are likely images a future OCR pass should target.
+        const empty = joined.length === 0
+        const lowTextDensity = !empty && (emptyPageCount > 0 || (totalPages > 0 && chars / totalPages < PDF_MIN_CHARS_PER_PAGE))
+        return { text: joined, empty, lowTextDensity, pageCount: totalPages, emptyPageCount }
     },
 }
 
@@ -257,7 +278,9 @@ const docxHandler: Handler = {
     extract: async ({ content }) => {
         const { default: mammoth } = await import('mammoth')
         const { value } = await mammoth.extractRawText({ buffer: content })
-        return { text: value }
+        // Has embedded images but little text -> content is probably in the images.
+        const lowTextDensity = content.includes(DOCX_MEDIA_MARKER) && value.trim().length < DOCX_MIN_TEXT_CHARS
+        return { text: value, lowTextDensity }
     },
 }
 
@@ -437,6 +460,11 @@ const extractAt = async (input: AttachmentInput, depth: number): Promise<Extract
             status: isEmpty ? 'extracted_empty' : 'extracted',
             extractedText: isEmpty ? undefined : output.text,
             children: output.children,
+            // Image-awareness signals pass through unchanged; page counts are reported
+            // even on extracted_empty so an OCR pass knows how many pages to render.
+            lowTextDensity: output.lowTextDensity,
+            pageCount: output.pageCount,
+            emptyPageCount: output.emptyPageCount,
         }
     } catch (error) {
         // Attacker-controlled bytes: a throw or timeout is an expected event, captured as
