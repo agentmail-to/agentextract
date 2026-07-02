@@ -49,6 +49,10 @@ const SNIFF_TEXT_RATIO = 0.85
 const DETECT_SAMPLE_BYTES = 64 * 1024
 const DETECT_MIN_CONFIDENCE = 0.7
 
+// Scanned PDFs carry an image layer but little/no text. Below this average number of
+// characters per page we report extracted_empty rather than returning stray noise.
+const PDF_MIN_CHARS_PER_PAGE = 50
+
 /////////////////////////////////////////////////////////////
 // TYPES
 
@@ -200,7 +204,64 @@ const textHandler: Handler = {
     extract: async ({ content, charsetHint }) => decodeText(content, charsetHint),
 }
 
-const REGISTRY: Handler[] = [textHandler]
+// The library handlers below lazy-load their parser via dynamic import() so a Lambda
+// that only ever sees text attachments never pays to load pdf.js / mammoth, and so
+// the ESM-only `unpdf` loads cleanly from this CommonJS module.
+
+const htmlHandler: Handler = {
+    kind: 'html',
+    contentTypes: ['text/html', 'application/xhtml+xml'],
+    extensions: ['.html', '.htm', '.xhtml'],
+    // HTML bytes can be non-utf8 too, so decode with the same charset logic first,
+    // then flatten. Never regex-strip tags — html-to-text walks the DOM.
+    extract: async ({ content, charsetHint }) => {
+        const { text: decoded, charset } = decodeText(content, charsetHint)
+        const { convert } = await import('html-to-text')
+        const text = convert(decoded, {
+            wordwrap: false,
+            selectors: [
+                { selector: 'img', format: 'skip' },
+                { selector: 'a', options: { ignoreHref: true } },
+                { selector: 'script', format: 'skip' },
+                { selector: 'style', format: 'skip' },
+            ],
+        })
+        return { text, charset }
+    },
+}
+
+const pdfHandler: Handler = {
+    kind: 'pdf',
+    contentTypes: ['application/pdf'],
+    extensions: ['.pdf'],
+    // Per-page (mergePages: false) so the char-density heuristic below can tell a
+    // scanned/image-only PDF (extracted_empty) from a real text PDF.
+    extract: async ({ content }) => {
+        const { getDocumentProxy, extractText } = await import('unpdf')
+        const pdf = await getDocumentProxy(new Uint8Array(content))
+        const { totalPages, text } = await extractText(pdf, { mergePages: false })
+        const pages = text.map((page) => page.trim())
+        const joined = pages.join('\n\n').trim()
+        const chars = pages.reduce((sum, page) => sum + page.length, 0)
+        const empty = joined.length === 0 || (totalPages > 0 && chars / totalPages < PDF_MIN_CHARS_PER_PAGE)
+        return { text: joined, empty }
+    },
+}
+
+const docxHandler: Handler = {
+    kind: 'docx',
+    contentTypes: ['application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+    extensions: ['.docx'],
+    // extractRawText only (never the HTML path) — its blank-line paragraph separation
+    // is the structure we keep. Empty/whitespace-only falls to the default trim rule.
+    extract: async ({ content }) => {
+        const { default: mammoth } = await import('mammoth')
+        const { value } = await mammoth.extractRawText({ buffer: content })
+        return { text: value }
+    },
+}
+
+const REGISTRY: Handler[] = [textHandler, htmlHandler, pdfHandler, docxHandler]
 
 const findHandler = (kind: HandlerKind): Handler | undefined => REGISTRY.find((h) => h.kind === kind)
 
@@ -260,11 +321,22 @@ const looksLikeText = (content: Buffer): boolean => {
     return textish / sample.length >= SNIFF_TEXT_RATIO
 }
 
-// Step 1 sniffs only for text. Magic-byte detection for pdf/zip is added with those
-// handlers in the next step. A BOM is checked first: UTF-16 text is full of NUL
-// bytes, so looksLikeText would reject it as binary — the BOM overrides that.
-const sniff = (content: Buffer): HandlerKind | undefined =>
-    bomCharset(content) || looksLikeText(content) ? 'text' : undefined
+const PDF_MAGIC = Buffer.from('%PDF-')
+const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]) // "PK\x03\x04"
+const startsWith = (content: Buffer, magic: Buffer): boolean =>
+    content.length >= magic.length && content.subarray(0, magic.length).equals(magic)
+
+// Magic bytes are the strongest sniff signal, so they go first. A BOM is next: UTF-16
+// text is full of NUL bytes, so looksLikeText would reject it as binary — the BOM
+// overrides that. A .docx is a zip, but a bare zip could be xlsx/pptx/jar, so we only
+// claim docx when the extension confirms it (already caught by extension routing before
+// we sniff — kept as a defensive backstop).
+const sniff = (content: Buffer, ext?: string): HandlerKind | undefined => {
+    if (startsWith(content, PDF_MAGIC)) return 'pdf'
+    if (startsWith(content, ZIP_MAGIC) && ext === '.docx') return 'docx'
+    if (bomCharset(content) || looksLikeText(content)) return 'text'
+    return undefined
+}
 
 export const detectRoute = (input: AttachmentInput): { kind?: HandlerKind; routedBy: RoutedBy } => {
     const { type } = parseContentType(input.contentType)
@@ -277,7 +349,7 @@ export const detectRoute = (input: AttachmentInput): { kind?: HandlerKind; route
     if (byExt) return { kind: byExt.kind, routedBy: 'extension' }
 
     if (shouldSniff(type)) {
-        const sniffed = sniff(input.content)
+        const sniffed = sniff(input.content, ext)
         if (sniffed) return { kind: sniffed, routedBy: 'sniff' }
     }
 

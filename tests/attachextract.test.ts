@@ -1,6 +1,14 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+
 import { describe, it, expect } from 'vitest'
 
 import { extractAttachment, detectRoute, MAX_INPUT_BYTES, EXTRACTION_VERSION } from '../attachextract'
+
+// Real fixtures generated once with macOS textutil (.docx) and cupsfilter (.pdf).
+// vitest runs from the repo root, so resolve against cwd.
+const fixture = (name: string) => readFileSync(join(process.cwd(), 'tests', 'fixtures', name))
+const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
 // ---------------------------------------------------------------------------
 // Synthetic tests for attachextract.ts — Step 1 (baseline + direct-text)
@@ -165,5 +173,91 @@ describe('attachextract — result contract', () => {
         expect(r.extractionVersion).toBe(EXTRACTION_VERSION)
         expect(r.filename).toBe('hi.txt')
         expect(r.byteSize).toBe(content.length)
+    })
+})
+
+// HTML handler ---------------------------------------------------------------
+
+describe('attachextract — html handler', () => {
+    it('flattens HTML to visible text', async () => {
+        const r = await extractAttachment({
+            content: buf('<html><body><h1>Title</h1><p>Body text here.</p></body></html>'),
+            contentType: 'text/html',
+        })
+        expect(r.status).toBe('extracted')
+        expect(r.detectedType).toBe('html')
+        expect(r.routedBy).toBe('content-type')
+        // html-to-text uppercases <h1> headings by default, so match case-insensitively.
+        expect(r.extractedText?.toLowerCase()).toContain('title')
+        expect(r.extractedText).toContain('Body text here.')
+    })
+
+    // Non-rendered content must be dropped; real table text must survive.
+    it('drops script/style and keeps table cell text', async () => {
+        const html =
+            '<style>.a{color:red}</style><script>alert("x")</script>' +
+            '<table><tr><td>Cell A</td><td>Cell B</td></tr></table>'
+        const r = await extractAttachment({ content: buf(html), contentType: 'text/html', filename: 'page.html' })
+        expect(r.extractedText).toContain('Cell A')
+        expect(r.extractedText).toContain('Cell B')
+        expect(r.extractedText).not.toContain('color:red')
+        expect(r.extractedText).not.toContain('alert')
+    })
+})
+
+// PDF handler ----------------------------------------------------------------
+
+describe('attachextract — pdf handler', () => {
+    it('extracts text from a real PDF', async () => {
+        const r = await extractAttachment({ content: fixture('sample.pdf'), contentType: 'application/pdf', filename: 'sample.pdf' })
+        expect(r.status).toBe('extracted')
+        expect(r.detectedType).toBe('pdf')
+        expect(r.extractedText).toContain('extractable text content')
+    })
+
+    // A PDF mislabeled as octet-stream with no .pdf name is rescued by the %PDF magic bytes.
+    it('routes a mislabeled PDF by its magic bytes', async () => {
+        const r = await extractAttachment({ content: fixture('sample.pdf'), contentType: 'application/octet-stream' })
+        expect(r.routedBy).toBe('sniff')
+        expect(r.detectedType).toBe('pdf')
+        expect(r.status).toBe('extracted')
+    })
+
+    // Attacker-controlled bytes that pass the %PDF gate but don't parse must fail cleanly,
+    // never throw — this is also the reachability case for the 'failed' status.
+    it('returns failed (not a throw) on a corrupt PDF', async () => {
+        const r = await extractAttachment({ content: buf('%PDF-1.4\nthis is not a real pdf body'), contentType: 'application/pdf' })
+        expect(r.status).toBe('failed')
+        expect(r.reason).toBeDefined()
+        expect(r.detectedType).toBe('pdf')
+    })
+})
+
+// DOCX handler ---------------------------------------------------------------
+
+describe('attachextract — docx handler', () => {
+    it('extracts a real .docx and preserves paragraph breaks', async () => {
+        const r = await extractAttachment({ content: fixture('sample.docx'), contentType: DOCX_TYPE, filename: 'sample.docx' })
+        expect(r.status).toBe('extracted')
+        expect(r.detectedType).toBe('docx')
+        expect(r.extractedText).toContain('First paragraph')
+        expect(r.extractedText).toContain('Second paragraph')
+        // mammoth separates paragraphs with a blank line — the structure we keep.
+        expect(r.extractedText).toMatch(/First paragraph[\s\S]*\n\n[\s\S]*Second paragraph/)
+    })
+
+    // An empty document parses successfully but yields no text.
+    it('reports an empty .docx as extracted_empty', async () => {
+        const r = await extractAttachment({ content: fixture('empty.docx'), contentType: DOCX_TYPE })
+        expect(r.status).toBe('extracted_empty')
+        expect(r.extractedText).toBeUndefined()
+    })
+
+    // A docx mislabeled octet-stream is caught by its extension.
+    it('routes a docx by extension when the type lies', async () => {
+        const r = await extractAttachment({ content: fixture('sample.docx'), contentType: 'application/octet-stream', filename: 'sample.docx' })
+        expect(r.routedBy).toBe('extension')
+        expect(r.detectedType).toBe('docx')
+        expect(r.status).toBe('extracted')
     })
 })
