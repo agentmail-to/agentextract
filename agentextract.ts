@@ -195,25 +195,42 @@ export const extractNewContent = (text: string): string => {
             // Rescue a stranded signature: sometimes the sender's real sign-off sits
             // BELOW the quoted block (reply text → quote → "--" → signature). A naive
             // cut at the quote would delete that signature too. So look for it.
-            // Scan downward for the LAST "--" line (email's standard signature marker).
+            //
+            // Candidate "--" markers below the cut whose preceding block (from the cut) is ≥50% quoted
+            // history — the ≥50% guard confirms the marker sits just after the quote, not some unrelated
+            // "--". Among those, choosing WHICH one to reattach from handles two mirror-image layouts:
+            //   • quote → "--" → sig → "--" → disclaimer/list-footer: reattaching from the last "--"
+            //     would drop the sender's real sig with the quote. So we anchor on the EARLIEST marker
+            //     whose signature body is substantial (multi-line) — the real sig — keeping it.
+            //   • quote → "--" → inner (quoted) sig → "--" → real sig: the intervening line is short
+            //     quoted junk (a quoted sig that lost its ">"), so no early marker is "substantial" and
+            //     we fall back to the latest qualifying marker — the inner sig stays dropped.
             const cut = i
-            let sigIdx = -1
+            const markers: number[] = []
             for (let j = cut + 1; j < lines.length; j++) {
-                if (/^--\s*$/.test(lines[j])) sigIdx = j
-            }
-            // Only rescue if the block between the cut and the "--" is genuinely quoted
-            // history (≥50% of its non-blank lines start with ">"). This confirms the "--"
-            // is a signature sitting after a quote — not some unrelated "--" we'd wrongly stitch back on.
-            if (sigIdx >= 0) {
-                const body = lines.slice(cut + 1, sigIdx).filter((l) => l.trim())
+                if (!/^--\s*$/.test(lines[j])) continue
+                const body = lines.slice(cut + 1, j).filter((l) => l.trim())
                 const quoted = body.filter((l) => l.startsWith('>')).length
-                if (body.length && quoted >= body.length * 0.5) {
-                    // Keep reply (above cut) + signature (from "--" down), drop the quoted middle.
-                    return [...lines.slice(0, cut), ...lines.slice(sigIdx)].join('\n').trim()
+                if (body.length && quoted >= body.length * 0.5) markers.push(j)
+            }
+            let sigIdx = -1
+            // Earliest marker whose sig body (up to the next marker) is a substantial ≥2-line block.
+            for (const j of markers) {
+                const nextMarker = markers.find((k) => k > j) ?? lines.length
+                const sigBody = lines.slice(j + 1, nextMarker).filter((l) => l.trim())
+                if (sigBody.length >= 2) {
+                    sigIdx = j
+                    break
                 }
             }
+            // Fallback: latest qualifying marker (the original behavior) — single-line sigs, inner-sig case.
+            if (sigIdx < 0 && markers.length) sigIdx = markers[markers.length - 1]
+            if (sigIdx >= 0) {
+                // Keep reply (above cut) + signature (from "--" down), drop the quoted middle.
+                return [...lines.slice(0, cut), ...lines.slice(sigIdx)].join('\n').trim()
+            }
             // Normal cut: keep everything above the quote, drop everything below.
-            return lines.slice(0, cut).join('\n').trim() 
+            return lines.slice(0, cut).join('\n').trim()
         }
     }
 
