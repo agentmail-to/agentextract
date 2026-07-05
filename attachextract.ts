@@ -180,9 +180,11 @@ const textHandler: Handler = {
         'text/vcard',
         'text/x-vcard',
         'text/enriched',
-        // Header-only / partial-message MIME types (DSNs, forwards) — text, not full email.
+        // Header-only / report MIME types (DSNs, ARF spam reports) — text, not a full email.
+        // NB: message/global is NOT here — it's a full internationalized email (eml handler).
         'message/global-headers',
-        'message/global',
+        'message/delivery-status',
+        'message/feedback-report',
         'text/rfc822-headers', 
         // Common structured-but-plain-text payloads.
         'application/json',
@@ -271,7 +273,9 @@ const docxHandler: Handler = {
 // EML handler - eml
 const emlHandler: Handler = {
     kind: 'eml',
-    contentTypes: ['message/rfc822'],
+    // message/global is the internationalized (SMTPUTF8) equivalent of message/rfc822 — a
+    // full email, not a headers blob, so it parses through mailparser like any other .eml.
+    contentTypes: ['message/rfc822', 'message/global'],
     extensions: ['.eml'],
     extract: async ({ content, depth }) => {
         const { simpleParser } = await import('mailparser') // mailparser is a library that parses emails
@@ -336,9 +340,10 @@ const extensionOf = (filename?: string): string | undefined => {
 // Look up the handler in the registry by content type.
 const findByContentType = (type: string): Handler | undefined =>
     REGISTRY.find((h) => h.contentTypes.includes(type)) ??
-    // Any other text/* subtype we didn't enumerate is still plain text — except
-    // text/html, which has its own handler and must not decode as raw text.
-    (type.startsWith('text/') && type !== 'text/html' ? textHandler : undefined)
+    // Any other text/* subtype we didn't enumerate is still plain text — except html-ish
+    // subtypes (text/x-amp-html in real traffic), which carry markup and must flatten
+    // through the html handler rather than decode as raw text.
+    (type.startsWith('text/') ? (type.includes('html') ? htmlHandler : textHandler) : undefined)
 
 // Given a file extension (like .pdf), find the handler in the registry whose extensions list includes it (just a straight lookup). 
 const findByExtension = (ext: string): Handler | undefined => REGISTRY.find((h) => h.extensions.includes(ext))
@@ -391,6 +396,15 @@ const sniff = (content: Buffer, ext?: string): HandlerKind | undefined => {
     return undefined
 }
 
+// A text/html claim is only as good as its bytes: a PDF shipped as text/plain would
+// latin1-decode into garbage and be reported as 'extracted' — a silent quality failure,
+// worse than a labeled skip. Provably-binary bytes (no BOM, NULs / non-printable head)
+// void the claim; the sniff then rescues what the magic bytes prove (%PDF, zip+.docx)
+// and anything else is left unrouted. Empty content stays with the claimed handler so a
+// zero-byte text attachment still lands on extracted_empty rather than a skip.
+const bytesContradictTextClaim = (content: Buffer): boolean =>
+    content.length > 0 && !bomCharset(content) && !looksLikeText(content)
+
 // Takes an AttachmentInput and produces the final routing decision. 
 // Tries each signal in priority order and stops as soon as one works.
 export const detectRoute = (input: AttachmentInput): { kind?: HandlerKind; routedBy: RoutedBy } => {
@@ -398,10 +412,19 @@ export const detectRoute = (input: AttachmentInput): { kind?: HandlerKind; route
     const ext = extensionOf(input.filename)
 
     const byType = type ? findByContentType(type) : undefined
-    if (byType) return { kind: byType.kind, routedBy: 'content-type' }
-
     const byExt = ext ? findByExtension(ext) : undefined
-    if (byExt) return { kind: byExt.kind, routedBy: 'extension' }
+    const claimed = byType
+        ? ({ kind: byType.kind, routedBy: 'content-type' } as const)
+        : byExt
+          ? ({ kind: byExt.kind, routedBy: 'extension' } as const)
+          : undefined
+
+    // Distrust a text-decoding claim contradicted by the bytes (the type/extension lied).
+    if (claimed && (claimed.kind === 'text' || claimed.kind === 'html') && bytesContradictTextClaim(input.content)) {
+        const sniffed = sniff(input.content, ext)
+        return sniffed ? { kind: sniffed, routedBy: 'sniff' } : { routedBy: 'none' }
+    }
+    if (claimed) return claimed
 
     if (shouldSniff(type)) {
         const sniffed = sniff(input.content, ext)
@@ -466,7 +489,7 @@ const extractAt = async (input: AttachmentInput, depth: number): Promise<Extract
         }
     }
 
-    const { charset: charsetHint } = parseContentType(input.contentType) // pull any declared charset out, to pass to the handler
+    const { type, charset: charsetHint } = parseContentType(input.contentType) // declared type + charset, parsed once
     const { kind, routedBy } = detectRoute(input) // figure out what kind of file this is, and confidence level
     const handler = kind ? findHandler(kind) : undefined // look up the actual handler for that kind, if we found one
 
@@ -476,9 +499,7 @@ const extractAt = async (input: AttachmentInput, depth: number): Promise<Extract
             ...base,
             routedBy,
             status: 'skipped_unsupported_type',
-            reason: parseContentType(input.contentType).type
-                ? `unsupported type ${parseContentType(input.contentType).type}`
-                : 'unrecognized attachment',
+            reason: type ? `unsupported type ${type}` : 'unrecognized attachment',
         }
     }
 

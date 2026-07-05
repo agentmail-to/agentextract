@@ -73,6 +73,86 @@ describe('attachextract — routing (never trust one signal)', () => {
         expect(r.status).toBe('extracted')
     })
 
+    // DSN status blobs and ARF spam reports are header-style text payloads.
+    it('routes message/delivery-status and message/feedback-report as text', async () => {
+        const dsn = await extractAttachment({
+            content: buf('Reporting-MTA: dns; mx.example.com\nAction: failed\nStatus: 5.1.1'),
+            contentType: 'message/delivery-status',
+        })
+        expect(dsn.detectedType).toBe('text')
+        expect(dsn.status).toBe('extracted')
+        const arf = await extractAttachment({
+            content: buf('Feedback-Type: abuse\nUser-Agent: SomeReporter/1.0'),
+            contentType: 'message/feedback-report',
+        })
+        expect(arf.detectedType).toBe('text')
+        expect(arf.status).toBe('extracted')
+    })
+
+    // message/global is a FULL internationalized email (SMTPUTF8 rfc822), not a headers
+    // blob — it must parse through the eml handler, not decode as raw text.
+    it('routes message/global to the eml handler', async () => {
+        const r = await extractAttachment({ content: fixture('plain.eml'), contentType: 'message/global' })
+        expect(r.detectedType).toBe('eml')
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText).toContain('Meeting notes')
+    })
+
+    // AMP HTML (text/x-amp-html in real traffic) is markup: it must flatten through the
+    // html handler, not decode as raw text and surface tag soup.
+    it('routes html-ish text/* subtypes through the html handler', async () => {
+        const r = await extractAttachment({
+            content: buf('<div>AMP body text</div><style amp-custom>.a{color:red}</style>'),
+            contentType: 'text/x-amp-html',
+        })
+        expect(r.detectedType).toBe('html')
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText).toContain('AMP body text')
+        expect(r.extractedText).not.toContain('color:red')
+        expect(r.extractedText).not.toContain('<div>')
+    })
+
+    // A PDF shipped as text/plain must NOT be latin1-decoded into garbage and reported
+    // as extracted — the magic bytes void the false text claim and rescue the route.
+    it('overrides a lying text/plain claim when the bytes are a PDF', async () => {
+        const r = await extractAttachment({ content: fixture('sample.pdf'), contentType: 'text/plain', filename: 'report.txt' })
+        expect(r.detectedType).toBe('pdf')
+        expect(r.routedBy).toBe('sniff')
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText).toContain('extractable text content')
+    })
+
+    // Same lie, docx flavor: zip magic + .docx extension rescue the route.
+    it('overrides a lying text claim when the bytes are a docx', async () => {
+        const r = await extractAttachment({ content: fixture('sample.docx'), contentType: 'text/plain', filename: 'sample.docx' })
+        expect(r.detectedType).toBe('docx')
+        expect(r.routedBy).toBe('sniff')
+        expect(r.status).toBe('extracted')
+    })
+
+    // Unrescuable binary behind a text claim becomes a labeled skip, not mojibake.
+    it('skips provably-binary bytes behind a text/plain claim', async () => {
+        const r = await extractAttachment({ content: Buffer.from([0x00, 0x01, 0x02, 0x03]), contentType: 'text/plain' })
+        expect(r.status).toBe('skipped_unsupported_type')
+        expect(r.extractedText).toBeUndefined()
+    })
+
+    // The byte-verification guard must not break the zero-byte edge: an empty text
+    // attachment stays with the text handler and lands on extracted_empty.
+    it('keeps a zero-byte text attachment on the text handler (extracted_empty)', async () => {
+        const r = await extractAttachment({ content: Buffer.alloc(0), contentType: 'text/plain', filename: 'empty.txt' })
+        expect(r.detectedType).toBe('text')
+        expect(r.status).toBe('extracted_empty')
+    })
+
+    // A BOM'd UTF-16 file (NUL-heavy bytes) declared as text must survive the guard.
+    it('keeps a declared UTF-16 text file with a BOM on the text handler', async () => {
+        const r = await extractAttachment({ content: Buffer.from('\ufeffhello', 'utf16le'), contentType: 'text/plain' })
+        expect(r.detectedType).toBe('text')
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText).toBe('hello')
+    })
+
     // A declared, recognized non-text media type is a deliberate skip — we do NOT
     // sniff it (sniff is only for missing/unknown/octet-stream).
     it('skips a declared image type without sniffing', async () => {
