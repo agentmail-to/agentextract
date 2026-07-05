@@ -1245,6 +1245,32 @@ describe('extractEmailBody — plain text — trailing-signature rescue', () => 
         )
         expect(ex(text)).toBe(t('My reply.', '', '-- ', 'Outer Sender'))
     })
+
+    // Real-world regression (seen in production mail): sender's real multi-line signature sits below the
+    // quote, followed by a trailing legal disclaimer / list-footer that adds its own "-- ". Anchoring on
+    // the LAST "-- " would drop the real sig and keep only the disclaimer. We anchor on the earliest
+    // marker whose sig body is substantial (multi-line), so the real sig is kept. (Structure anonymized.)
+    it('keeps the sender\'s real multi-line sig when a trailing disclaimer adds a later "-- "', () => {
+        const text = t(
+            'Thanks — sending that over now.',
+            '',
+            'On Mon, Jan 5, 2026 Alex Rivera <alex@buyer.example> wrote:',
+            '> Could you send the out-the-door price including all fees?',
+            '> Also please confirm current mileage.',
+            '-- ',
+            'Jane Doe',
+            'Senior Client Advisor',
+            'Example Motors',
+            '555-0100',
+            '-- ',
+            'This message is intended only for the addressee and may contain confidential material.',
+        )
+        const out = ex(text)
+        expect(out).toContain('Jane Doe') // real sig kept (was dropped by the last-"--" anchor)
+        expect(out).toContain('Senior Client Advisor')
+        expect(out).not.toContain('out-the-door') // quoted history still removed
+        expect(out).not.toContain('confirm current mileage')
+    })
 })
 
 // Inline-reply guard: when the sender's NEW prose is sandwiched BETWEEN ">"-quote blocks (quote -> prose ->
