@@ -3,12 +3,13 @@ import { join } from 'node:path'
 
 import { describe, it, expect } from 'vitest'
 
-import { extractAttachment, detectRoute, MAX_INPUT_BYTES } from '../attachextract'
+import { extractAttachment, detectRoute, MAX_INPUT_BYTES, MAX_OUTPUT_CHARS } from '../attachextract'
 
-// Real fixtures generated once with macOS textutil (.docx) and cupsfilter (.pdf).
+// Real fixtures generated once with macOS textutil (.docx) and cupsfilter (.pdf), and exceljs (.xlsx).
 // vitest runs from the repo root, so resolve against cwd.
 const fixture = (name: string) => readFileSync(join(process.cwd(), 'tests', 'fixtures', name))
 const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
 // ---------------------------------------------------------------------------
 // Synthetic tests for attachextract.ts — Step 1 (baseline + direct-text)
@@ -396,6 +397,90 @@ describe('attachextract — doc handler', () => {
         expect(r.status).toBe('failed')
         expect(r.detectedType).toBe('doc')
         expect(r.reason).toBeDefined()
+    })
+})
+
+// XLSX handler (modern OOXML Excel) ------------------------------------------
+// Real fixtures generated with exceljs. Sheets flatten to `=== name ===` + tab-joined rows.
+
+describe('attachextract — xlsx handler', () => {
+    it('flattens every sheet with headers, keeping cell values across sheets', async () => {
+        const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE, filename: 'book.xlsx' })
+        expect(r.status).toBe('extracted')
+        expect(r.detectedType).toBe('xlsx')
+        expect(r.routedBy).toBe('content-type')
+        // Both sheets, each under its own header.
+        expect(r.extractedText).toContain('=== Q1 ===')
+        expect(r.extractedText).toContain('=== Notes ===')
+        expect(r.extractedText).toContain('Region\tRevenue')
+        expect(r.extractedText).toContain('West\t4200')
+        expect(r.extractedText).toContain('Ada Lovelace')
+    })
+
+    // A formula cell must extract its computed VALUE, not the "=SUM(...)" formula string.
+    it('extracts the computed value of a formula, not the formula text', async () => {
+        const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
+        expect(r.extractedText).toContain('Total\t7300')
+        expect(r.extractedText).not.toContain('SUM(')
+    })
+
+    // A workbook with only empty sheets parses fine but yields no rows.
+    it('reports an empty workbook as extracted_empty (present-empty)', async () => {
+        const r = await extractAttachment({ content: fixture('empty.xlsx'), contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted_empty')
+        expect(r.extractedText).toBe('')
+    })
+
+    // xlsx is a zip; mislabeled octet-stream is rescued by the .xlsx extension.
+    it('routes a mislabeled .xlsx by its extension', async () => {
+        const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: 'application/octet-stream', filename: 'sample.xlsx' })
+        expect(r.routedBy).toBe('extension')
+        expect(r.detectedType).toBe('xlsx')
+        expect(r.status).toBe('extracted')
+    })
+
+    // Zip bytes without a confirming extension must NOT be claimed as xlsx (could be docx/pptx/jar).
+    it('does not claim zip bytes as xlsx without a .xlsx extension', async () => {
+        const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: 'application/octet-stream', filename: 'archive.zip' })
+        expect(r.detectedType).toBeUndefined()
+        expect(r.status).toBe('skipped_unsupported_type')
+    })
+
+    // Attacker-controlled bytes that pass the xlsx route but don't parse fail cleanly.
+    it('returns failed (not a throw) on a corrupt xlsx', async () => {
+        const r = await extractAttachment({ content: buf('PK\x03\x04 not a real workbook'), contentType: XLSX_TYPE, filename: 'bad.xlsx' })
+        expect(r.status).toBe('failed')
+        expect(r.detectedType).toBe('xlsx')
+    })
+})
+
+// Output cap -----------------------------------------------------------------
+// Input is byte-capped, but output isn't proportional to input — cap it centrally so a
+// pathological/large document can't dump megabytes of text into S3 + the search index.
+
+describe('attachextract — output cap', () => {
+    // Over-cap output is truncated to exactly MAX_OUTPUT_CHARS and flagged.
+    it('truncates over-cap extracted text and sets truncated', async () => {
+        const content = Buffer.alloc(2 * MAX_OUTPUT_CHARS, 0x41) // 2x the cap of 'A', well under the input cap
+        const r = await extractAttachment({ content, contentType: 'text/plain', filename: 'big.txt' })
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText?.length).toBe(MAX_OUTPUT_CHARS)
+        expect(r.truncated).toBe(true)
+    })
+
+    // Under-cap output is untouched and carries no flag.
+    it('leaves under-cap text whole with no truncated flag', async () => {
+        const r = await extractAttachment({ content: buf('short body'), contentType: 'text/plain' })
+        expect(r.extractedText).toBe('short body')
+        expect(r.truncated).toBeUndefined()
+    })
+
+    // The empty contract is orthogonal to truncation: still '' , never flagged.
+    it('does not flag an empty extraction as truncated', async () => {
+        const r = await extractAttachment({ content: buf('   '), contentType: 'text/plain' })
+        expect(r.status).toBe('extracted_empty')
+        expect(r.extractedText).toBe('')
+        expect(r.truncated).toBeUndefined()
     })
 })
 

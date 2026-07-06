@@ -1,7 +1,7 @@
 // attachextract — text extraction for email attachments.
 //
-// In scope: text, HTML, PDF, Word (.docx + legacy .doc), and nested emails (.eml). Out of
-// scope: images/OCR, spreadsheets (.xlsx), and archives — those return a labeled skip.
+// In scope: text, HTML, PDF, Word (.docx + legacy .doc), Excel (.xlsx), and nested emails
+// (.eml). Out of scope: images/OCR, legacy .xls/.ppt, and archives — those return a labeled skip.
 // Ships as a separate subpath export ("agentextract/attachments") so the heavy
 // parsers stay out of the body extractor's bundle. New formats = new registry entries.
 
@@ -15,6 +15,11 @@ import jschardet from 'jschardet'
 
 // Max: 10 MB - Any attachment bigger than this gets rejected before any processing happens at all
 export const MAX_INPUT_BYTES = 10 * 1024 * 1024
+
+// Max extracted text length (JS chars). Input is byte-capped, but output isn't: a big
+// spreadsheet or HTML table can balloon into megabytes that then hit S3 and the search index.
+// Past this we truncate and set `truncated`.
+export const MAX_OUTPUT_CHARS = 1_000_000
 
 // Guard: if a handler takes >= 20 seconds, we stop awaiting it. Note: this can't
 // cancel synchronous CPU-bound work — it only stops us waiting on a slow async parse.
@@ -61,8 +66,9 @@ export type RoutedBy = 'content-type' | 'extension' | 'sniff' | 'none'
 // pdf: pdf
 // docx: docx (modern OOXML Word)
 // doc: doc (legacy OLE Word, Word 97–2003)
+// xlsx: xlsx (modern OOXML Excel)
 // eml: eml
-export type HandlerKind = 'text' | 'html' | 'pdf' | 'docx' | 'doc' | 'eml'
+export type HandlerKind = 'text' | 'html' | 'pdf' | 'docx' | 'doc' | 'xlsx' | 'eml'
 
 // The input to the extraction.
 export interface AttachmentInput {
@@ -80,7 +86,8 @@ export interface ExtractionResult {
     byteSize: number // the size of the attachment in bytes 
     status: ExtractionStatus // the status of the extraction 
     reason?: string // set on failed / skipped_* 
-    extractedText?: string // present string on 'extracted'/'extracted_empty' ('' when empty); undefined on skip/failed — see the field-presence note at the entry point
+    extractedText?: string // present ('' if empty) on extracted/extracted_empty; undefined on skip/failed
+    truncated?: boolean // true if extractedText was cut off at MAX_OUTPUT_CHARS (more text existed than we kept)
     children?: ExtractionResult[] // .eml only — one result per inner attachment
 
     // Image-awareness signals. No OCR, but we flag when a document likely holds text we could not reach (eg. image-heavy). 
@@ -267,16 +274,43 @@ const docxHandler: Handler = {
     },
 }
 
-// DOC handler. 
-// Separate from docx: mammoth only reads the modern OOXML zip, so pre-2007 .doc needs word-extractor, which parses the OLE compound binary.
+// DOC handler — legacy Word (.doc). mammoth only reads the modern .docx zip, so the old
+// OLE binary needs word-extractor instead.
 const docHandler: Handler = {
     kind: 'doc',
     contentTypes: ['application/msword'],
     extensions: ['.doc'],
     extract: async ({ content }) => {
-        const { default: WordExtractor } = await import('word-extractor') // parses the legacy OLE .doc binary
-        const doc = await new WordExtractor().extract(content) // accepts the raw buffer directly
-        return { text: doc.getBody() } // getBody() is the main document text (headers/footers/notes are separate)
+        const { default: WordExtractor } = await import('word-extractor')
+        const doc = await new WordExtractor().extract(content)
+        return { text: doc.getBody() } // main body only; headers/footers/notes are separate streams
+    },
+}
+
+// XLSX handler — modern Excel (.xlsx). Flatten each sheet to text for search/indexing.
+const xlsxHandler: Handler = {
+    kind: 'xlsx',
+    contentTypes: ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+    extensions: ['.xlsx'],
+    extract: async ({ content }) => {
+        const { default: ExcelJS } = await import('exceljs') // not SheetJS: no known parse-time CVEs on untrusted bytes
+        const workbook = new ExcelJS.Workbook()
+        // Cast: the value is a real Buffer; exceljs's load() type clashes with @types/node's generic Buffer.
+        await workbook.xlsx.load(content as unknown as Parameters<typeof workbook.xlsx.load>[0])
+        const sheets: string[] = []
+        workbook.eachSheet((sheet) => {
+            const rows: string[] = []
+            // Drop empty cells/rows so a sparse sheet doesn't flatten into runs of empty tabs.
+            sheet.eachRow({ includeEmpty: false }, (row) => {
+                const cells: string[] = []
+                // cell.text = the shown value (formula result, formatted date), not the raw number/formula.
+                row.eachCell({ includeEmpty: false }, (cell) => cells.push(cell.text ?? ''))
+                if (cells.length > 0) rows.push(cells.join('\t'))
+            })
+            // Header + rows per sheet; a text-less sheet contributes nothing → extracted_empty.
+            if (rows.length > 0) sheets.push(`=== ${sheet.name} ===\n${rows.join('\n')}`)
+        })
+        return { text: sheets.join('\n\n') }
     },
 }
 
@@ -319,7 +353,7 @@ const emlHandler: Handler = {
     },
 }
 
-const REGISTRY: Handler[] = [textHandler, htmlHandler, pdfHandler, docxHandler, docHandler, emlHandler]
+const REGISTRY: Handler[] = [textHandler, htmlHandler, pdfHandler, docxHandler, docHandler, xlsxHandler, emlHandler]
 
 const findHandler = (kind: HandlerKind): Handler | undefined => REGISTRY.find((h) => h.kind === kind) // Look up the handler in that array whose kind matches the one requested.
 
@@ -350,10 +384,11 @@ const extensionOf = (filename?: string): string | undefined => {
 // Look up the handler in the registry by content type.
 const findByContentType = (type: string): Handler | undefined =>
     REGISTRY.find((h) => h.contentTypes.includes(type)) ??
-    // Guard: If RTF returns undefined - text/rtf would originally return the text handler
-    // Checked before the text handler on purpose to avoid misclaiming it as plain text and leaking the control words
+    // RTF is text/* but is really control-word markup and we have no handler for it. Skip it here,
+    // before the text fallback below would decode those control words as body text.
     (type.includes('rtf') ? undefined :
-    // If text/ or text/html, return the html handler if it's text/html, otherwise return the text handler (if none of the above, return undefined)
+    // Any other text/* we didn't enumerate is plain text — except html-ish subtypes
+    // (e.g. text/x-amp-html), which are markup and must go through the html handler.
     type.startsWith('text/') ? (type.includes('html') ? htmlHandler : textHandler) : undefined)
 
 // Given a file extension (like .pdf), find the handler in the registry whose extensions list includes it (just a straight lookup). 
@@ -391,26 +426,25 @@ const PDF_MAGIC = Buffer.from('%PDF-')
 // Zip files always start with the byte sequence 0x50 0x4b 0x03 0x04 ("PK..").
 // A .docx is a zip, so this lets us recognize one from its content.
 const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04])
-// RTF documents always start with the literal "{\rtf". RTF is ASCII, so looksLikeText would
-// otherwise grab a mislabeled/extensionless one as text and leak its control words — detect it
-// here to skip instead (see the text/rtf note on findByContentType).
+// RTF starts with "{\rtf". It's ASCII, so looksLikeText would wrongly take a mislabeled one as
+// text and leak the control words — detect it here to skip instead (see findByContentType).
 const RTF_MAGIC = Buffer.from('{\\rtf')
-// Legacy OLE compound files (Word 97–2003 .doc) start with this fixed 8-byte signature. It is
-// NOT unique to Word — legacy .xls / .ppt / .msg share it — so, like the zip→docx case, we only
-// claim doc when the extension confirms it; other OLE payloads stay unrouted.
+// Legacy OLE files (.doc) start with this 8-byte signature. Shared by .xls/.ppt/.msg too, so —
+// like zip→docx — we only claim doc when the extension confirms it.
 const OLE_MAGIC = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
 
 // Check if the file starts with the given magic bytes.
 const startsWith = (content: Buffer, magic: Buffer): boolean =>
     content.length >= magic.length && content.subarray(0, magic.length).equals(magic)
 
-// Magic bytes are the strongest sniff signal, so they go first. 
-// A BOM is next: UTF-16 text is full of NUL bytes, so looksLikeText would reject it as binary 
-// A .docx is a zip, but a bare zip could be xlsx/pptx/jar, 
-// so we only claim docx when the extension confirms it. 
+// Magic bytes are the strongest sniff signal, so they go first.
+// A BOM is next: UTF-16 text is full of NUL bytes, so looksLikeText would reject it as binary
+// docx and xlsx are both just zips (as are pptx/jar), so the zip magic alone can't tell them
+// apart — we only claim a specific OOXML kind when the extension confirms it.
 const sniff = (content: Buffer, ext?: string): HandlerKind | undefined => {
     if (startsWith(content, PDF_MAGIC)) return 'pdf'
     if (startsWith(content, ZIP_MAGIC) && ext === '.docx') return 'docx'
+    if (startsWith(content, ZIP_MAGIC) && ext === '.xlsx') return 'xlsx'
     if (startsWith(content, OLE_MAGIC) && ext === '.doc') return 'doc'
     // RTF is ASCII text but control-word markup, and we have no handler for it. Skip before the
     // looksLikeText check that would misclaim it as plain text and leak the control words.
@@ -532,19 +566,25 @@ const extractAt = async (input: AttachmentInput, depth: number): Promise<Extract
             HANDLER_TIMEOUT_MS 
         )
         const isEmpty = output.empty ?? output.text.trim().length === 0
+        // Cap output centrally so every handler is bounded the same way. Don't split a surrogate
+        // pair at the boundary (would leave a lone half that serializes as U+FFFD).
+        const overCap = output.text.length > MAX_OUTPUT_CHARS
+        const capEnd =
+            overCap && output.text.charCodeAt(MAX_OUTPUT_CHARS - 1) >= 0xd800 && output.text.charCodeAt(MAX_OUTPUT_CHARS - 1) <= 0xdbff
+                ? MAX_OUTPUT_CHARS - 1
+                : MAX_OUTPUT_CHARS
+        const text = overCap ? output.text.slice(0, capEnd) : output.text
         return {
             ...base,
             detectedType: handler.kind,
             routedBy,
             charset: output.charset,
             status: isEmpty ? 'extracted_empty' : 'extracted',
-            // A handler that ran is a completed extraction: emit a present string even when empty
-            // ('' on extracted_empty), never undefined. This mirrors the body extractor's contract
-            // (extractEmailBody returns '' for an empty result) so a downstream field-presence
-            // cache — "extracted field present ⇒ cached", no version stamp — treats a legitimately
-            // empty attachment as cached instead of re-extracting it forever. Skip/failed statuses
-            // below leave extractedText undefined, which correctly reads as "not cached, re-attempt".
-            extractedText: isEmpty ? '' : output.text,
+            // A handler that ran always returns a present string ('' if empty), never undefined.
+            // The cache reads "field present ⇒ cached", so an empty attachment stays cached instead
+            // of re-extracting forever. Skip/failed leave it undefined below — i.e. "retry me".
+            extractedText: isEmpty ? '' : text,
+            truncated: overCap || undefined, // flag when there was more text than we kept
             children: output.children,
             // Image-awareness signals pass through unchanged; page counts are reported
             // even on extracted_empty so an OCR pass knows how many pages to render.
