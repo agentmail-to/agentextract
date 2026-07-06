@@ -1,7 +1,7 @@
 // attachextract — text extraction for email attachments.
 //
-// In scope: text, HTML, PDF, Word (.docx), and nested emails (.eml). Out of scope:
-// images/OCR, spreadsheets (.xlsx), and archives — those return a labeled skip.
+// In scope: text, HTML, PDF, Word (.docx + legacy .doc), and nested emails (.eml). Out of
+// scope: images/OCR, spreadsheets (.xlsx), and archives — those return a labeled skip.
 // Ships as a separate subpath export ("agentextract/attachments") so the heavy
 // parsers stay out of the body extractor's bundle. New formats = new registry entries.
 
@@ -12,9 +12,6 @@ import jschardet from 'jschardet'
 
 /////////////////////////////////////////////////////////////
 // CONSTANTS (tunable)
-
-// Bump when extraction logic changes so a downstream cache can invalidate on it.
-export const EXTRACTION_VERSION = '1'
 
 // Max: 10 MB - Any attachment bigger than this gets rejected before any processing happens at all
 export const MAX_INPUT_BYTES = 10 * 1024 * 1024
@@ -58,13 +55,14 @@ export type ExtractionStatus =
 // Records which signal ended up deciding the route.
 export type RoutedBy = 'content-type' | 'extension' | 'sniff' | 'none'
 
-// The formats we can route to. Each maps to exactly one handler. 
+// The formats we can route to. Each maps to exactly one handler.
 // text: plain text, csv, calendar, vcard, json, xml, yaml
 // html: html
 // pdf: pdf
-// docx: docx
+// docx: docx (modern OOXML Word)
+// doc: doc (legacy OLE Word, Word 97–2003)
 // eml: eml
-export type HandlerKind = 'text' | 'html' | 'pdf' | 'docx' | 'eml'
+export type HandlerKind = 'text' | 'html' | 'pdf' | 'docx' | 'doc' | 'eml'
 
 // The input to the extraction.
 export interface AttachmentInput {
@@ -82,8 +80,7 @@ export interface ExtractionResult {
     byteSize: number // the size of the attachment in bytes 
     status: ExtractionStatus // the status of the extraction 
     reason?: string // set on failed / skipped_* 
-    extractedText?: string // set on 'extracted' 
-    extractionVersion: string // the version of the extraction logic
+    extractedText?: string // present string on 'extracted'/'extracted_empty' ('' when empty); undefined on skip/failed — see the field-presence note at the entry point
     children?: ExtractionResult[] // .eml only — one result per inner attachment
 
     // Image-awareness signals. No OCR, but we flag when a document likely holds text we could not reach (eg. image-heavy). 
@@ -270,6 +267,19 @@ const docxHandler: Handler = {
     },
 }
 
+// DOC handler. 
+// Separate from docx: mammoth only reads the modern OOXML zip, so pre-2007 .doc needs word-extractor, which parses the OLE compound binary.
+const docHandler: Handler = {
+    kind: 'doc',
+    contentTypes: ['application/msword'],
+    extensions: ['.doc'],
+    extract: async ({ content }) => {
+        const { default: WordExtractor } = await import('word-extractor') // parses the legacy OLE .doc binary
+        const doc = await new WordExtractor().extract(content) // accepts the raw buffer directly
+        return { text: doc.getBody() } // getBody() is the main document text (headers/footers/notes are separate)
+    },
+}
+
 // EML handler - eml
 const emlHandler: Handler = {
     kind: 'eml',
@@ -309,7 +319,7 @@ const emlHandler: Handler = {
     },
 }
 
-const REGISTRY: Handler[] = [textHandler, htmlHandler, pdfHandler, docxHandler, emlHandler]
+const REGISTRY: Handler[] = [textHandler, htmlHandler, pdfHandler, docxHandler, docHandler, emlHandler]
 
 const findHandler = (kind: HandlerKind): Handler | undefined => REGISTRY.find((h) => h.kind === kind) // Look up the handler in that array whose kind matches the one requested.
 
@@ -340,10 +350,11 @@ const extensionOf = (filename?: string): string | undefined => {
 // Look up the handler in the registry by content type.
 const findByContentType = (type: string): Handler | undefined =>
     REGISTRY.find((h) => h.contentTypes.includes(type)) ??
-    // Any other text/* subtype we didn't enumerate is still plain text — except html-ish
-    // subtypes (text/x-amp-html in real traffic), which carry markup and must flatten
-    // through the html handler rather than decode as raw text.
-    (type.startsWith('text/') ? (type.includes('html') ? htmlHandler : textHandler) : undefined)
+    // Guard: If RTF returns undefined - text/rtf would originally return the text handler
+    // Checked before the text handler on purpose to avoid misclaiming it as plain text and leaking the control words
+    (type.includes('rtf') ? undefined :
+    // If text/ or text/html, return the html handler if it's text/html, otherwise return the text handler (if none of the above, return undefined)
+    type.startsWith('text/') ? (type.includes('html') ? htmlHandler : textHandler) : undefined)
 
 // Given a file extension (like .pdf), find the handler in the registry whose extensions list includes it (just a straight lookup). 
 const findByExtension = (ext: string): Handler | undefined => REGISTRY.find((h) => h.extensions.includes(ext))
@@ -378,8 +389,16 @@ const looksLikeText = (content: Buffer): boolean => {
 // PDFs always start with the literal bytes "%PDF-"
 const PDF_MAGIC = Buffer.from('%PDF-')
 // Zip files always start with the byte sequence 0x50 0x4b 0x03 0x04 ("PK..").
-// A .docx is a zip, so this lets us recognize one from its content. 
-const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04]) 
+// A .docx is a zip, so this lets us recognize one from its content.
+const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04])
+// RTF documents always start with the literal "{\rtf". RTF is ASCII, so looksLikeText would
+// otherwise grab a mislabeled/extensionless one as text and leak its control words — detect it
+// here to skip instead (see the text/rtf note on findByContentType).
+const RTF_MAGIC = Buffer.from('{\\rtf')
+// Legacy OLE compound files (Word 97–2003 .doc) start with this fixed 8-byte signature. It is
+// NOT unique to Word — legacy .xls / .ppt / .msg share it — so, like the zip→docx case, we only
+// claim doc when the extension confirms it; other OLE payloads stay unrouted.
+const OLE_MAGIC = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
 
 // Check if the file starts with the given magic bytes.
 const startsWith = (content: Buffer, magic: Buffer): boolean =>
@@ -392,6 +411,10 @@ const startsWith = (content: Buffer, magic: Buffer): boolean =>
 const sniff = (content: Buffer, ext?: string): HandlerKind | undefined => {
     if (startsWith(content, PDF_MAGIC)) return 'pdf'
     if (startsWith(content, ZIP_MAGIC) && ext === '.docx') return 'docx'
+    if (startsWith(content, OLE_MAGIC) && ext === '.doc') return 'doc'
+    // RTF is ASCII text but control-word markup, and we have no handler for it. Skip before the
+    // looksLikeText check that would misclaim it as plain text and leak the control words.
+    if (startsWith(content, RTF_MAGIC)) return undefined
     if (bomCharset(content) || looksLikeText(content)) return 'text'
     return undefined
 }
@@ -476,7 +499,6 @@ const extractAt = async (input: AttachmentInput, depth: number): Promise<Extract
     const base = {
         filename: input.filename,
         byteSize,
-        extractionVersion: EXTRACTION_VERSION,
     }
 
     // Size gate BEFORE any decode/parse. If the attachment is too large, skip it.
@@ -516,7 +538,13 @@ const extractAt = async (input: AttachmentInput, depth: number): Promise<Extract
             routedBy,
             charset: output.charset,
             status: isEmpty ? 'extracted_empty' : 'extracted',
-            extractedText: isEmpty ? undefined : output.text,
+            // A handler that ran is a completed extraction: emit a present string even when empty
+            // ('' on extracted_empty), never undefined. This mirrors the body extractor's contract
+            // (extractEmailBody returns '' for an empty result) so a downstream field-presence
+            // cache — "extracted field present ⇒ cached", no version stamp — treats a legitimately
+            // empty attachment as cached instead of re-extracting it forever. Skip/failed statuses
+            // below leave extractedText undefined, which correctly reads as "not cached, re-attempt".
+            extractedText: isEmpty ? '' : output.text,
             children: output.children,
             // Image-awareness signals pass through unchanged; page counts are reported
             // even on extracted_empty so an OCR pass knows how many pages to render.

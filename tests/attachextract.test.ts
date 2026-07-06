@@ -3,7 +3,7 @@ import { join } from 'node:path'
 
 import { describe, it, expect } from 'vitest'
 
-import { extractAttachment, detectRoute, MAX_INPUT_BYTES, EXTRACTION_VERSION } from '../attachextract'
+import { extractAttachment, detectRoute, MAX_INPUT_BYTES } from '../attachextract'
 
 // Real fixtures generated once with macOS textutil (.docx) and cupsfilter (.pdf).
 // vitest runs from the repo root, so resolve against cwd.
@@ -143,6 +143,9 @@ describe('attachextract — routing (never trust one signal)', () => {
         const r = await extractAttachment({ content: Buffer.alloc(0), contentType: 'text/plain', filename: 'empty.txt' })
         expect(r.detectedType).toBe('text')
         expect(r.status).toBe('extracted_empty')
+        // A completed-but-empty extraction is present-empty, not undefined, so a field-presence
+        // cache counts it as cached (mirrors the body extractor's '' contract).
+        expect(r.extractedText).toBe('')
     })
 
     // A BOM'd UTF-16 file (NUL-heavy bytes) declared as text must survive the guard.
@@ -178,6 +181,22 @@ describe('attachextract — routing (never trust one signal)', () => {
         expect(r.routedBy).toBe('sniff')
         expect(r.status).toBe('extracted')
         expect(r.extractedText).toBe('hello')
+    })
+
+    // RTF is text/* by MIME but its body is control-word markup. With no RTF handler,
+    // decoding it as raw text would leak \rtf1/\pard/\fonttbl into extractedText — worse
+    // than a labeled skip. Both the content-type path and the sniff path must skip it.
+    it('skips RTF instead of leaking control words as text', async () => {
+        const rtf = buf('{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0 Times;}}\\pard Dear team, the meeting is at noon.\\par}')
+        // 1. Declared text/rtf — must not fall through the text/* fallback.
+        const byType = await extractAttachment({ content: rtf, contentType: 'text/rtf', filename: 'memo.rtf' })
+        expect(byType.status).toBe('skipped_unsupported_type')
+        expect(byType.extractedText).toBeUndefined()
+        // 2. Mislabeled octet-stream — the {\rtf magic must skip it before looksLikeText grabs it.
+        const bySniff = await extractAttachment({ content: rtf, contentType: 'application/octet-stream' })
+        expect(bySniff.status).toBe('skipped_unsupported_type')
+        expect(bySniff.routedBy).toBe('none')
+        expect(bySniff.extractedText).toBeUndefined()
     })
 
     // detectRoute is the pure routing decision, independent of extraction.
@@ -239,7 +258,7 @@ describe('attachextract — safety gates', () => {
     it('reports empty/whitespace-only text as extracted_empty, not extracted', async () => {
         const r = await extractAttachment({ content: buf('   \n\t  '), contentType: 'text/plain' })
         expect(r.status).toBe('extracted_empty')
-        expect(r.extractedText).toBeUndefined()
+        expect(r.extractedText).toBe('') // present-empty (field-presence cache treats it as cached), not undefined
         expect(r.charset).toBeDefined()
     })
 })
@@ -247,10 +266,9 @@ describe('attachextract — safety gates', () => {
 // Result contract ------------------------------------------------------------
 
 describe('attachextract — result contract', () => {
-    it('always stamps the extraction version and echoes filename + byteSize', async () => {
+    it('echoes filename + byteSize on the result', async () => {
         const content = buf('hello')
         const r = await extractAttachment({ content, contentType: 'text/plain', filename: 'hi.txt' })
-        expect(r.extractionVersion).toBe(EXTRACTION_VERSION)
         expect(r.filename).toBe('hi.txt')
         expect(r.byteSize).toBe(content.length)
     })
@@ -330,7 +348,7 @@ describe('attachextract — docx handler', () => {
     it('reports an empty .docx as extracted_empty', async () => {
         const r = await extractAttachment({ content: fixture('empty.docx'), contentType: DOCX_TYPE })
         expect(r.status).toBe('extracted_empty')
-        expect(r.extractedText).toBeUndefined()
+        expect(r.extractedText).toBe('') // present-empty, not undefined (field-presence cache contract)
     })
 
     // A docx mislabeled octet-stream is caught by its extension.
@@ -339,6 +357,45 @@ describe('attachextract — docx handler', () => {
         expect(r.routedBy).toBe('extension')
         expect(r.detectedType).toBe('docx')
         expect(r.status).toBe('extracted')
+    })
+})
+
+// DOC handler (legacy OLE Word) ----------------------------------------------
+// Real fixture generated with macOS textutil (-convert doc). Word 97–2003 is an OLE
+// compound binary mammoth can't read, so it routes to word-extractor instead.
+
+describe('attachextract — doc handler', () => {
+    it('extracts a real legacy .doc by content-type', async () => {
+        const r = await extractAttachment({ content: fixture('sample.doc'), contentType: 'application/msword', filename: 'report.doc' })
+        expect(r.status).toBe('extracted')
+        expect(r.detectedType).toBe('doc')
+        expect(r.routedBy).toBe('content-type')
+        expect(r.extractedText).toContain('First paragraph about revenue')
+        expect(r.extractedText).toContain('Second paragraph about costs')
+    })
+
+    // A .doc mislabeled octet-stream is rescued by the shared OLE magic + .doc extension —
+    // the extension gate matters because .xls/.ppt/.msg carry the identical OLE signature.
+    it('routes a mislabeled .doc by its OLE magic + extension', async () => {
+        const r = await extractAttachment({ content: fixture('sample.doc'), contentType: 'application/octet-stream', filename: 'report.doc' })
+        expect(r.detectedType).toBe('doc')
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText).toContain('First paragraph about revenue')
+    })
+
+    // OLE bytes with a non-.doc name must NOT be claimed as doc (could be xls/ppt/msg).
+    it('does not claim OLE bytes as doc without a .doc extension', async () => {
+        const r = await extractAttachment({ content: fixture('sample.doc'), contentType: 'application/octet-stream', filename: 'book.xls' })
+        expect(r.detectedType).toBeUndefined()
+        expect(r.status).toBe('skipped_unsupported_type')
+    })
+
+    // Attacker-controlled bytes that pass the msword route but don't parse fail cleanly.
+    it('returns failed (not a throw) on a corrupt .doc', async () => {
+        const r = await extractAttachment({ content: buf('this is not really an OLE document'), contentType: 'application/msword', filename: 'bad.doc' })
+        expect(r.status).toBe('failed')
+        expect(r.detectedType).toBe('doc')
+        expect(r.reason).toBeDefined()
     })
 })
 
