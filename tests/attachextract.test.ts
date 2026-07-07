@@ -2,8 +2,9 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import { describe, it, expect } from 'vitest'
+import iconv from 'iconv-lite'
 
-import { extractAttachment, detectRoute, MAX_INPUT_BYTES, MAX_OUTPUT_CHARS } from '../attachextract'
+import { extractAttachment, detectRoute, MAX_INPUT_BYTES, MAX_OUTPUT_CHARS, MAX_EML_CHILDREN } from '../attachextract'
 
 // Real fixtures generated once with macOS textutil (.docx) and cupsfilter (.pdf), and exceljs (.xlsx).
 // vitest runs from the repo root, so resolve against cwd.
@@ -240,6 +241,17 @@ describe('attachextract — charset-correct decoding', () => {
         expect(r.extractedText).toBe('hello world')
         expect(r.charset).toBe('utf-16le')
     })
+
+    // When the chosen charset is wrong and produces U+FFFD (jschardet confidently reads this
+    // undeclared big5 as GB2312), we fall back to byte-preserving latin1 — never emit replacement
+    // chars, which are unrecoverable. Bytes preserved, so it's reversible if the real encoding is known.
+    it('falls back to latin1 rather than emit U+FFFD on a wrong-charset decode', async () => {
+        const content = iconv.encode('你好世界，這是發票總額。'.repeat(15), 'big5')
+        const r = await extractAttachment({ content, contentType: 'text/plain' })
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText).not.toContain('�')
+        expect(r.charset).toBe('latin1')
+    })
 })
 
 // Safety ---------------------------------------------------------------------
@@ -391,9 +403,11 @@ describe('attachextract — doc handler', () => {
         expect(r.status).toBe('skipped_unsupported_type')
     })
 
-    // Attacker-controlled bytes that pass the msword route but don't parse fail cleanly.
+    // Bytes that carry the OLE magic (so magic-verify lets them through) but don't parse fail
+    // cleanly. NB: garbage WITHOUT the OLE magic is now rerouted by magic-verify, not sent here.
     it('returns failed (not a throw) on a corrupt .doc', async () => {
-        const r = await extractAttachment({ content: buf('this is not really an OLE document'), contentType: 'application/msword', filename: 'bad.doc' })
+        const oleGarbage = Buffer.concat([Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]), buf(' not a real doc body')])
+        const r = await extractAttachment({ content: oleGarbage, contentType: 'application/msword', filename: 'bad.doc' })
         expect(r.status).toBe('failed')
         expect(r.detectedType).toBe('doc')
         expect(r.reason).toBeDefined()
@@ -439,16 +453,28 @@ describe('attachextract — xlsx handler', () => {
         expect(r.status).toBe('extracted')
     })
 
-    // Zip bytes without a confirming extension must NOT be claimed as xlsx (could be docx/pptx/jar).
-    it('does not claim zip bytes as xlsx without a .xlsx extension', async () => {
+    // A real xlsx is identified from its OOXML part even when named .zip and typed octet-stream —
+    // content beats a missing/wrong extension.
+    it('detects an xlsx from content even when named .zip', async () => {
         const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: 'application/octet-stream', filename: 'archive.zip' })
+        expect(r.detectedType).toBe('xlsx')
+        expect(r.status).toBe('extracted')
+    })
+
+    // A generic (non-OOXML) zip has no docx/xlsx part, so it stays unrouted — not mis-claimed.
+    it('does not claim a non-OOXML zip', async () => {
+        const genericZip = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), buf('not an office file, just a zipped thing')])
+        const r = await extractAttachment({ content: genericZip, contentType: 'application/octet-stream', filename: 'bundle.zip' })
         expect(r.detectedType).toBeUndefined()
         expect(r.status).toBe('skipped_unsupported_type')
     })
 
-    // Attacker-controlled bytes that pass the xlsx route but don't parse fail cleanly.
+    // Bytes carrying the zip magic + the xl/workbook.xml marker (so content-detection routes them
+    // to xlsx) but with a corrupt body fail cleanly. NB: a bare "PK.." with no OOXML part is now
+    // rerouted by content-detection, not sent here.
     it('returns failed (not a throw) on a corrupt xlsx', async () => {
-        const r = await extractAttachment({ content: buf('PK\x03\x04 not a real workbook'), contentType: XLSX_TYPE, filename: 'bad.xlsx' })
+        const oxmlGarbage = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), buf('xl/workbook.xml'), buf(' corrupt body')])
+        const r = await extractAttachment({ content: oxmlGarbage, contentType: XLSX_TYPE, filename: 'bad.xlsx' })
         expect(r.status).toBe('failed')
         expect(r.detectedType).toBe('xlsx')
     })
@@ -481,6 +507,47 @@ describe('attachextract — output cap', () => {
         expect(r.status).toBe('extracted_empty')
         expect(r.extractedText).toBe('')
         expect(r.truncated).toBeUndefined()
+    })
+})
+
+// Magic-verify (mislabeled binary claims) ------------------------------------
+// A confident but wrong binary content-type (a PDF stamped application/…docx, etc.) must not go
+// straight to the wrong parser and fail — we verify content (magic bytes, and the OOXML part for
+// docx vs xlsx) first and re-sniff on mismatch.
+
+describe('attachextract — magic-verify of binary claims', () => {
+    const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+
+    // PDF bytes mislabeled as docx: the %PDF magic reroutes them back to the pdf handler.
+    it('recovers a PDF mislabeled as docx', async () => {
+        const r = await extractAttachment({ content: fixture('sample.pdf'), contentType: DOCX, filename: 'report.docx' })
+        expect(r.detectedType).toBe('pdf')
+        expect(r.routedBy).toBe('sniff')
+        expect(r.status).toBe('extracted')
+    })
+
+    // DOCX bytes mislabeled application/pdf recover to docx from their OOXML part — even with a
+    // lying .pdf name, since content (not the extension) decides.
+    it('recovers a DOCX mislabeled as pdf regardless of extension', async () => {
+        const r = await extractAttachment({ content: fixture('sample.docx'), contentType: 'application/pdf', filename: 'report.pdf' })
+        expect(r.detectedType).toBe('docx')
+        expect(r.status).toBe('extracted')
+    })
+
+    // The docx↔xlsx case magic bytes alone can't resolve: an xlsx mislabeled as docx is caught by
+    // its xl/workbook.xml part and rerouted to the xlsx handler instead of failing in mammoth.
+    it('recovers an xlsx mislabeled as docx via its OOXML part', async () => {
+        const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: DOCX, filename: 'report.docx' })
+        expect(r.detectedType).toBe('xlsx')
+        expect(r.status).toBe('extracted')
+    })
+
+    // Honest binary claims are unaffected — magic matches, no reroute.
+    it('leaves an honest PDF claim on the content-type route', async () => {
+        const r = await extractAttachment({ content: fixture('sample.pdf'), contentType: 'application/pdf', filename: 'x.pdf' })
+        expect(r.detectedType).toBe('pdf')
+        expect(r.routedBy).toBe('content-type')
+        expect(r.status).toBe('extracted')
     })
 })
 
@@ -581,4 +648,21 @@ describe('attachextract — eml handler', () => {
     // is always a subset of the (<=10 MB) outer email, so the outer size gate trips first
     // and the inner cap is unreachable in a single eml. Each child still runs the same
     // gated pipeline via extractAt(depth + 1).
+
+    // A mail packed with attachments must not fan out unbounded parsers: children are capped at
+    // MAX_EML_CHILDREN, and the ones we keep still extract correctly (batching preserves order).
+    it('caps the number of extracted children at MAX_EML_CHILDREN', async () => {
+        const boundary = 'MANY'
+        const n = MAX_EML_CHILDREN + 25
+        const parts = [`From: a@b.com\r\nSubject: Packed\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="${boundary}"\r\n`]
+        for (let i = 0; i < n; i++) {
+            parts.push(`\r\n--${boundary}\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename="a${i}.txt"\r\n\r\nchild ${i} body\r\n`)
+        }
+        parts.push(`\r\n--${boundary}--\r\n`)
+        const r = await extractAttachment({ content: Buffer.from(parts.join('')), contentType: 'message/rfc822' })
+        expect(r.children).toHaveLength(MAX_EML_CHILDREN)
+        // Kept children are real extractions in order, not dropped/garbled by the batching.
+        expect(r.children?.[0].extractedText).toContain('child 0 body')
+        expect(r.children?.[MAX_EML_CHILDREN - 1].status).toBe('extracted')
+    })
 })

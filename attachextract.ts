@@ -5,7 +5,9 @@
 // Ships as a separate subpath export ("agentextract/attachments") so the heavy
 // parsers stay out of the body extractor's bundle. New formats = new registry entries.
 
-// Converts bytes into text using a specific character encoding 
+import { isUtf8 } from 'node:buffer' // fast native check: are these bytes valid utf-8?
+
+// Converts bytes into text using a specific character encoding
 import iconv from 'iconv-lite'
 // Guesses what encoding a chunk of bytes is in (eg. UTF-8, UTF-16, or windows-1252)
 import jschardet from 'jschardet'
@@ -19,14 +21,19 @@ export const MAX_INPUT_BYTES = 10 * 1024 * 1024
 // Max extracted text length (JS chars). Input is byte-capped, but output isn't: a big
 // spreadsheet or HTML table can balloon into megabytes that then hit S3 and the search index.
 // Past this we truncate and set `truncated`.
-export const MAX_OUTPUT_CHARS = 1_000_000
+export const MAX_OUTPUT_CHARS = 250_000
 
-// Guard: if a handler takes >= 20 seconds, we stop awaiting it. Note: this can't
+// Guard: if a handler takes >= 10 seconds, we stop awaiting it. Note: this can't
 // cancel synchronous CPU-bound work — it only stops us waiting on a slow async parse.
-export const HANDLER_TIMEOUT_MS = 20_000
+export const HANDLER_TIMEOUT_MS = 10_000
 
 // For nested emails (.emls), we only descend one level (eg. a forward of a forward).
 export const MAX_NESTING_DEPTH = 1
+
+// A forwarded email can carry many attachments. Cap how many we recurse into, and parse them in
+// small batches, so one email can't fan out an unbounded number of parsers at once.
+export const MAX_EML_CHILDREN = 100
+const EML_CHILD_CONCURRENCY = 8
 
 // "Sniff" the first 8KB of the buffer to see if it looks like text.
 const SNIFF_BYTES = 8 * 1024
@@ -38,8 +45,8 @@ const DETECT_SAMPLE_BYTES = 64 * 1024
 // If the confidence is less than 70%, we don't trust the detection.
 const DETECT_MIN_CONFIDENCE = 0.7
 
-// below ~50 avg chars/page, a PDF with some text gets flagged as likely image-heavy 
-const PDF_MIN_CHARS_PER_PAGE = 50
+// below ~25 avg chars/page, a PDF with some text gets flagged as likely image-heavy 
+const PDF_MIN_CHARS_PER_PAGE = 25
 
 // Setup: converts folder-name string into raw bytes, so the code can search for that literal byte sequence inside the zip's raw contents. 
 const DOCX_MEDIA_MARKER = Buffer.from('word/media/')
@@ -154,17 +161,31 @@ const resolveCharset = (content: Buffer, hint?: string): string => {
     ) {
         return detected.encoding
     }
-    // 4. utf-8, then 5. latin1 as the guaranteed-decodable floor.
-    return iconv.encodingExists('utf-8') ? 'utf-8' : 'latin1'
+    // 4. Floor — no signal was trusted, so pick the least destructive decode. If the bytes are
+    //    valid utf-8, they almost certainly are utf-8. If not, this is single-byte legacy text,
+    //    and utf-8 would turn every high byte into U+FFFD — irreversible loss. So degrade
+    //    gracefully instead: take jschardet's guess even below the confidence gate (a plausible
+    //    decode beats guaranteed U+FFFD), and failing that latin1, which maps every byte to a
+    //    character — possibly wrong, but reversible.
+    if (isUtf8(content)) return 'utf-8'
+    if (detected?.encoding && iconv.encodingExists(detected.encoding)) return detected.encoding
+    return 'latin1'
 }
 
 // Decode the text using the correct charset.
 const decodeText = (content: Buffer, hint?: string): { text: string; charset: string } => {
     const charset = resolveCharset(content, hint) // get the correct charset (done above)
-    const text = iconv 
+    const text = iconv
         .decode(content, charset) // convert the raw bytes into a JS string using that encoding
         .replace(/^﻿/, '') // strip BOM (cleans the final output)
         .replace(/\r\n?/g, '\n') // normalizes the line endings
+    // U+FFFD means the charset was wrong — the decoder hit bytes it couldn't map (jschardet can
+    // confidently confuse e.g. big5 for GB2312). Those replacement chars are unrecoverable, so fall
+    // back to latin1, which maps every byte to a character (reversible, never destroys data). Genuine
+    // utf-8 text can legitimately contain U+FFFD, so leave that case — identified by isUtf8 — alone.
+    if (text.includes('�') && !isUtf8(content)) {
+        return { text: iconv.decode(content, 'latin1').replace(/\r\n?/g, '\n'), charset: 'latin1' }
+    }
     return { text, charset } // return the decoded text and the charset
 }
 
@@ -331,25 +352,18 @@ const emlHandler: Handler = {
         })
         const body = parsed.text?.trim() ? parsed.text : parsed.html ? await flattenHtml(parsed.html) : '' // get the text from the email or the html body
         const text = [parsed.subject, body].filter((part) => part && part.trim().length > 0).join('\n\n') // join the subject and body with a blank line
-        // Start building the (optional) array of results for any nested attachments. 
-        // Recursively extract the attachments.
-        const children = 
-            depth < MAX_NESTING_DEPTH && parsed.attachments.length > 0 
-                ? await Promise.all( 
-                      parsed.attachments.map((attachment) =>
-                          extractAt(
-                              {
-                                  content: attachment.content,
-                                  filename: attachment.filename,
-                                  contentType: attachment.contentType,
-                              },
-                              depth + 1
-                          )
-                      )
-                  )
-                : undefined
-
-        return { text, children }
+        // Recurse into nested attachments — but only up to MAX_EML_CHILDREN, and in batches of
+        // EML_CHILD_CONCURRENCY so a mail packed with attachments can't spin up every parser at once.
+        const nested = depth < MAX_NESTING_DEPTH ? parsed.attachments.slice(0, MAX_EML_CHILDREN) : []
+        const children: ExtractionResult[] = []
+        for (let i = 0; i < nested.length; i += EML_CHILD_CONCURRENCY) {
+            const batch = nested.slice(i, i + EML_CHILD_CONCURRENCY)
+            const results = await Promise.all(
+                batch.map((a) => extractAt({ content: a.content, filename: a.filename, contentType: a.contentType }, depth + 1))
+            )
+            children.push(...results)
+        }
+        return { text, children: children.length > 0 ? children : undefined }
     },
 }
 
@@ -430,21 +444,50 @@ const ZIP_MAGIC = Buffer.from([0x50, 0x4b, 0x03, 0x04])
 // text and leak the control words — detect it here to skip instead (see findByContentType).
 const RTF_MAGIC = Buffer.from('{\\rtf')
 // Legacy OLE files (.doc) start with this 8-byte signature. Shared by .xls/.ppt/.msg too, so —
-// like zip→docx — we only claim doc when the extension confirms it.
+// like OOXML — we only claim doc when the extension confirms it.
 const OLE_MAGIC = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
+
+// docx and xlsx share the zip magic, but their main part has a distinct path stored (uncompressed)
+// as a literal filename in the zip: word/document.xml vs xl/workbook.xml. Scanning for it tells the
+// two apart from content alone — no extension needed.
+const DOCX_PART = Buffer.from('word/document.xml')
+const XLSX_PART = Buffer.from('xl/workbook.xml')
 
 // Check if the file starts with the given magic bytes.
 const startsWith = (content: Buffer, magic: Buffer): boolean =>
     content.length >= magic.length && content.subarray(0, magic.length).equals(magic)
 
+// Which OOXML kind a zip is, by its main-part path. When both appear (a docx with an embedded
+// spreadsheet), the container's own part sits earlier in the file than the embedded object's, so
+// the earlier marker wins. Returns undefined for a non-OOXML zip (jar, plain archive, pptx).
+const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
+    const d = content.indexOf(DOCX_PART)
+    const x = content.indexOf(XLSX_PART)
+    if (d === -1 && x === -1) return undefined
+    if (x === -1) return 'docx'
+    if (d === -1) return 'xlsx'
+    return d < x ? 'docx' : 'xlsx'
+}
+
+// Does the content match a confident binary claim? Catches a wrong claim before we hand the bytes
+// to the parser. pdf/doc are a magic-byte prefix; docx/xlsx go by their OOXML main part (zip magic
+// alone can't tell them apart). text/html/eml have no single signature, so they always pass here —
+// lying text claims are handled separately by bytesContradictTextClaim.
+const magicOk = (kind: HandlerKind, content: Buffer): boolean => {
+    if (kind === 'pdf') return startsWith(content, PDF_MAGIC)
+    if (kind === 'doc') return startsWith(content, OLE_MAGIC)
+    if (kind === 'docx') return ooxmlKind(content) === 'docx'
+    if (kind === 'xlsx') return ooxmlKind(content) === 'xlsx'
+    return true
+}
+
 // Magic bytes are the strongest sniff signal, so they go first.
-// A BOM is next: UTF-16 text is full of NUL bytes, so looksLikeText would reject it as binary
-// docx and xlsx are both just zips (as are pptx/jar), so the zip magic alone can't tell them
-// apart — we only claim a specific OOXML kind when the extension confirms it.
+// A BOM is next: UTF-16 text is full of NUL bytes, so looksLikeText would reject it as binary.
+// A zip could be docx/xlsx/pptx/jar; ooxmlKind reads the content to pick docx vs xlsx (and skips
+// the rest), so we no longer need the extension to disambiguate.
 const sniff = (content: Buffer, ext?: string): HandlerKind | undefined => {
     if (startsWith(content, PDF_MAGIC)) return 'pdf'
-    if (startsWith(content, ZIP_MAGIC) && ext === '.docx') return 'docx'
-    if (startsWith(content, ZIP_MAGIC) && ext === '.xlsx') return 'xlsx'
+    if (startsWith(content, ZIP_MAGIC)) return ooxmlKind(content)
     if (startsWith(content, OLE_MAGIC) && ext === '.doc') return 'doc'
     // RTF is ASCII text but control-word markup, and we have no handler for it. Skip before the
     // looksLikeText check that would misclaim it as plain text and leak the control words.
@@ -476,12 +519,22 @@ export const detectRoute = (input: AttachmentInput): { kind?: HandlerKind; route
           ? ({ kind: byExt.kind, routedBy: 'extension' } as const)
           : undefined
 
-    // Distrust a text-decoding claim contradicted by the bytes (the type/extension lied).
-    if (claimed && (claimed.kind === 'text' || claimed.kind === 'html') && bytesContradictTextClaim(input.content)) {
-        const sniffed = sniff(input.content, ext)
-        return sniffed ? { kind: sniffed, routedBy: 'sniff' } : { routedBy: 'none' }
+    if (claimed) {
+        // Distrust a text-decoding claim contradicted by the bytes (the type/extension lied).
+        if ((claimed.kind === 'text' || claimed.kind === 'html') && bytesContradictTextClaim(input.content)) {
+            const sniffed = sniff(input.content, ext)
+            return sniffed ? { kind: sniffed, routedBy: 'sniff' } : { routedBy: 'none' }
+        }
+        // Distrust a binary claim the content contradicts — a PDF mislabeled .docx, or a
+        // spreadsheet mislabeled .docx (caught by its OOXML part, not just the shared zip magic).
+        // Handing wrong bytes to the parser just fails and loses any real text, so re-sniff to find
+        // the true format. Empty content has nothing to check — leave it to the parser.
+        if (input.content.length > 0 && !magicOk(claimed.kind, input.content)) {
+            const sniffed = sniff(input.content, ext)
+            return sniffed ? { kind: sniffed, routedBy: 'sniff' } : { routedBy: 'none' }
+        }
+        return claimed
     }
-    if (claimed) return claimed
 
     if (shouldSniff(type)) {
         const sniffed = sniff(input.content, ext)
