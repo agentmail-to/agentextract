@@ -144,14 +144,25 @@ const bomCharset = (content: Buffer): string | undefined => {
     return undefined
 }
 
-// Priority-ordered fallback chain (highest priority to lowest priority - try the most trustworthy thing, degrade gracefully). 
+// Priority-ordered fallback chain (highest priority to lowest priority - try the most trustworthy thing, degrade gracefully).
 const resolveCharset = (content: Buffer, hint?: string): string => {
-    // 1. Explicit charset from the Content-Type, if iconv-lite knows it.
-    if (hint && iconv.encodingExists(hint)) return hint
-    // 2. A BOM is definitive — trust it over statistical detection.
+    // 1. A BOM is definitive — the bytes declare their own encoding. Trust it above the
+    //    Content-Type hint: a stale/wrong charset= param must not override an in-band BOM
+    //    (e.g. a UTF-16 file mislabeled charset=windows-1252 would otherwise decode as garbage).
     const bom = bomCharset(content)
     if (bom) return bom
-    // 3. Statistical detection on the head, gated on confidence.
+    // 2. Valid UTF-8 is self-evidencing — the multi-byte sequences are near-impossible to hit by
+    //    accident, so trust the content over a hint that would mangle it. Pure-ASCII text is also
+    //    valid utf-8 and decodes identically under latin1/windows-1252, so this never loses data;
+    //    it only stops a wrong hint from corrupting genuine utf-8 multi-byte characters.
+    //    Guard on NUL: BOM-less UTF-16 ASCII (h\0e\0l\0...) is technically valid utf-8 yet is really
+    //    UTF-16 — decoding it as utf-8 would keep the interleaved NULs. Genuine utf-8 text has none.
+    //    (The router already skips NUL-heavy text upstream, so for now this only backstops a
+    //    direct decodeText caller, but it keeps resolveCharset correct without relying on that.)
+    if (isUtf8(content) && !content.subarray(0, SNIFF_BYTES).includes(0)) return 'utf-8'
+    // 3. Explicit charset from the Content-Type, if iconv-lite knows it.
+    if (hint && iconv.encodingExists(hint)) return hint
+    // 4. Statistical detection on the head, gated on confidence.
     const detected = jschardet.detect(content.subarray(0, DETECT_SAMPLE_BYTES))
     if (
         detected &&
@@ -161,13 +172,11 @@ const resolveCharset = (content: Buffer, hint?: string): string => {
     ) {
         return detected.encoding
     }
-    // 4. Floor — no signal was trusted, so pick the least destructive decode. If the bytes are
-    //    valid utf-8, they almost certainly are utf-8. If not, this is single-byte legacy text,
-    //    and utf-8 would turn every high byte into U+FFFD — irreversible loss. So degrade
-    //    gracefully instead: take jschardet's guess even below the confidence gate (a plausible
-    //    decode beats guaranteed U+FFFD), and failing that latin1, which maps every byte to a
-    //    character — possibly wrong, but reversible.
-    if (isUtf8(content)) return 'utf-8'
+    // 5. Floor — no signal was trusted. This isn't valid utf-8 (step 2 ruled that out), so it's
+    //    single-byte legacy text, and utf-8 would turn every high byte into U+FFFD — irreversible
+    //    loss. So degrade gracefully instead: take jschardet's guess even below the confidence gate
+    //    (a plausible decode beats guaranteed U+FFFD), and failing that latin1, which maps every
+    //    byte to a character — possibly wrong, but reversible.
     if (detected?.encoding && iconv.encodingExists(detected.encoding)) return detected.encoding
     return 'latin1'
 }

@@ -242,6 +242,26 @@ describe('attachextract — charset-correct decoding', () => {
         expect(r.charset).toBe('utf-16le')
     })
 
+    // Precedence: an in-band BOM is definitive and must beat a wrong Content-Type charset. A
+    // UTF-16 file mislabeled charset=windows-1252 would mojibake under the hint; the BOM wins.
+    it('lets a BOM override a contradicting charset hint', async () => {
+        const content = Buffer.from('﻿facturé', 'utf16le') // real UTF-16LE BOM, lying windows-1252 label
+        const r = await extractAttachment({ content, contentType: 'text/plain; charset=windows-1252' })
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText).toBe('facturé')
+        expect(r.charset).toBe('utf-16le') // hint ignored in favor of the BOM
+    })
+
+    // Precedence: content that is provably valid UTF-8 must not be mangled by a wrong single-byte
+    // hint. windows-1252 would turn each multi-byte char into two garbage chars; UTF-8 wins.
+    it('keeps valid UTF-8 multi-byte text despite a wrong single-byte charset hint', async () => {
+        const content = Buffer.from('café ünïcode 中文', 'utf8')
+        const r = await extractAttachment({ content, contentType: 'text/plain; charset=windows-1252' })
+        expect(r.status).toBe('extracted')
+        expect(r.extractedText).toBe('café ünïcode 中文') // decoded as utf-8, not the declared hint
+        expect(r.charset).toBe('utf-8')
+    })
+
     // When the chosen charset is wrong and produces U+FFFD (jschardet confidently reads this
     // undeclared big5 as GB2312), we fall back to byte-preserving latin1 — never emit replacement
     // chars, which are unrecoverable. Bytes preserved, so it's reversible if the real encoding is known.
