@@ -1,4 +1,18 @@
-// PLAIN TEXT VERSION 
+// PLAIN TEXT VERSION
+
+// Attachment text extraction (pdf/docx/xlsx/eml/...) is exposed at the top level too, so consumers
+// reach it via `import { extractAttachment } from 'agentextract'` alongside extractEmailBody — not
+// only through the 'agentextract/attachments' subpath. The subpath export stays for callers that
+// want it in isolation. Each handler lazy-loads its heavy parser, so this re-export costs nothing
+// until extractAttachment is actually called.
+export { extractAttachment, detectRoute } from './attachextract'
+export type {
+    AttachmentInput,
+    ExtractionResult,
+    ExtractionStatus,
+    HandlerKind,
+    RoutedBy,
+} from './attachextract'
 
 //
 const ATTRIBUTION_WRAP_WINDOW = 2

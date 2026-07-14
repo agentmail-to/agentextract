@@ -34,6 +34,10 @@
     ".": {
       "types": "./dist/agentextract.d.ts",
       "default": "./dist/agentextract.js"
+    },
+    "./attachments": {
+      "types": "./dist/attachextract.d.ts",
+      "default": "./dist/attachextract.js"
     }
   },
   "files": [
@@ -50,7 +54,21 @@
     "prepublishOnly": "npm run test"
   },
   "devDependencies": {
+    "@types/html-to-text": "^9.0.4",
+    "@types/mailparser": "^3.4.6",
+    "@types/node": "^22.20.0",
+    "@types/word-extractor": "^1.0.6",
     "typescript": "^6.0.3",
     "vitest": "^4.1.2"
+  },
+  "dependencies": {
+    "exceljs": "^4.4.0",
+    "html-to-text": "^10.0.0",
+    "iconv-lite": "^0.7.2",
+    "jschardet": "^3.1.4",
+    "mailparser": "^3.9.12",
+    "mammoth": "^1.12.0",
+    "unpdf": "^1.6.2",
+    "word-extractor": "^1.0.4"
   }
 }

@@ -37,6 +37,29 @@ The underlying stages are exported too, if you need them on their own:
 - `stripNoise(text)` / `stripNoiseHtml(html)` — trailing-boilerplate removal
 - `isTrueDsn(text)` — DSN / bounce detection
 
+## Attachments
+
+`extractAttachment(input)` pulls the text out of an email attachment — plain text, HTML, PDF, Word
+(`.docx` + legacy `.doc`), Excel (`.xlsx`), and nested emails (`.eml`). It never throws on bad or
+attacker-controlled input; failures come back as a labeled `failed` / `skipped_*` status.
+
+```ts
+import { extractAttachment } from 'agentextract'
+
+const result = await extractAttachment({
+  content: buffer, // the raw attachment bytes
+  filename: 'report.pdf',
+  contentType: 'application/pdf',
+})
+// result.status === 'extracted'
+// result.extractedText === 'Q3 revenue …'
+```
+
+The heavy parsers (`unpdf`, `mammoth`, `exceljs`, …) are lazy-loaded per handler, so importing
+`extractAttachment` costs nothing until you actually call it on a matching attachment. It's also
+available on its own subpath — `import { extractAttachment } from 'agentextract/attachments'` — if
+you want to reach it without touching the body-extraction entry point.
+
 ## What it does that off-the-shelf engines don't
 
 Benchmarked against TalonJS and Mailgun Talon on a real corpus of ~41k messages (exact-match vs a

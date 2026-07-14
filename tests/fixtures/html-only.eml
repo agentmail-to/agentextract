@@ -1,0 +1,8 @@
+From: alice@example.com
+To: bob@example.com
+Subject: HTML greeting
+Date: Mon, 1 Jan 2024 10:00:00 +0000
+Message-ID: <html-1@example.com>
+Content-Type: text/html; charset=utf-8
+
+<html><body><h1>Welcome</h1><p>This is an <b>HTML</b> only email body.</p></body></html>

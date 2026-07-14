@@ -4,6 +4,8 @@ node_modules/
 dist/
 coverage/
 
-# Large eval data (never commit) — corpus, answer keys, cached engine outputs
+# Evals (never commit) — harnesses run against real production data.
+# The whole dir stays local: corpus, answer keys, cached engine outputs, and fixtures.
+eval/
 *.jsonl
 threads.jsonl
