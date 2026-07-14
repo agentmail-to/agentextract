@@ -1,7 +1,7 @@
 // attachextract — text extraction for email attachments.
 //
-// In scope: text, HTML, PDF, Word (.docx + legacy .doc), Excel (.xlsx), and nested emails
-// (.eml). Out of scope: images/OCR, legacy .xls/.ppt, and archives — those return a labeled skip.
+// In scope: text, HTML, PDF, Word (.docx + legacy .doc), and Excel (.xlsx). Out of scope: nested
+// emails (.eml), images/OCR, legacy .xls/.ppt, and archives — those return a labeled skip.
 // Ships as a separate subpath export ("agentextract/attachments") so the heavy
 // parsers stay out of the body extractor's bundle. New formats = new registry entries.
 
@@ -20,20 +20,12 @@ export const MAX_INPUT_BYTES = 10 * 1024 * 1024
 
 // Max extracted text length (JS chars). Input is byte-capped, but output isn't: a big
 // spreadsheet or HTML table can balloon into megabytes that then hit S3 and the search index.
-// Past this we truncate and set `truncated`.
+// Past this the text is truncated (bounded silently — there is no truncation flag on the result).
 export const MAX_OUTPUT_CHARS = 250_000
 
 // Guard: if a handler takes >= 10 seconds, we stop awaiting it. Note: this can't
 // cancel synchronous CPU-bound work — it only stops us waiting on a slow async parse.
 export const HANDLER_TIMEOUT_MS = 10_000
-
-// For nested emails (.emls), we only descend one level (eg. a forward of a forward).
-export const MAX_NESTING_DEPTH = 1
-
-// A forwarded email can carry many attachments. Cap how many we recurse into, and parse them in
-// small batches, so one email can't fan out an unbounded number of parsers at once.
-export const MAX_EML_CHILDREN = 100
-const EML_CHILD_CONCURRENCY = 8
 
 // "Sniff" the first 8KB of the buffer to see if it looks like text.
 const SNIFF_BYTES = 8 * 1024
@@ -58,11 +50,9 @@ const DOCX_MIN_TEXT_CHARS = 200
 
 // The status of the extraction.
 export type ExtractionStatus =
-    | 'extracted' // real text obtained
-    | 'extracted_empty' // handler succeeded but produced no text (e.g. scanned PDF) — terminal, valid
-    | 'skipped_oversize' // over MAX_INPUT_BYTES, never attempted
-    | 'skipped_unsupported_type' // image, spreadsheet, archive, binary, etc.
-    | 'failed' // parser threw, timed out, or decode failed 
+    | 'extracted' // handler ran (extraction holds the text, or is omitted when it produced none)
+    | 'skipped' // over MAX_INPUT_BYTES, or unsupported/unrecognized type — never attempted
+    | 'failed' // parser threw, timed out, or decode failed
 
 // Records which signal ended up deciding the route.
 export type RoutedBy = 'content-type' | 'extension' | 'sniff' | 'none'
@@ -74,8 +64,7 @@ export type RoutedBy = 'content-type' | 'extension' | 'sniff' | 'none'
 // docx: docx (modern OOXML Word)
 // doc: doc (legacy OLE Word, Word 97–2003)
 // xlsx: xlsx (modern OOXML Excel)
-// eml: eml
-export type HandlerKind = 'text' | 'html' | 'pdf' | 'docx' | 'doc' | 'xlsx' | 'eml'
+export type HandlerKind = 'text' | 'html' | 'pdf' | 'docx' | 'doc' | 'xlsx'
 
 // The input to the extraction.
 export interface AttachmentInput {
@@ -86,22 +75,9 @@ export interface AttachmentInput {
 
 // The output of the extraction.
 export interface ExtractionResult {
-    filename?: string // the name of the attachment
-    detectedType?: HandlerKind // the handler that ran; undefined when nothing matched (eg. image, spreadsheet, archive, binary, etc.)
-    routedBy: RoutedBy // how we decided what handler to use 
-    charset?: string // set when a text handler decoded 
-    byteSize: number // the size of the attachment in bytes 
-    status: ExtractionStatus // the status of the extraction 
-    reason?: string // set on failed / skipped_* 
-    extractedText?: string // present ('' if empty) on extracted/extracted_empty; undefined on skip/failed
-    truncated?: boolean // true if extractedText was cut off at MAX_OUTPUT_CHARS (more text existed than we kept)
-    children?: ExtractionResult[] // .eml only — one result per inner attachment
-
-    // Image-awareness signals. No OCR, but we flag when a document likely holds text we could not reach (eg. image-heavy). 
-    // For future OCR passes.
-    lowTextDensity?: boolean // real text obtained, but sparse / some pages had none — likely image-heavy
-    pageCount?: number // PDF only — total pages 
-    emptyPageCount?: number // PDF only — pages with no extractable text (likely image pages)
+    status: ExtractionStatus // the status of the extraction
+    extraction?: string // the extracted text; omitted entirely (never '') when the handler produced none
+    reason?: string // set on skipped / failed
 }
 
 // The context for a handler.
@@ -109,7 +85,6 @@ interface HandlerContext {
     content: Buffer // the raw bytes of the attachment
     filename?: string // the name of the attachment
     charsetHint?: string // from the content-type charset= param
-    depth: number // nesting guard for the eml handler
 }
 
 // The output of a handler.
@@ -117,7 +92,6 @@ interface HandlerOutput {
     text: string // the text of the attachment
     charset?: string // text handlers report the charset they decoded with
     empty?: boolean // handler's own emptiness call; defaults to text.trim() === ''
-    children?: ExtractionResult[] // eml only
     lowTextDensity?: boolean // image-awareness signal (pdf/docx)
     pageCount?: number // pdf only
     emptyPageCount?: number // pdf only
@@ -125,7 +99,7 @@ interface HandlerOutput {
 
 // Handler takes context and returns an output. 
 interface Handler {
-    kind: HandlerKind // the type of the handler (eg. text, html, pdf, docx, eml)
+    kind: HandlerKind // the type of the handler (eg. text, html, pdf, docx, xlsx)
     contentTypes: string[] // exact, lowercased, param-stripped
     extensions: string[] // with leading dot, lowercased
     extract: (ctx: HandlerContext) => Promise<HandlerOutput>
@@ -215,7 +189,8 @@ const textHandler: Handler = {
         'text/x-vcard',
         'text/enriched',
         // Header-only / report MIME types (DSNs, ARF spam reports) — text, not a full email.
-        // NB: message/global is NOT here — it's a full internationalized email (eml handler).
+        // NB: message/global is NOT here — it's a full internationalized email, which is out of
+        // scope in this version (no eml handler), so it routes to nothing and lands on a skip.
         'message/global-headers',
         'message/delivery-status',
         'message/feedback-report',
@@ -247,7 +222,7 @@ const textHandler: Handler = {
 // NOTE: Lazy loading so that a Lambda that only ever sees text attachments never pays to load pdf.js / mammoth (heavier dependencies). 
 
 // Helper function: Shared HTML -> visible-text flattening, 
-// used by the html handler and reused by the eml handler for html-only forwarded bodies. 
+// used by the html handler to turn an HTML document into visible text.
 const flattenHtml = async (html: string): Promise<string> => {
     const { convert } = await import('html-to-text')
     return convert(html, {
@@ -344,39 +319,10 @@ const xlsxHandler: Handler = {
     },
 }
 
-// EML handler - eml
-const emlHandler: Handler = {
-    kind: 'eml',
-    // message/global is the internationalized (SMTPUTF8) equivalent of message/rfc822 — a
-    // full email, not a headers blob, so it parses through mailparser like any other .eml.
-    contentTypes: ['message/rfc822', 'message/global'],
-    extensions: ['.eml'],
-    extract: async ({ content, depth }) => {
-        const { simpleParser } = await import('mailparser') // mailparser is a library that parses emails
-        const parsed = await simpleParser(content, {
-            skipHtmlToText: true, // skip the html to text conversion so our HTML handler owns that path
-            skipTextToHtml: true, // skip the text to html conversion so our HTML handler owns that path
-            skipImageLinks: true, // skip the image links so we don't include them in the text
-            skipTextLinks: true, // skip the text links so we don't include them in the text
-        })
-        const body = parsed.text?.trim() ? parsed.text : parsed.html ? await flattenHtml(parsed.html) : '' // get the text from the email or the html body
-        const text = [parsed.subject, body].filter((part) => part && part.trim().length > 0).join('\n\n') // join the subject and body with a blank line
-        // Recurse into nested attachments — but only up to MAX_EML_CHILDREN, and in batches of
-        // EML_CHILD_CONCURRENCY so a mail packed with attachments can't spin up every parser at once.
-        const nested = depth < MAX_NESTING_DEPTH ? parsed.attachments.slice(0, MAX_EML_CHILDREN) : []
-        const children: ExtractionResult[] = []
-        for (let i = 0; i < nested.length; i += EML_CHILD_CONCURRENCY) {
-            const batch = nested.slice(i, i + EML_CHILD_CONCURRENCY)
-            const results = await Promise.all(
-                batch.map((a) => extractAt({ content: a.content, filename: a.filename, contentType: a.contentType }, depth + 1))
-            )
-            children.push(...results)
-        }
-        return { text, children: children.length > 0 ? children : undefined }
-    },
-}
+// NB: no EML handler in this version — nested emails (.eml / message/rfc822 / message/global) are
+// out of scope and route to nothing, so they land on a labeled skip.
 
-const REGISTRY: Handler[] = [textHandler, htmlHandler, pdfHandler, docxHandler, docHandler, xlsxHandler, emlHandler]
+const REGISTRY: Handler[] = [textHandler, htmlHandler, pdfHandler, docxHandler, docHandler, xlsxHandler]
 
 const findHandler = (kind: HandlerKind): Handler | undefined => REGISTRY.find((h) => h.kind === kind) // Look up the handler in that array whose kind matches the one requested.
 
@@ -480,7 +426,7 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
 
 // Does the content match a confident binary claim? Catches a wrong claim before we hand the bytes
 // to the parser. pdf/doc are a magic-byte prefix; docx/xlsx go by their OOXML main part (zip magic
-// alone can't tell them apart). text/html/eml have no single signature, so they always pass here —
+// alone can't tell them apart). text/html have no single signature, so they always pass here —
 // lying text claims are handled separately by bytesContradictTextClaim.
 const magicOk = (kind: HandlerKind, content: Buffer): boolean => {
     if (kind === 'pdf') return startsWith(content, PDF_MAGIC)
@@ -588,83 +534,46 @@ const errorMessage = (error: unknown): string => (error instanceof Error ? error
 // Calls everything, in the right order, with the right safety nets around each risky step, 
 // and produces a complete, labeled ExtractionResult.
 
-// Main entry point for extracting an attachment. 
-// Takes an AttachmentInput and a depth (for nested emails) and returns an ExtractionResult.
-const extractAt = async (input: AttachmentInput, depth: number): Promise<ExtractionResult> => {
+// Main entry point for extracting an attachment. Returns a labeled ExtractionResult:
+// status, the extracted text (omitted when there is none — never ''), and a reason on skip/fail.
+export const extractAttachment = async (input: AttachmentInput): Promise<ExtractionResult> => {
     const byteSize = input.content.length
-    const base = {
-        filename: input.filename,
-        byteSize,
-    }
 
     // Size gate BEFORE any decode/parse. If the attachment is too large, skip it.
     if (byteSize > MAX_INPUT_BYTES) {
-        return {
-            ...base,
-            routedBy: 'none',
-            status: 'skipped_oversize',
-            reason: `${byteSize} bytes exceeds ${MAX_INPUT_BYTES}`,
-        }
+        return { status: 'skipped', reason: `${byteSize} bytes exceeds ${MAX_INPUT_BYTES}` }
     }
 
     const { type, charset: charsetHint } = parseContentType(input.contentType) // declared type + charset, parsed once
-    const { kind, routedBy } = detectRoute(input) // figure out what kind of file this is, and confidence level
+    const { kind } = detectRoute(input) // figure out what kind of file this is
     const handler = kind ? findHandler(kind) : undefined // look up the actual handler for that kind, if we found one
 
     // No handler found for this kind — unsupported or unrecognized format, skip it.
-    if (!handler) { 
-        return {
-            ...base,
-            routedBy,
-            status: 'skipped_unsupported_type',
-            reason: type ? `unsupported type ${type}` : 'unrecognized attachment',
-        }
+    if (!handler) {
+        return { status: 'skipped', reason: type ? `unsupported type ${type}` : 'unrecognized attachment' }
     }
 
     // Run the handler safely — catch errors/timeouts instead of crashing, and build the final result.
     try {
         const output = await withTimeout( // Enforce a time limit so a slow/hung handler doesn't block forever.
-            handler.extract({ content: input.content, filename: input.filename, charsetHint, depth }),
-            HANDLER_TIMEOUT_MS 
+            handler.extract({ content: input.content, filename: input.filename, charsetHint }),
+            HANDLER_TIMEOUT_MS
         )
         const isEmpty = output.empty ?? output.text.trim().length === 0
-        // Cap output centrally so every handler is bounded the same way. Don't split a surrogate
-        // pair at the boundary (would leave a lone half that serializes as U+FFFD).
+        // Cap output centrally so a pathological document can't dump megabytes into S3 + the search
+        // index. Don't split a surrogate pair at the boundary (a lone half serializes as U+FFFD).
         const overCap = output.text.length > MAX_OUTPUT_CHARS
         const capEnd =
             overCap && output.text.charCodeAt(MAX_OUTPUT_CHARS - 1) >= 0xd800 && output.text.charCodeAt(MAX_OUTPUT_CHARS - 1) <= 0xdbff
                 ? MAX_OUTPUT_CHARS - 1
                 : MAX_OUTPUT_CHARS
         const text = overCap ? output.text.slice(0, capEnd) : output.text
-        return {
-            ...base,
-            detectedType: handler.kind,
-            routedBy,
-            charset: output.charset,
-            status: isEmpty ? 'extracted_empty' : 'extracted',
-            // A handler that ran always returns a present string ('' if empty), never undefined.
-            // The cache reads "field present ⇒ cached", so an empty attachment stays cached instead
-            // of re-extracting forever. Skip/failed leave it undefined below — i.e. "retry me".
-            extractedText: isEmpty ? '' : text,
-            truncated: overCap || undefined, // flag when there was more text than we kept
-            children: output.children,
-            // Image-awareness signals pass through unchanged; page counts are reported
-            // even on extracted_empty so an OCR pass knows how many pages to render.
-            lowTextDensity: output.lowTextDensity,
-            pageCount: output.pageCount,
-            emptyPageCount: output.emptyPageCount,
-        }
+        // The extracted text — omitted entirely (never '') when the handler produced none. A
+        // consumer reads a present `extraction` as "has text", its absence as "ran, but empty".
+        return isEmpty ? { status: 'extracted' } : { status: 'extracted', extraction: text }
     } catch (error) {
         // Attacker-controlled bytes: a throw or timeout is an expected event, captured as
         // 'failed' with the reason — never propagated to crash the caller.
-        return {
-            ...base,
-            detectedType: handler.kind,
-            routedBy,
-            status: 'failed',
-            reason: errorMessage(error),
-        }
+        return { status: 'failed', reason: errorMessage(error) }
     }
 }
-// Public entry point — starts the recursion at depth 0.
-export const extractAttachment = (input: AttachmentInput): Promise<ExtractionResult> => extractAt(input, 0)
