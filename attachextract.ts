@@ -166,7 +166,9 @@ const decodeText = (content: Buffer, hint?: string): { text: string; charset: st
     // confidently confuse e.g. big5 for GB2312). Those replacement chars are unrecoverable, so fall
     // back to latin1, which maps every byte to a character (reversible, never destroys data). Genuine
     // utf-8 text can legitimately contain U+FFFD, so leave that case — identified by isUtf8 — alone.
-    if (text.includes('�') && !isUtf8(content)) {
+    // A BOM makes the charset DEFINITIVE (e.g. a UTF-16 file that legitimately contains U+FFFD): trust
+    // it, never re-decode as latin1 — that would keep the interleaved NULs from the two-byte units.
+    if (text.includes('�') && !isUtf8(content) && !bomCharset(content)) {
         return { text: iconv.decode(content, 'latin1').replace(/\r\n?/g, '\n'), charset: 'latin1' }
     }
     return { text, charset } // return the decoded text and the charset
@@ -475,8 +477,14 @@ export const detectRoute = (input: AttachmentInput): { kind?: HandlerKind; route
           : undefined
 
     if (claimed) {
-        // Distrust a text-decoding claim contradicted by the bytes (the type/extension lied).
-        if ((claimed.kind === 'text' || claimed.kind === 'html') && bytesContradictTextClaim(input.content)) {
+        // Distrust a text-decoding claim contradicted by the bytes (the type/extension lied), OR one
+        // whose bytes are RTF — RTF is printable ASCII so it slips past bytesContradictTextClaim, but
+        // it's control-word markup with no handler and must not decode as body text. Re-sniffing hits
+        // the RTF_MAGIC skip in sniff() and lands on a labeled skip instead of leaking control words.
+        if (
+            (claimed.kind === 'text' || claimed.kind === 'html') &&
+            (bytesContradictTextClaim(input.content) || startsWith(input.content, RTF_MAGIC))
+        ) {
             const sniffed = sniff(input.content, ext)
             return sniffed ? { kind: sniffed, routedBy: 'sniff' } : { routedBy: 'none' }
         }
@@ -538,6 +546,13 @@ const errorMessage = (error: unknown): string => (error instanceof Error ? error
 // status, the extracted text (omitted when there is none — never ''), and a reason on skip/fail.
 export const extractAttachment = async (input: AttachmentInput): Promise<ExtractionResult> => {
     const byteSize = input.content.length
+
+    // Empty content has nothing to extract — resolve it here so the status is consistent regardless
+    // of the declared type (otherwise an empty PDF/OOXML routes into a parser that throws on zero
+    // bytes → 'failed', while empty text → 'extracted'). Treat all empties as ran-but-empty.
+    if (byteSize === 0) {
+        return { status: 'extracted' }
+    }
 
     // Size gate BEFORE any decode/parse. If the attachment is too large, skip it.
     if (byteSize > MAX_INPUT_BYTES) {

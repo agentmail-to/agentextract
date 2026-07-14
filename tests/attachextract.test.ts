@@ -626,3 +626,94 @@ describe('attachextract — image-heavy documents', () => {
 
 // NB: no EML handler in this version. Nested emails (.eml / message/rfc822 / message/global) are
 // out of scope and skip — see the "skips full emails" case in the routing block above.
+
+// Edge cases surfaced by an adversarial pass. The first three guard the fixes in this change; the
+// last two document limitations left as-is (a CONFIRM test, and an it.fails marker).
+describe('attachextract — edge cases (regression)', () => {
+    // A validly BOM-decoded UTF-16 buffer that legitimately contains U+FFFD must NOT be re-decoded
+    // as latin1 — that would keep the interleaved NULs from the two-byte units. decodeText's latin1
+    // fallback is now gated on !bomCharset, so a BOM-definitive charset is trusted.
+    it('keeps valid UTF-16LE text containing a literal U+FFFD (no latin1 corruption)', async () => {
+        const content = Buffer.from('﻿a�b', 'utf16le') // BOM + "a�b", genuinely UTF-16LE
+        const r = await extractAttachment({ content, contentType: 'text/plain' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBe('a�b') // correct utf-16le decode
+        expect(r.extraction ?? '').not.toContain('\u0000') // no NULs from a latin1 re-decode
+    })
+
+    // RTF is printable ASCII, so it slips past bytesContradictTextClaim; sent as text/plain it must
+    // still skip (not leak control words), matching the text/rtf and octet-stream paths. detectRoute
+    // now voids a text/html claim whose bytes start with RTF_MAGIC and re-sniffs to a labeled skip.
+    it('skips RTF sent as text/plain instead of leaking control words', async () => {
+        const rtf = Buffer.from('{\\rtf1\\ansi\\deff0 Dear team, the meeting is at noon.\\par}', 'utf8')
+        const r = await extractAttachment({ content: rtf, contentType: 'text/plain' })
+        expect(r.status).toBe('skipped')
+        expect(r.extraction ?? '').not.toContain('\\rtf1')
+    })
+
+    // A zero-byte attachment resolves to the same status regardless of declared type — an early gate
+    // returns 'extracted' (ran, no text) before an empty PDF/OOXML could route into a parser that
+    // throws on zero bytes and reports 'failed'.
+    it('gives a zero-byte attachment a consistent status across declared types', async () => {
+        const empty = Buffer.alloc(0)
+        const asText = await extractAttachment({ content: empty, contentType: 'text/plain' })
+        const asPdf = await extractAttachment({ content: empty, contentType: 'application/pdf' })
+        expect(asText.status).toBe('extracted')
+        expect(asPdf.status).toBe(asText.status)
+        expect(asPdf.extraction).toBeUndefined()
+    })
+
+    // Documented limitation — withTimeout (attachextract.ts:514) is not exported, so replicate it
+    // verbatim. Rejecting the wrapper does NOT cancel the underlying handler: its CPU work runs to
+    // completion regardless (wasted CPU/memory after we time out). Can't be fixed without a
+    // cancellable/off-thread parser.
+    it('CONFIRM: withTimeout rejects at the deadline yet the handler still runs to completion', async () => {
+        const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
+            new Promise((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error(`timeout ${ms}ms`)), ms)
+                p.then(
+                    (v) => {
+                        clearTimeout(timer)
+                        resolve(v)
+                    },
+                    (e) => {
+                        clearTimeout(timer)
+                        reject(e)
+                    }
+                )
+            })
+
+        let ranToCompletion = false
+        const handler = (async () => {
+            await new Promise((r) => setTimeout(r, 40)) // async gap > timeout so the timer fires
+            const end = Date.now() + 80
+            while (Date.now() < end) {
+                /* synchronous CPU burn — uncancellable */
+            }
+            ranToCompletion = true
+            return 'done'
+        })()
+
+        let outcome = 'resolved'
+        try {
+            await withTimeout(handler, 20)
+        } catch {
+            outcome = 'rejected'
+        }
+        expect(outcome).toBe('rejected') // we stopped waiting at 20ms
+        expect(ranToCompletion).toBe(false) // work had not finished when we gave up
+        await handler // the uncancelled handler runs on...
+        expect(ranToCompletion).toBe(true) // ...and completes its CPU work anyway
+    })
+
+    // Documented limitation, ACCEPTED BY DESIGN — the 3-field slim intentionally dropped the
+    // `truncated` flag, so over-cap output is bounded silently. Marked it.fails so it records the
+    // gap without reddening the suite; if a truncation signal is ever re-added, this flips.
+    it.fails('over-cap output is truncated with no signal in the result', async () => {
+        const content = Buffer.alloc(2 * MAX_OUTPUT_CHARS, 0x41) // 500k "A", under the 10MB input cap
+        const r = await extractAttachment({ content, contentType: 'text/plain' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction?.length).toBe(MAX_OUTPUT_CHARS) // capped
+        expect(r).toHaveProperty('truncated') // no field signals truncation
+    })
+})
