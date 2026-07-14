@@ -37,14 +37,6 @@ const DETECT_SAMPLE_BYTES = 64 * 1024
 // If the confidence is less than 70%, we don't trust the detection.
 const DETECT_MIN_CONFIDENCE = 0.7
 
-// below ~25 avg chars/page, a PDF with some text gets flagged as likely image-heavy 
-const PDF_MIN_CHARS_PER_PAGE = 25
-
-// Setup: converts folder-name string into raw bytes, so the code can search for that literal byte sequence inside the zip's raw contents. 
-const DOCX_MEDIA_MARKER = Buffer.from('word/media/')
-// below 200 chars AND the doc has embedded media -> flagged as likely image-heavy 
-const DOCX_MIN_TEXT_CHARS = 200
-
 /////////////////////////////////////////////////////////////
 // TYPES
 
@@ -90,11 +82,7 @@ interface HandlerContext {
 // The output of a handler.
 interface HandlerOutput {
     text: string // the text of the attachment
-    charset?: string // text handlers report the charset they decoded with
     empty?: boolean // handler's own emptiness call; defaults to text.trim() === ''
-    lowTextDensity?: boolean // image-awareness signal (pdf/docx)
-    pageCount?: number // pdf only
-    emptyPageCount?: number // pdf only
 }
 
 // Handler takes context and returns an output. 
@@ -155,9 +143,9 @@ const resolveCharset = (content: Buffer, hint?: string): string => {
     return 'latin1'
 }
 
-// Decode the text using the correct charset.
-const decodeText = (content: Buffer, hint?: string): { text: string; charset: string } => {
-    const charset = resolveCharset(content, hint) // get the correct charset (done above)
+// Decode the raw bytes to text using the correct charset.
+const decodeText = (content: Buffer, hint?: string): string => {
+    const charset = resolveCharset(content, hint) // pick the charset (see resolveCharset above)
     const text = iconv
         .decode(content, charset) // convert the raw bytes into a JS string using that encoding
         .replace(/^﻿/, '') // strip BOM (cleans the final output)
@@ -169,9 +157,9 @@ const decodeText = (content: Buffer, hint?: string): { text: string; charset: st
     // A BOM makes the charset DEFINITIVE (e.g. a UTF-16 file that legitimately contains U+FFFD): trust
     // it, never re-decode as latin1 — that would keep the interleaved NULs from the two-byte units.
     if (text.includes('�') && !isUtf8(content) && !bomCharset(content)) {
-        return { text: iconv.decode(content, 'latin1').replace(/\r\n?/g, '\n'), charset: 'latin1' }
+        return iconv.decode(content, 'latin1').replace(/\r\n?/g, '\n')
     }
-    return { text, charset } // return the decoded text and the charset
+    return text
 }
 
 /////////////////////////////////////////////////////////////
@@ -218,7 +206,7 @@ const textHandler: Handler = {
         '.yaml',
         '.yml',
     ],
-    extract: async ({ content, charsetHint }) => decodeText(content, charsetHint),
+    extract: async ({ content, charsetHint }) => ({ text: decodeText(content, charsetHint) }),
 }
 
 // NOTE: Lazy loading so that a Lambda that only ever sees text attachments never pays to load pdf.js / mammoth (heavier dependencies). 
@@ -244,8 +232,8 @@ const htmlHandler: Handler = {
     contentTypes: ['text/html', 'application/xhtml+xml'],
     extensions: ['.html', '.htm', '.xhtml'],
     extract: async ({ content, charsetHint }) => {
-        const { text: decoded, charset } = decodeText(content, charsetHint) 
-        return { text: await flattenHtml(decoded), charset } 
+        const decoded = decodeText(content, charsetHint)
+        return { text: await flattenHtml(decoded) }
     },
 }
 
@@ -257,14 +245,9 @@ const pdfHandler: Handler = {
     extract: async ({ content }) => {
         const { getDocumentProxy, extractText } = await import('unpdf') // Unpdf is a library that extracts text from PDF
         const pdf = await getDocumentProxy(new Uint8Array(content)) // Converts the raw bytes into format unpdf expects
-        const { totalPages, text } = await extractText(pdf, { mergePages: false }) // extract text per page and return the total number of pages and the text
-        const pages = text.map((page) => page.trim()) // trim the whitespace 
-        const joined = pages.join('\n\n').trim() // join the pages with a blank line 
-        const emptyPageCount = pages.filter((page) => page.length === 0).length // count the number of empty pages (no text)
-        const chars = pages.reduce((sum, page) => sum + page.length, 0) // count the number of characters in the text (across all pages)
-        const empty = joined.length === 0 // true if no text at all 
-        const lowTextDensity = !empty && (emptyPageCount > 0 || (totalPages > 0 && chars / totalPages < PDF_MIN_CHARS_PER_PAGE)) // flag as image-heavy if any page has no text, or overall density is low
-        return { text: joined, empty, lowTextDensity, pageCount: totalPages, emptyPageCount }
+        const { text } = await extractText(pdf, { mergePages: false }) // extract text per page
+        const joined = text.map((page) => page.trim()).join('\n\n').trim() // trim each page, join with a blank line
+        return { text: joined, empty: joined.length === 0 }
     },
 }
 
@@ -276,8 +259,7 @@ const docxHandler: Handler = {
     extract: async ({ content }) => {
         const { default: mammoth } = await import('mammoth') // Mammoth is a library that extracts text from DOCX files
         const { value } = await mammoth.extractRawText({ buffer: content }) // extract the text from the DOCX file
-        const lowTextDensity = content.includes(DOCX_MEDIA_MARKER) && value.trim().length < DOCX_MIN_TEXT_CHARS // flag as image-heavy if the document has embedded images but little text
-        return { text: value, lowTextDensity } // return the text and the low text density
+        return { text: value }
     },
 }
 
