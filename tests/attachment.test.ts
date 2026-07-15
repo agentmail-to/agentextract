@@ -271,6 +271,18 @@ describe('attachment — charset-correct decoding', () => {
         expect(r.extraction).toBe('hello world')
     })
 
+    // Some real text attachments declare UTF-16 in Content-Type but omit the BOM. The explicit
+    // charset is the only signal that the NUL-heavy bytes are text, so the binary-contradiction
+    // guard must not reroute them to a skip.
+    it('decodes a BOM-less UTF-16 file when Content-Type declares the charset', async () => {
+        const content = Buffer.from('hello world', 'utf16le')
+        const input = { content, contentType: 'text/plain; charset=utf-16le' }
+        expect(detectRoute(input)).toEqual({ kind: 'text', routedBy: 'content-type' })
+        const r = await extractAttachment(input)
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBe('hello world')
+    })
+
     // Precedence: an in-band BOM is definitive and must beat a wrong Content-Type charset. A
     // UTF-16 file mislabeled charset=windows-1252 would mojibake under the hint; the BOM wins.
     it('lets a BOM override a contradicting charset hint', async () => {
@@ -363,6 +375,18 @@ describe('attachment — pdf handler', () => {
         expect(detectRoute(input)).toEqual({ kind: 'pdf', routedBy: 'sniff' })
         const r = await extractAttachment(input)
         expect(r.status).toBe('extracted')
+    })
+
+    // Several providers use historical PDF aliases and do not always include a filename. These are
+    // real PDF claims, not generic unsupported binary media, so they should route directly.
+    it('routes common PDF MIME aliases without needing a filename', async () => {
+        for (const contentType of ['application/x-pdf', 'application/acrobat', 'application/vnd.pdf']) {
+            const input = { content: fixture('sample.pdf'), contentType }
+            expect(detectRoute(input)).toEqual({ kind: 'pdf', routedBy: 'content-type' })
+            const r = await extractAttachment(input)
+            expect(r.status).toBe('extracted')
+            expect(r.extraction).toContain('extractable text content')
+        }
     })
 
     // Attacker-controlled bytes that pass the %PDF gate but don't parse must fail cleanly,
@@ -628,7 +652,8 @@ describe('attachment — image-heavy documents', () => {
 // out of scope and skip — see the "skips full emails" case in the routing block above.
 
 // Edge cases surfaced by an adversarial pass. The first three guard the fixes in this change; the
-// last two document limitations left as-is (a CONFIRM test, and an it.fails marker).
+// last two document limitations left as-is (a CONFIRM test for the uncancellable timeout, and a
+// by-design assertion that the slim contract carries no truncation signal).
 describe('attachment — edge cases (regression)', () => {
     // A validly BOM-decoded UTF-16 buffer that legitimately contains U+FFFD must NOT be re-decoded
     // as latin1 — that would keep the interleaved NULs from the two-byte units. decodeText's latin1
@@ -706,14 +731,80 @@ describe('attachment — edge cases (regression)', () => {
         expect(ranToCompletion).toBe(true) // ...and completes its CPU work anyway
     })
 
-    // Documented limitation, ACCEPTED BY DESIGN — the 3-field slim intentionally dropped the
-    // `truncated` flag, so over-cap output is bounded silently. Marked it.fails so it records the
-    // gap without reddening the suite; if a truncation signal is ever re-added, this flips.
-    it.fails('over-cap output is truncated with no signal in the result', async () => {
+    // ACCEPTED BY DESIGN — the 3-field slim intentionally carries NO truncation signal, so over-cap
+    // output is bounded silently. Asserted positively (a normal green test): if a `truncated` field
+    // is ever added, `not.toHaveProperty` below fails, forcing a conscious update to the contract.
+    it('caps over-limit output silently — the slim contract has no truncation signal (by design)', async () => {
         const content = Buffer.alloc(2 * MAX_OUTPUT_CHARS, 0x41) // 500k "A", under the 10MB input cap
         const r = await extractAttachment({ content, contentType: 'text/plain' })
         expect(r.status).toBe('extracted')
         expect(r.extraction?.length).toBe(MAX_OUTPUT_CHARS) // capped
-        expect(r).toHaveProperty('truncated') // no field signals truncation
+        expect(r).not.toHaveProperty('truncated') // deliberate: no field signals truncation
+    })
+})
+
+// OOXML decompression preflight — a small in-cap .docx/.xlsx can declare a huge uncompressed size in
+// its zip central directory and OOM the worker. The preflight reads ONLY those declared sizes, so the
+// malicious archive is hand-built (a valid EOCD + one central-directory header with an inflated
+// uncompressed field, pointing at an xl/workbook.xml part so it still routes to xlsx) — no real
+// compressed data needed.
+describe('attachextract — OOXML decompression preflight', () => {
+    // Minimal zip: local header (zip magic + the xl/workbook.xml part name, for routing) + one
+    // central-directory header whose uncompressed field is `declaredUncompressed`, + an EOCD.
+    const fakeOoxmlZip = (
+        declaredUncompressed: number,
+        options: { entries?: number; centralDirectoryOffset?: number; centralDirectorySize?: number } = {}
+    ): Buffer => {
+        const name = Buffer.from('xl/workbook.xml') // makes ooxmlKind route the bytes to xlsx
+        const lfh = Buffer.alloc(30 + name.length)
+        lfh.writeUInt32LE(0x04034b50, 0) // local file header signature (PK\x03\x04)
+        lfh.writeUInt16LE(name.length, 26) // file name length
+        name.copy(lfh, 30)
+        const cdh = Buffer.alloc(46 + name.length)
+        cdh.writeUInt32LE(0x02014b50, 0) // central directory header signature
+        cdh.writeUInt32LE(declaredUncompressed >>> 0, 24) // the inflated uncompressed size (the lie)
+        cdh.writeUInt16LE(name.length, 28) // file name length
+        name.copy(cdh, 46)
+        const eocd = Buffer.alloc(22)
+        eocd.writeUInt32LE(0x06054b50, 0) // end of central directory signature
+        eocd.writeUInt16LE(options.entries ?? 1, 8) // entries on this disk
+        eocd.writeUInt16LE(options.entries ?? 1, 10) // total entries
+        eocd.writeUInt32LE(options.centralDirectorySize ?? cdh.length, 12) // central directory size
+        eocd.writeUInt32LE(options.centralDirectoryOffset ?? lfh.length, 16) // central directory offset
+        return Buffer.concat([lfh, cdh, eocd])
+    }
+
+    // Declares 100 MB uncompressed (> the 50 MB cap) → skipped before exceljs is ever loaded.
+    it('skips an OOXML archive whose declared uncompressed size is over budget', async () => {
+        const bomb = fakeOoxmlZip(100 * 1024 * 1024)
+        const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toMatch(/decompress/i)
+        expect(r.extraction).toBeUndefined()
+    })
+
+    // ZIP64 archives mark classic EOCD fields with sentinels and store the real values elsewhere.
+    // Treat those sentinels as over-budget instead of falling through to exceljs/mammoth, since the
+    // real declared size can be arbitrarily large and the preflight deliberately does not chase ZIP64
+    // extra records.
+    it('skips ZIP64 EOCD sentinels before loading the parser', async () => {
+        for (const bomb of [
+            fakeOoxmlZip(1, { entries: 0xffff }),
+            fakeOoxmlZip(1, { centralDirectorySize: 0xffffffff }),
+            fakeOoxmlZip(1, { centralDirectoryOffset: 0xffffffff }),
+        ]) {
+            const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
+            expect(r.status).toBe('skipped')
+            expect(r.reason).toMatch(/decompress/i)
+            expect(r.extraction).toBeUndefined()
+        }
+    })
+
+    // A real, modestly-sized .xlsx (declared uncompressed well under the cap) sails through the
+    // preflight and extracts normally — the gate must not over-reject legitimate files.
+    it('lets a normal .xlsx through the preflight and extracts it', async () => {
+        const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('=== Q1 ===')
     })
 })

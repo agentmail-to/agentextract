@@ -40,8 +40,9 @@ The underlying stages are exported too, if you need them on their own:
 ## Attachments
 
 `extractAttachment(input)` pulls the text out of an email attachment — plain text, HTML, PDF, Word
-(`.docx` + legacy `.doc`), Excel (`.xlsx`), and nested emails (`.eml`). It never throws on bad or
-attacker-controlled input; failures come back as a labeled `failed` / `skipped_*` status.
+(`.docx` + legacy `.doc`), and Excel (`.xlsx`). It never throws on bad or attacker-controlled input;
+failures come back as a labeled `failed` or `skipped` status. Nested emails (`.eml`), images/OCR,
+legacy `.xls`/`.ppt`, and archives are out of scope in this version and are skipped.
 
 ```ts
 import { extractAttachment } from 'agentextract'
@@ -52,7 +53,7 @@ const result = await extractAttachment({
   contentType: 'application/pdf',
 })
 // result.status === 'extracted'
-// result.extractedText === 'Q3 revenue …'
+// result.extraction === 'Q3 revenue …'
 ```
 
 The heavy parsers (`unpdf`, `mammoth`, `exceljs`, …) are lazy-loaded per handler, so importing
