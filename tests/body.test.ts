@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest'
 
-import { extractEmailBody, stripNoise } from '../agentextract'
+import { extractEmailBody, stripNoise } from '../body'
 
 // ---------------------------------------------------------------------------
-// Synthetic Tests for my code (agentextract.ts)
+// Synthetic Tests for my code (body.ts)
 // ---------------------------------------------------------------------------
 
 // Build a multi-line body without fighting template-literal indentation.
@@ -1563,7 +1563,7 @@ describe('extractEmailBody — HTML — quote markers', () => {
     // The quoted message arrives as a bare header block — From:/Sent:/To:/Subject: — with NO
     // gmail_quote, NO <blockquote>, NO "On...wrote:" to anchor on. None of our markers fire,
     // so the whole quoted history survives into our output. This is the HTML analog of the
-    // text path's Signal 5 (From: header, isQuoteSignal in agentextract.ts). We cut at the
+    // text path's Signal 5 (From: header, isQuoteSignal in body.ts). We cut at the
     // From: line and keep everything above it. Source: real corpus (01c701dbb059...@gmail.com,
     // a Yahoo/Outlook reply that survived our cut).
     it('cuts at a From:/Sent: header block with no wrapper (port of text Signal 5)', () => {

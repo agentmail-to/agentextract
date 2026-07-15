@@ -1,6 +1,6 @@
 {
   "name": "agentextract",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Email quote & signature extractor — strips quoted history and boilerplate, keeping the sender's new content. Pure regex: no DOM parser, no ML.",
   "license": "MIT",
   "author": {
@@ -28,16 +28,20 @@
     "html"
   ],
   "type": "commonjs",
-  "main": "dist/agentextract.js",
-  "types": "dist/agentextract.d.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/agentextract.d.ts",
-      "default": "./dist/agentextract.js"
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
     },
-    "./attachments": {
-      "types": "./dist/attachextract.d.ts",
-      "default": "./dist/attachextract.js"
+    "./body": {
+      "types": "./dist/body.d.ts",
+      "default": "./dist/body.js"
+    },
+    "./attachment": {
+      "types": "./dist/attachment.d.ts",
+      "default": "./dist/attachment.js"
     }
   },
   "files": [

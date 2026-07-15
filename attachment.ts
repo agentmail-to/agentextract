@@ -1,8 +1,8 @@
-// attachextract — text extraction for email attachments.
+// attachment — text extraction for email attachments.
 //
 // In scope: text, HTML, PDF, Word (.docx + legacy .doc), and Excel (.xlsx). Out of scope: nested
 // emails (.eml), images/OCR, legacy .xls/.ppt, and archives — those return a labeled skip.
-// Ships as a separate subpath export ("agentextract/attachments") so the heavy
+// Ships as a separate subpath export ("agentextract/attachment") so the heavy
 // parsers stay out of the body extractor's bundle. New formats = new registry entries.
 
 import { isUtf8 } from 'node:buffer' // fast native check: are these bytes valid utf-8?
