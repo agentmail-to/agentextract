@@ -23,6 +23,12 @@ export const MAX_INPUT_BYTES = 10 * 1024 * 1024
 // Past this the text is truncated (bounded silently — there is no truncation flag on the result).
 export const MAX_OUTPUT_CHARS = 250_000
 
+// Max total DECLARED uncompressed size of an OOXML (zip) attachment. A small in-cap .docx/.xlsx can
+// still decompress to hundreds of MB and OOM the worker — MAX_INPUT_BYTES only bounds the COMPRESSED
+// size. Parsers then build an in-memory model on top (~8x for a cell-dense sheet), so keep this well
+// under the heavy-parser memory floor (1024 MB): 50 MB uncompressed → ~400 MB RSS worst case.
+export const MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+
 // Guard: if a handler takes >= 10 seconds, we stop awaiting it. Note: this can't
 // cancel synchronous CPU-bound work — it only stops us waiting on a slow async parse.
 export const HANDLER_TIMEOUT_MS = 10_000
@@ -240,7 +246,7 @@ const htmlHandler: Handler = {
 // PDF handler - pdf
 const pdfHandler: Handler = {
     kind: 'pdf',
-    contentTypes: ['application/pdf'],
+    contentTypes: ['application/pdf', 'application/x-pdf', 'application/acrobat', 'application/vnd.pdf'],
     extensions: ['.pdf'],
     extract: async ({ content }) => {
         const { getDocumentProxy, extractText } = await import('unpdf') // Unpdf is a library that extracts text from PDF
@@ -408,6 +414,33 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
     return d < x ? 'docx' : 'xlsx'
 }
 
+// Total DECLARED uncompressed size of a zip, read from its central directory (no decompression).
+// Returns Infinity for a ZIP64 archive (>= 4 GB — the 0xffffffff size sentinel means the real value
+// lives in an extra field we treat as over-budget), or 0 for a non-zip (no End-of-Central-Directory).
+const declaredUnzippedSize = (buf: Buffer): number => {
+    let eocd = -1 // End-of-Central-Directory: last 22 B + up to 64 KB comment; scan back for its sig.
+    for (let i = buf.length - 22; i >= Math.max(0, buf.length - (22 + 0xffff)); i--) {
+        if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break }
+    }
+    if (eocd < 0) return 0
+    const entries = buf.readUInt16LE(eocd + 10)
+    const centralDirectorySize = buf.readUInt32LE(eocd + 12)
+    const centralDirectoryOffset = buf.readUInt32LE(eocd + 16)
+    if (entries === 0xffff || centralDirectorySize === 0xffffffff || centralDirectoryOffset === 0xffffffff) {
+        return Infinity
+    }
+    let total = 0
+    let p = centralDirectoryOffset // central-directory offset
+    for (let i = 0; i < entries; i++) {
+        if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) break // 0x02014b50 = CD file header
+        const uncompressed = buf.readUInt32LE(p + 24)
+        if (uncompressed === 0xffffffff) return Infinity // ZIP64 sentinel — real size >= 4 GB
+        total += uncompressed
+        p += 46 + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
+    }
+    return total
+}
+
 // Does the content match a confident binary claim? Catches a wrong claim before we hand the bytes
 // to the parser. pdf/doc are a magic-byte prefix; docx/xlsx go by their OOXML main part (zip magic
 // alone can't tell them apart). text/html have no single signature, so they always pass here —
@@ -441,13 +474,18 @@ const sniff = (content: Buffer, ext?: string): HandlerKind | undefined => {
 // void the claim; the sniff then rescues what the magic bytes prove (%PDF, zip+.docx)
 // and anything else is left unrouted. Empty content stays with the claimed handler so a
 // zero-byte text attachment still lands on extracted_empty rather than a skip.
-const bytesContradictTextClaim = (content: Buffer): boolean =>
-    content.length > 0 && !bomCharset(content) && !looksLikeText(content)
+const trustsExplicitUnicodeCharset = (charset?: string): boolean => {
+    const normalized = charset?.trim().toLowerCase().replace(/_/g, '-')
+    return normalized === 'utf-16' || normalized === 'utf-16le' || normalized === 'utf-16be'
+}
+
+const bytesContradictTextClaim = (content: Buffer, charsetHint?: string): boolean =>
+    content.length > 0 && !bomCharset(content) && !trustsExplicitUnicodeCharset(charsetHint) && !looksLikeText(content)
 
 // Takes an AttachmentInput and produces the final routing decision. 
 // Tries each signal in priority order and stops as soon as one works.
 export const detectRoute = (input: AttachmentInput): { kind?: HandlerKind; routedBy: RoutedBy } => {
-    const { type } = parseContentType(input.contentType)
+    const { type, charset: charsetHint } = parseContentType(input.contentType)
     const ext = extensionOf(input.filename)
 
     const byType = type ? findByContentType(type) : undefined
@@ -465,7 +503,7 @@ export const detectRoute = (input: AttachmentInput): { kind?: HandlerKind; route
         // the RTF_MAGIC skip in sniff() and lands on a labeled skip instead of leaking control words.
         if (
             (claimed.kind === 'text' || claimed.kind === 'html') &&
-            (bytesContradictTextClaim(input.content) || startsWith(input.content, RTF_MAGIC))
+            (bytesContradictTextClaim(input.content, charsetHint) || startsWith(input.content, RTF_MAGIC))
         ) {
             const sniffed = sniff(input.content, ext)
             return sniffed ? { kind: sniffed, routedBy: 'sniff' } : { routedBy: 'none' }
@@ -548,6 +586,16 @@ export const extractAttachment = async (input: AttachmentInput): Promise<Extract
     // No handler found for this kind — unsupported or unrecognized format, skip it.
     if (!handler) {
         return { status: 'skipped', reason: type ? `unsupported type ${type}` : 'unrecognized attachment' }
+    }
+
+    // Decompression preflight: an OOXML (zip) attachment can balloon in memory far beyond its on-disk
+    // size, so skip one whose declared uncompressed size is over budget before exceljs/mammoth ever
+    // touch it. (pdf/doc/text aren't zips.)
+    if (kind === 'docx' || kind === 'xlsx') {
+        const unzipped = declaredUnzippedSize(input.content)
+        if (unzipped > MAX_UNCOMPRESSED_BYTES) {
+            return { status: 'skipped', reason: `decompresses to ${unzipped} bytes, exceeds ${MAX_UNCOMPRESSED_BYTES}` }
+        }
     }
 
     // Run the handler safely — catch errors/timeouts instead of crashing, and build the final result.
