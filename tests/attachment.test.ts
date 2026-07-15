@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { describe, it, expect } from 'vitest'
 import iconv from 'iconv-lite'
 
-import { extractAttachment, detectRoute, MAX_INPUT_BYTES, MAX_OUTPUT_CHARS } from '../attachextract'
+import { extractAttachment, detectRoute, MAX_INPUT_BYTES, MAX_OUTPUT_CHARS } from '../attachment'
 
 // NOTE: result shape is { status, extraction?, reason? }; `extraction` is omitted (never '') when a
 // handler runs but produces no text. Nested emails (.eml) are out of scope in this version and skip.
@@ -16,7 +16,7 @@ const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingm
 const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
 // ---------------------------------------------------------------------------
-// Synthetic tests for attachextract.ts
+// Synthetic tests for attachment.ts
 // ---------------------------------------------------------------------------
 // The RESULT is deliberately slim: { status, extraction?, reason? }. Routing is NOT on the result —
 // it's a separate concern verified through detectRoute(). So routing-decision assertions here call
@@ -28,7 +28,7 @@ const buf = (s: string) => Buffer.from(s, 'utf8')
 // The whole point of the slim contract: the top-level result carries no routing/diagnostic noise,
 // no top-level filename, and no truncation flag. If any of those leak back in, this fails.
 
-describe('attachextract — slim result contract', () => {
+describe('attachment — slim result contract', () => {
     it('returns only the three contract fields, never routing/diagnostic noise', async () => {
         const r = await extractAttachment({ content: buf('hello'), contentType: 'text/plain', filename: 'hi.txt' })
         // Every key present must be one of the three contract fields — nothing else.
@@ -50,7 +50,7 @@ describe('attachextract — slim result contract', () => {
 // Routing --------------------------------------------------------------------
 // Routing lives on detectRoute now, so we assert the decision there and the extraction on the result.
 
-describe('attachextract — routing (never trust one signal)', () => {
+describe('attachment — routing (never trust one signal)', () => {
     // Honest content-type: the common case. Routes on the type, extracts, reports it.
     it('routes text/csv by content-type', async () => {
         const input = { content: buf('a,b\n1,2'), contentType: 'text/csv', filename: 'data.csv' }
@@ -243,7 +243,7 @@ describe('attachextract — routing (never trust one signal)', () => {
 // Charset decoding -----------------------------------------------------------
 // The result no longer exposes `charset`; correct decoding is proven by the decoded text itself.
 
-describe('attachextract — charset-correct decoding', () => {
+describe('attachment — charset-correct decoding', () => {
     // windows-1252 'é' (0xE9) is invalid UTF-8 on its own. Naive Buffer.toString('utf8')
     // mangles it to the replacement char; we must decode with the declared charset.
     it('decodes a windows-1252 file that would mojibake under naive utf-8', async () => {
@@ -302,7 +302,7 @@ describe('attachextract — charset-correct decoding', () => {
 
 // Safety ---------------------------------------------------------------------
 
-describe('attachextract — safety gates', () => {
+describe('attachment — safety gates', () => {
     // Over the cap: skipped BEFORE any decode, no text produced.
     it('skips oversize input before any work', async () => {
         const content = Buffer.alloc(MAX_INPUT_BYTES + 1, 0x41)
@@ -322,7 +322,7 @@ describe('attachextract — safety gates', () => {
 
 // HTML handler ---------------------------------------------------------------
 
-describe('attachextract — html handler', () => {
+describe('attachment — html handler', () => {
     it('flattens HTML to visible text', async () => {
         const input = { content: buf('<html><body><h1>Title</h1><p>Body text here.</p></body></html>'), contentType: 'text/html' }
         expect(detectRoute(input)).toEqual({ kind: 'html', routedBy: 'content-type' })
@@ -348,7 +348,7 @@ describe('attachextract — html handler', () => {
 
 // PDF handler ----------------------------------------------------------------
 
-describe('attachextract — pdf handler', () => {
+describe('attachment — pdf handler', () => {
     it('extracts text from a real PDF', async () => {
         const input = { content: fixture('sample.pdf'), contentType: 'application/pdf', filename: 'sample.pdf' }
         expect(detectRoute(input).kind).toBe('pdf')
@@ -377,7 +377,7 @@ describe('attachextract — pdf handler', () => {
 
 // DOCX handler ---------------------------------------------------------------
 
-describe('attachextract — docx handler', () => {
+describe('attachment — docx handler', () => {
     it('extracts a real .docx and preserves paragraph breaks', async () => {
         const input = { content: fixture('sample.docx'), contentType: DOCX_TYPE, filename: 'sample.docx' }
         expect(detectRoute(input).kind).toBe('docx')
@@ -409,7 +409,7 @@ describe('attachextract — docx handler', () => {
 // Real fixture generated with macOS textutil (-convert doc). Word 97–2003 is an OLE
 // compound binary mammoth can't read, so it routes to word-extractor instead.
 
-describe('attachextract — doc handler', () => {
+describe('attachment — doc handler', () => {
     it('extracts a real legacy .doc by content-type', async () => {
         const input = { content: fixture('sample.doc'), contentType: 'application/msword', filename: 'report.doc' }
         expect(detectRoute(input)).toEqual({ kind: 'doc', routedBy: 'content-type' })
@@ -452,7 +452,7 @@ describe('attachextract — doc handler', () => {
 // XLSX handler (modern OOXML Excel) ------------------------------------------
 // Real fixtures generated with exceljs. Sheets flatten to `=== name ===` + tab-joined rows.
 
-describe('attachextract — xlsx handler', () => {
+describe('attachment — xlsx handler', () => {
     it('flattens every sheet with headers, keeping cell values across sheets', async () => {
         const input = { content: fixture('sample.xlsx'), contentType: XLSX_TYPE, filename: 'book.xlsx' }
         expect(detectRoute(input)).toEqual({ kind: 'xlsx', routedBy: 'content-type' })
@@ -522,7 +522,7 @@ describe('attachextract — xlsx handler', () => {
 // Input is byte-capped, but output isn't proportional to input — cap it centrally so a
 // pathological/large document can't dump megabytes of text into S3 + the search index.
 
-describe('attachextract — output cap', () => {
+describe('attachment — output cap', () => {
     // Over-cap output is bounded to exactly MAX_OUTPUT_CHARS (silently — no truncation flag).
     it('bounds over-cap extracted text to MAX_OUTPUT_CHARS', async () => {
         const content = Buffer.alloc(2 * MAX_OUTPUT_CHARS, 0x41) // 2x the cap of 'A', well under the input cap
@@ -543,7 +543,7 @@ describe('attachextract — output cap', () => {
 // straight to the wrong parser and fail — we verify content (magic bytes, and the OOXML part for
 // docx vs xlsx) first and re-sniff on mismatch. Routing is verified via detectRoute.
 
-describe('attachextract — magic-verify of binary claims', () => {
+describe('attachment — magic-verify of binary claims', () => {
     const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
     // PDF bytes mislabeled as docx: the %PDF magic reroutes them back to the pdf handler.
@@ -587,7 +587,7 @@ describe('attachextract — magic-verify of binary claims', () => {
 // pageCount / emptyPageCount) — those are internal now. What we still guarantee is behavioral:
 // reachable text is KEPT, and a text-less document lands on extracted with present-empty text.
 
-describe('attachextract — image-heavy documents', () => {
+describe('attachment — image-heavy documents', () => {
     // Normal text PDF: real text extracted.
     it('extracts a normal text PDF', async () => {
         const r = await extractAttachment({ content: fixture('sample.pdf'), contentType: 'application/pdf' })
@@ -629,7 +629,7 @@ describe('attachextract — image-heavy documents', () => {
 
 // Edge cases surfaced by an adversarial pass. The first three guard the fixes in this change; the
 // last two document limitations left as-is (a CONFIRM test, and an it.fails marker).
-describe('attachextract — edge cases (regression)', () => {
+describe('attachment — edge cases (regression)', () => {
     // A validly BOM-decoded UTF-16 buffer that legitimately contains U+FFFD must NOT be re-decoded
     // as latin1 — that would keep the interleaved NULs from the two-byte units. decodeText's latin1
     // fallback is now gated on !bomCharset, so a BOM-definitive charset is trusted.
@@ -663,7 +663,7 @@ describe('attachextract — edge cases (regression)', () => {
         expect(asPdf.extraction).toBeUndefined()
     })
 
-    // Documented limitation — withTimeout (attachextract.ts:514) is not exported, so replicate it
+    // Documented limitation — withTimeout (attachment.ts:514) is not exported, so replicate it
     // verbatim. Rejecting the wrapper does NOT cancel the underlying handler: its CPU work runs to
     // completion regardless (wasted CPU/memory after we time out). Can't be fixed without a
     // cancellable/off-thread parser.

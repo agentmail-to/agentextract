@@ -28,16 +28,20 @@
     "html"
   ],
   "type": "commonjs",
-  "main": "dist/agentextract.js",
-  "types": "dist/agentextract.d.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/agentextract.d.ts",
-      "default": "./dist/agentextract.js"
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
     },
-    "./attachments": {
-      "types": "./dist/attachextract.d.ts",
-      "default": "./dist/attachextract.js"
+    "./body": {
+      "types": "./dist/body.d.ts",
+      "default": "./dist/body.js"
+    },
+    "./attachment": {
+      "types": "./dist/attachment.d.ts",
+      "default": "./dist/attachment.js"
     }
   },
   "files": [

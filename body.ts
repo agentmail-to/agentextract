@@ -1,20 +1,9 @@
-// PLAIN TEXT VERSION
-
-// Attachment text extraction (pdf/docx/xlsx/eml/...) is exposed at the top level too, so consumers
-// reach it via `import { extractAttachment } from 'agentextract'` alongside extractEmailBody — not
-// only through the 'agentextract/attachments' subpath. The subpath export stays for callers that
-// want it in isolation. Each handler lazy-loads its heavy parser, so this re-export costs nothing
-// until extractAttachment is actually called.
-export { extractAttachment, detectRoute } from './attachextract'
-export type {
-    AttachmentInput,
-    ExtractionResult,
-    ExtractionStatus,
-    HandlerKind,
-    RoutedBy,
-} from './attachextract'
-
+// body — email body extraction: strips quoted history and signature/boilerplate noise,
+// keeping the sender's new content. Pure regex: no DOM parser, no ML.
 //
+// Peer module to attachment.ts; neither depends on the other. Both are surfaced together
+// from the package entry (index.ts) and each also has its own subpath export.
+
 const ATTRIBUTION_WRAP_WINDOW = 2
 
 // An "On ... wrote:" attribution can get glued onto the sender's reply text.

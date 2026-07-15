@@ -57,7 +57,7 @@ const result = await extractAttachment({
 
 The heavy parsers (`unpdf`, `mammoth`, `exceljs`, …) are lazy-loaded per handler, so importing
 `extractAttachment` costs nothing until you actually call it on a matching attachment. It's also
-available on its own subpath — `import { extractAttachment } from 'agentextract/attachments'` — if
+available on its own subpath — `import { extractAttachment } from 'agentextract/attachment'` — if
 you want to reach it without touching the body-extraction entry point.
 
 ## What it does that off-the-shelf engines don't
