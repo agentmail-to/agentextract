@@ -43,10 +43,12 @@ const DETECT_MIN_CONFIDENCE = 0.7
 /////////////////////////////////////////////////////////////
 // TYPES
 
+// The two refusals differ by whose fault it is, so a caller can branch on them: `skipped` is a file
+// we chose not to read, `failed` is one we couldn't. Never collapse them.
 export type ExtractionStatus =
     | 'extracted' // handler ran; `extraction` holds the text, or is omitted when there was none
-    | 'skipped' // over MAX_INPUT_BYTES, or unsupported/unrecognized — never attempted
-    | 'failed' // parser threw, timed out, or decode failed
+    | 'skipped' // intact, but declined: over MAX_INPUT_BYTES or the decompression budget, unsupported, unrecognized
+    | 'failed' // broken or hostile bytes: parser threw, timed out, decode failed, or the zip preflight found it malformed
 
 // Which signal decided the route.
 export type RoutedBy = 'content-type' | 'extension' | 'sniff' | 'none'
@@ -424,8 +426,13 @@ const EOCD_MAGIC = Buffer.from([0x50, 0x4b, 0x05, 0x06]) // End-of-Central-Direc
 const CD_SIG = 0x02014b50 // Central-Directory file header
 const LOCAL_SIG = 0x04034b50 // Local file header
 
-// `ok` = safe to hand to the parser; otherwise `reason` is the skip message.
-type DecompressionCheck = { ok: true } | { ok: false; reason: string }
+// `ok` = safe to hand to the parser. Otherwise `status` is which kind of no, since the two differ to
+// a caller: `failed` = the bytes are broken (the parser would have thrown anyway), `skipped` = intact
+// but we decline — over budget, or a variant we don't chase. Mirrors the MAX_INPUT_BYTES precedent.
+type DecompressionCheck = { ok: true } | { ok: false; status: 'failed' | 'skipped'; reason: string }
+
+const corrupt = (reason: string): DecompressionCheck => ({ ok: false, status: 'failed', reason })
+const declined = (reason: string): DecompressionCheck => ({ ok: false, status: 'skipped', reason })
 
 // Inflate one raw-deflate region onto `runningTotal`, aborting the moment it would exceed `cap`.
 // Returns the new total, or a sentinel — -1 = over budget, -2 = corrupt stream. Byte counts are
@@ -488,7 +495,7 @@ const zipEntryNames = (buf: Buffer): string[] | undefined => {
 // changes. Every real archive satisfies them (73 measured, 0 failures).
 const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<DecompressionCheck> => {
     const eocd = findEocd(buf)
-    if (eocd < 0) return { ok: false, reason: 'malformed zip: no end-of-central-directory record' }
+    if (eocd < 0) return corrupt('malformed zip: no end-of-central-directory record')
 
     const entries = buf.readUInt16LE(eocd + 10)
     const cdSize = buf.readUInt32LE(eocd + 12)
@@ -496,15 +503,16 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
     // ZIP64 / out-of-range sentinels: the true values live in a ZIP64 record we don't chase. Treat as
     // over-budget rather than trust the classic field or crash on the sentinel.
     if (entries === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff)
-        return { ok: false, reason: 'zip declares a ZIP64 / out-of-range size' }
+        return declined('zip declares a ZIP64 / out-of-range size')
 
     // Invariant 1: the directory must END exactly where the EOCD begins.
-    // jszip doesn't read from cdOffset unconditionally — when eocdPos - (cdOffset + cdSize) is
-    // positive it rebases every offset by that gap (its support for data prepended ahead of the
-    // archive). A nonzero gap therefore aims the two readers at two different directories, and a
-    // bomb planted at the rebased one is a bomb we never measure.
+    // jszip rebases every offset by a positive `eocdPos - (cdOffset + cdSize)` gap — its support for
+    // data prepended ahead of the archive. A nonzero gap aims the two readers at two different
+    // directories, and a bomb planted at the rebased one is one we never measure.
+    // Deliberate: that gap is also how a self-extracting archive legitimately carries its stub, so
+    // this calls real files malformed. Accepted — an email attachment has no business being one.
     if (cdOffset + cdSize !== eocd)
-        return { ok: false, reason: 'malformed zip: central directory does not end at the end-of-central-directory record' }
+        return corrupt('malformed zip: central directory does not end at the end-of-central-directory record')
 
     let total = 0
     let p = cdOffset
@@ -512,31 +520,31 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
         // Guard: a missing/misaligned header means the offset lied. Fail closed — a partial walk must
         // never silently return the total it accumulated so far.
         if (p + 46 > buf.length || buf.readUInt32LE(p) !== CD_SIG)
-            return { ok: false, reason: 'malformed zip: truncated or misaligned central directory' }
+            return corrupt('malformed zip: truncated or misaligned central directory')
         const method = buf.readUInt16LE(p + 10)
         const compSize = buf.readUInt32LE(p + 20)
         const localOffset = buf.readUInt32LE(p + 42)
         if (compSize === 0xffffffff || localOffset === 0xffffffff)
-            return { ok: false, reason: 'zip declares a ZIP64 / out-of-range size' }
+            return declined('zip declares a ZIP64 / out-of-range size')
         // Read the local header's own name/extra lengths — they can differ from the central copy, and
         // they're what fixes where this entry's compressed bytes actually begin.
         if (localOffset + 30 > buf.length || buf.readUInt32LE(localOffset) !== LOCAL_SIG)
-            return { ok: false, reason: 'malformed zip: bad local header offset' }
+            return corrupt('malformed zip: bad local header offset')
         const dataStart = localOffset + 30 + buf.readUInt16LE(localOffset + 26) + buf.readUInt16LE(localOffset + 28)
         const comp = buf.subarray(dataStart, dataStart + compSize)
         if (comp.length < compSize)
-            return { ok: false, reason: 'malformed zip: compressed data runs past end of file' }
+            return corrupt('malformed zip: compressed data runs past end of file')
 
         if (method === 0) {
             total += comp.length // stored (no compression): output === input
         } else if (method === 8) {
             total = await inflateCounting(comp, total, cap)
-            if (total === -1) return { ok: false, reason: `decompresses to over ${cap} bytes` }
-            if (total === -2) return { ok: false, reason: 'malformed zip: unreadable compressed data' }
+            if (total === -1) return declined(`decompresses to over ${cap} bytes`)
+            if (total === -2) return corrupt('malformed zip: unreadable compressed data')
         } else {
-            return { ok: false, reason: `zip uses unsupported compression method ${method}` }
+            return declined(`zip uses unsupported compression method ${method}`)
         }
-        if (total > cap) return { ok: false, reason: `decompresses to over ${cap} bytes` }
+        if (total > cap) return declined(`decompresses to over ${cap} bytes`)
         p += 46 + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
     }
     // Invariant 2: walking exactly `entries` records must land exactly on the EOCD.
@@ -546,18 +554,23 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
     // Landing on the EOCD proves none hides: the next bytes are the EOCD signature, so jszip's
     // signature-driven loop stops exactly where this one did, on the same records.
     if (p !== eocd)
-        return { ok: false, reason: 'malformed zip: central directory holds more records than it declares' }
+        return corrupt('malformed zip: central directory holds more records than it declares')
     return { ok: true }
 }
 
 /////////////////////////////////////////////////////////////
 // ROUTING (continued) — claim verification + the final decision
 
+// Extensions naming a NON-doc OLE format. The OLE magic is shared, so it alone can't confirm a doc
+// claim — but an extension naming a sibling format contradicts it. A missing extension contradicts
+// nothing, so a real .doc sent without a filename still routes.
+const NON_DOC_OLE_EXTENSIONS = new Set(['.xls', '.ppt', '.msg'])
+
 // Do the bytes back up a binary claim? Catches a wrong one before the parser sees it. text/html have
 // no single signature, so they always pass here — lying text claims go to bytesContradictTextClaim.
-const magicOk = (kind: HandlerKind, content: Buffer): boolean => {
+const magicOk = (kind: HandlerKind, content: Buffer, ext?: string): boolean => {
     if (kind === 'pdf') return startsWith(content, PDF_MAGIC)
-    if (kind === 'doc') return startsWith(content, OLE_MAGIC)
+    if (kind === 'doc') return startsWith(content, OLE_MAGIC) && !(ext && NON_DOC_OLE_EXTENSIONS.has(ext))
     if (kind === 'docx') return ooxmlKind(content) === 'docx'
     if (kind === 'xlsx') return ooxmlKind(content) === 'xlsx'
     return true
@@ -666,7 +679,7 @@ export const detectRoute = (input: AttachmentInput): { kind?: HandlerKind; route
         // Distrust a binary claim the content contradicts — a PDF mislabeled .docx, or a spreadsheet
         // mislabeled .docx. Wrong bytes just fail the parser and lose any real text, so re-sniff for
         // the true format. Empty content has nothing to check: leave it to the parser.
-        if (input.content.length > 0 && !magicOk(claimed.kind, input.content)) {
+        if (input.content.length > 0 && !magicOk(claimed.kind, input.content, ext)) {
             const sniffed = sniff(input.content, ext)
             return sniffed ? { kind: sniffed, routedBy: 'sniff' } : { routedBy: 'none' }
         }
@@ -739,11 +752,12 @@ export const extractAttachment = async (input: AttachmentInput): Promise<Extract
         return { status: 'skipped', reason: type ? `unsupported type ${type}` : 'unrecognized attachment' }
     }
 
-    // Zip bombs: measure the real decompressed size and skip before exceljs/mammoth touch the bytes.
+    // Zip bombs: measure the real decompressed size before exceljs/mammoth touch the bytes. The
+    // preflight also decides which refusal this is — over budget skips, malformed fails.
     // (pdf/doc/text aren't zips.)
     if (kind === 'docx' || kind === 'xlsx') {
         const check = await checkDecompressionBudget(input.content, MAX_UNCOMPRESSED_BYTES)
-        if (!check.ok) return { status: 'skipped', reason: check.reason }
+        if (!check.ok) return { status: check.status, reason: check.reason }
     }
 
     try {

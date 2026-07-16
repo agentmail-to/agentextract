@@ -533,6 +533,26 @@ describe('attachment — doc handler', () => {
         expect(r.extraction).toContain('Second paragraph about costs')
     })
 
+    // The OLE magic is shared with .xls/.ppt/.msg, so it cannot confirm a doc claim on its own. An
+    // extension naming a sibling format contradicts the claim; a missing one contradicts nothing —
+    // otherwise a real .doc sent with no filename would lose its route.
+    it('refuses a doc claim the extension contradicts, but not one it is merely silent on', async () => {
+        const ole = fixture('sample.doc')
+        // .xls names a sibling OLE format, so the claim is void. Asserting the ROUTE (not just the
+        // status) is what proves word-extractor was never reached — a 'failed' would mean it was.
+        const asXls = { content: ole, contentType: 'application/msword', filename: 'book.xls' }
+        expect(detectRoute(asXls).kind).not.toBe('doc')
+        expect((await extractAttachment(asXls)).status).toBe('skipped')
+
+        // The regression guard: no filename contradicts nothing, so a real .doc must still extract.
+        // A naive `ext === '.doc'` gate would skip this.
+        const noName = { content: ole, contentType: 'application/msword' }
+        expect(detectRoute(noName).kind).toBe('doc')
+        const r = await extractAttachment(noName)
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('First paragraph about revenue')
+    })
+
     // A .doc mislabeled octet-stream is rescued by the shared OLE magic + .doc extension —
     // the extension gate matters because .xls/.ppt/.msg carry the identical OLE signature.
     it('routes a mislabeled .doc by its OLE magic + extension', async () => {
@@ -635,12 +655,12 @@ describe('attachment — xlsx handler', () => {
     // xlsx) but with no valid central directory are caught by the fail-closed decompression preflight
     // and skipped BEFORE exceljs ever loads — cleanly labeled, never a throw. NB: a bare "PK.." with
     // no OOXML part is rerouted by content-detection, not sent here.
-    it('skips a structurally-corrupt xlsx at the preflight (not a throw)', async () => {
+    it('fails a structurally-corrupt xlsx at the preflight (not a throw)', async () => {
         const oxmlGarbage = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), buf('xl/workbook.xml'), buf(' corrupt body')])
         const input = { content: oxmlGarbage, contentType: XLSX_TYPE, filename: 'bad.xlsx' }
         expect(detectRoute(input).kind).toBe('xlsx')
         const r = await extractAttachment(input)
-        expect(r.status).toBe('skipped')
+        expect(r.status).toBe('failed')
         expect(r.reason).toMatch(/malformed zip/i)
     })
 })
@@ -1087,6 +1107,16 @@ describe('attachextract — OOXML decompression preflight', () => {
         expect(r.extraction).toBeUndefined()
     })
 
+    // The preflight's two refusals are different answers, not one. Corrupt bytes earn 'failed' — the
+    // parser would have thrown on them anyway. An intact archive we decline to expand earns
+    // 'skipped', like the MAX_INPUT_BYTES gate. Callers branch on that, so pin both against collapse.
+    it('separates a corrupt archive (failed) from one merely over budget (skipped)', async () => {
+        const broken = craftOoxmlZip(Buffer.from('<workbook/>'), { omitEocd: true })
+        const overBudget = craftOoxmlZip(overCapContent())
+        expect((await extractAttachment({ content: broken, contentType: XLSX_TYPE })).status).toBe('failed')
+        expect((await extractAttachment({ content: overBudget, contentType: XLSX_TYPE })).status).toBe('skipped')
+    })
+
     // The bypass regression test: the archive LIES, declaring a tiny uncompressed size while its
     // deflate stream expands past the cap. The old metadata-trusting guard waved this through; the
     // streaming guard catches it because it counts real output bytes.
@@ -1116,7 +1146,7 @@ describe('attachextract — OOXML decompression preflight', () => {
     })
 
     // Fail-closed on malformed metadata — a partial/misdirected walk must never silently pass.
-    it('skips malformed archives (bad offsets / missing records) instead of passing them', async () => {
+    it('fails malformed archives (bad offsets / missing records) instead of passing them', async () => {
         const small = Buffer.from('<workbook/>')
         const cases: Array<[string, Buffer]> = [
             ['no EOCD', craftOoxmlZip(small, { omitEocd: true })],
@@ -1125,7 +1155,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         ]
         for (const [, bomb] of cases) {
             const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
-            expect(r.status).toBe('skipped')
+            expect(r.status).toBe('failed')
             expect(r.reason).toMatch(/malformed zip/i)
             expect(r.extraction).toBeUndefined()
         }
@@ -1204,7 +1234,7 @@ describe('attachextract — OOXML decompression preflight', () => {
 
         // So measuring the decoy at the raw cdOffset would approve a bomb. Reject the layout instead.
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
-        expect(r.status).toBe('skipped')
+        expect(r.status).toBe('failed')
         expect(r.reason).toMatch(/does not end at the end-of-central-directory/i)
         expect(r.extraction).toBeUndefined()
     })
@@ -1236,7 +1266,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         expect((await parsed.file(BOMB)!.async('nodebuffer')).length).toBeGreaterThan(MAX_UNCOMPRESSED_BYTES)
 
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
-        expect(r.status).toBe('skipped')
+        expect(r.status).toBe('failed')
         expect(r.reason).toMatch(/more records than it declares/i)
         expect(r.extraction).toBeUndefined()
     })
@@ -1268,7 +1298,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         ])
         const file = Buffer.concat([junk, eocd(1, junk.length, 0)]) // 0 + junk.length === eocdPos
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
-        expect(r.status).toBe('skipped')
+        expect(r.status).toBe('failed')
         expect(r.reason).toMatch(/truncated or misaligned central directory/i)
     })
 
@@ -1305,7 +1335,7 @@ describe('attachextract — OOXML decompression preflight', () => {
     it('fails closed when an entry claims compressed bytes that run past the end of the file', async () => {
         const bomb = craftOoxmlZip(buf('<workbook/>'), { entryCompSize: 0x0ffffff0 }) // huge, but not the ZIP64 sentinel
         const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
-        expect(r.status).toBe('skipped')
+        expect(r.status).toBe('failed')
         expect(r.reason).toMatch(/runs past end of file/i)
     })
 
@@ -1317,7 +1347,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         const cd = central('xl/workbook.xml', garbage.length, 4096, 0, 8)
         const file = Buffer.concat([local, cd, eocd(1, cd.length, local.length)])
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
-        expect(r.status).toBe('skipped')
+        expect(r.status).toBe('failed')
         expect(r.reason).toMatch(/unreadable compressed data/i)
     })
 
