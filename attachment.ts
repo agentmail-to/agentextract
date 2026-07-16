@@ -24,6 +24,12 @@ export const MAX_INPUT_BYTES = 10 * 1024 * 1024
 // Past this the text is truncated (bounded silently — there is no truncation flag on the result).
 export const MAX_OUTPUT_CHARS = 250_000
 
+// Max PDF pages to parse. A PDF can declare an enormous page count; we read text from at most this
+// many and then stop. Bounds worst-case parse work when the per-page text is too sparse to trip the
+// output cap (a content-bearing PDF hits MAX_OUTPUT_CHARS within a few dozen pages first). A typical
+// email PDF is a handful of pages, so this is far above any real attachment while still capping abuse.
+export const MAX_PDF_PAGES = 2000
+
 // Max total DECLARED uncompressed size of an OOXML (zip) attachment. A small in-cap .docx/.xlsx can
 // still decompress to hundreds of MB and OOM the worker — MAX_INPUT_BYTES only bounds the COMPRESSED
 // size. Parsers then build an in-memory model on top (~8x for a cell-dense sheet), so keep this well
@@ -250,10 +256,33 @@ const pdfHandler: Handler = {
     contentTypes: ['application/pdf', 'application/x-pdf', 'application/acrobat', 'application/vnd.pdf'],
     extensions: ['.pdf'],
     extract: async ({ content }) => {
-        const { getDocumentProxy, extractText } = await import('unpdf') // Unpdf is a library that extracts text from PDF
+        const { getDocumentProxy } = await import('unpdf') // Unpdf is a library that extracts text from PDF
         const pdf = await getDocumentProxy(new Uint8Array(content)) // Converts the raw bytes into format unpdf expects
-        const { text } = await extractText(pdf, { mergePages: false }) // extract text per page
-        const joined = text.map((page) => page.trim()).join('\n\n').trim() // trim each page, join with a blank line
+        // Iterate pages ourselves (rather than unpdf's extractText, which parses EVERY page up front)
+        // so a pathological page count or a huge text layer can't run unbounded: cap the page count
+        // and stop once accumulated text passes MAX_OUTPUT_CHARS. NB: this bounds OUR accumulation and
+        // the pages parsed — it does NOT bound pdf.js's internal per-page decompression (no hook
+        // exists); that residual is closed only at the Lambda memory limit.
+        const pageCount = Math.min(pdf.numPages, MAX_PDF_PAGES)
+        const pages: string[] = []
+        let length = 0
+        for (let n = 1; n <= pageCount; n++) {
+            const page = await pdf.getPage(n)
+            const { items } = await page.getTextContent()
+            // Replicate unpdf's per-page join (str + a newline on hasEOL), then trim the page — keeps
+            // output byte-identical to the previous extractText path for the common in-cap case.
+            const pageText = (items as Array<{ str?: string; hasEOL?: boolean }>)
+                .filter((item) => item.str != null)
+                .map((item) => (item.str ?? '') + (item.hasEOL ? '\n' : ''))
+                .join('')
+                .trim()
+            if (pageText) {
+                pages.push(pageText)
+                length += pageText.length + 2 // + the '\n\n' page join
+                if (length > MAX_OUTPUT_CHARS) break // one page of overshoot, trimmed centrally
+            }
+        }
+        const joined = pages.join('\n\n').trim() // trim each page, join with a blank line
         return { text: joined, empty: joined.length === 0 }
     },
 }

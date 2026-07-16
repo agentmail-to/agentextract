@@ -26,6 +26,37 @@ const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.s
 
 const buf = (s: string) => Buffer.from(s, 'utf8')
 
+// Minimal valid PDF builder: one non-embedded Helvetica (base-14) page per inner array, each line
+// drawn as its own on-page Tj (pdf.js clips a single off-page text run, so text must be laid out as
+// real lines to stay extractable). Byte-accurate xref so unpdf/pdf.js parses it. Used to synthesize
+// oversized PDFs (many pages of text) without shipping a big binary fixture.
+const buildPdf = (pages: string[][]): Buffer => {
+    const esc = (s: string) => s.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)')
+    const objects: string[] = []
+    objects[1] = '<< /Type /Catalog /Pages 2 0 R >>'
+    objects[2] = `<< /Type /Pages /Kids [${pages.map((_, i) => `${4 + i * 2} 0 R`).join(' ')}] /Count ${pages.length} >>`
+    objects[3] = '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>'
+    pages.forEach((lines, i) => {
+        objects[4 + i * 2] = `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${5 + i * 2} 0 R >>`
+        // First line at (72, 760); each subsequent line moves down 13pt (relative Td).
+        const body = lines.map((l, j) => `${j === 0 ? '72 760 Td' : '0 -13 Td'} (${esc(l)}) Tj`).join('\n')
+        const stream = `BT /F1 12 Tf\n${body}\nET`
+        objects[5 + i * 2] = `<< /Length ${stream.length} >>\nstream\n${stream}\nendstream`
+    })
+    let pdf = '%PDF-1.4\n'
+    const offsets: number[] = []
+    for (let n = 1; n < objects.length; n++) {
+        offsets[n] = Buffer.byteLength(pdf, 'latin1')
+        pdf += `${n} 0 obj\n${objects[n]}\nendobj\n`
+    }
+    const xrefStart = Buffer.byteLength(pdf, 'latin1')
+    const count = objects.length
+    pdf += `xref\n0 ${count}\n0000000000 65535 f \n`
+    for (let n = 1; n < count; n++) pdf += `${String(offsets[n]).padStart(10, '0')} 00000 n \n`
+    pdf += `trailer\n<< /Size ${count} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`
+    return Buffer.from(pdf, 'latin1')
+}
+
 // Result-shape guard ---------------------------------------------------------
 // The whole point of the slim contract: the top-level result carries no routing/diagnostic noise,
 // no top-level filename, and no truncation flag. If any of those leak back in, this fails.
@@ -578,6 +609,19 @@ describe('attachment — output cap', () => {
         expect(r.status).toBe('extracted')
         expect(r.extraction!.length).toBeLessThanOrEqual(MAX_OUTPUT_CHARS)
         expect(r.extraction!.length).toBeGreaterThan(MAX_OUTPUT_CHARS - 500) // capping actually engaged
+    })
+
+    // The pdf handler accumulates page text and stops once past the cap (it iterates pages itself
+    // rather than parsing every page up front). A PDF whose text layer far exceeds the cap comes back
+    // bounded, and near the cap — proving the incremental break ran, not that extraction was empty.
+    it('caps an oversized pdf to MAX_OUTPUT_CHARS', async () => {
+        // 90 pages x 55 lines (~57 chars each) ≈ 280k extractable chars, well over the 250k cap.
+        const line = 'the quick brown fox jumps over the lazy dog and then some'
+        const pdf = buildPdf(Array.from({ length: 90 }, () => Array.from({ length: 55 }, () => line)))
+        const r = await extractAttachment({ content: pdf, contentType: 'application/pdf' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction!.length).toBeLessThanOrEqual(MAX_OUTPUT_CHARS)
+        expect(r.extraction!.length).toBeGreaterThan(200_000) // lots of text extracted, then capped
     })
 })
 
