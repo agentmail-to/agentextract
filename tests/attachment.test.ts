@@ -684,6 +684,26 @@ describe('attachment — output cap', () => {
         expect(r.extraction).toBe('short body')
     })
 
+    // The cap counts UTF-16 code units, so slicing at it can land between the halves of an astral
+    // char. A lone half is not a character and serializes as U+FFFD, so the cut backs off by one.
+    // Only reachable when the boundary unit is a high surrogate — hence the exact placement here.
+    it('does not split a surrogate pair at the cap boundary', async () => {
+        const text = 'a'.repeat(MAX_OUTPUT_CHARS - 1) + '😀' + 'b'.repeat(64) // high half lands on cap-1
+        expect(text.charCodeAt(MAX_OUTPUT_CHARS - 1)).toBeGreaterThanOrEqual(0xd800)
+        expect(text.charCodeAt(MAX_OUTPUT_CHARS - 1)).toBeLessThanOrEqual(0xdbff)
+        const r = await extractAttachment({ content: buf(text), contentType: 'text/plain' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction?.length).toBe(MAX_OUTPUT_CHARS - 1) // backed off, not a hard slice
+        expect(r.extraction).not.toContain('�')
+        expect(r.extraction?.endsWith('a')).toBe(true)
+    })
+
+    // The other side of that branch: a non-surrogate boundary must still cut at exactly the cap.
+    it('cuts at exactly the cap when the boundary is not a surrogate', async () => {
+        const r = await extractAttachment({ content: buf('a'.repeat(MAX_OUTPUT_CHARS + 64)), contentType: 'text/plain' })
+        expect(r.extraction?.length).toBe(MAX_OUTPUT_CHARS)
+    })
+
     // The xlsx handler caps INCREMENTALLY as it flattens (it stops appending rows past the cap rather
     // than building the whole workbook's text and letting the central cap trim it). A workbook that
     // flattens to ~8x the cap still comes back bounded — and near the cap, proving the flatten ran.
