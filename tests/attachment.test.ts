@@ -643,6 +643,17 @@ describe('attachment — magic-verify of binary claims', () => {
         expect(r.extraction).toContain('extractable text content')
     })
 
+    // A binary mislabeled text/plain;charset=utf-16 must NOT slip through as text: the utf-16 charset
+    // exemption otherwise suppresses the binary check and the PDF would latin1/utf-16-decode into
+    // gibberish reported as 'extracted'. Binary magic overrides the hint, so %PDF reroutes to pdf.
+    it('recovers a PDF mislabeled text/plain; charset=utf-16 (magic beats the charset hint)', async () => {
+        const input = { content: fixture('sample.pdf'), contentType: 'text/plain; charset=utf-16', filename: 'note.txt' }
+        expect(detectRoute(input)).toEqual({ kind: 'pdf', routedBy: 'sniff' })
+        const r = await extractAttachment(input)
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('extractable text content') // real PDF text, not gibberish
+    })
+
     // DOCX bytes mislabeled application/pdf recover to docx from their OOXML part — even with a
     // lying .pdf name, since content (not the extension) decides.
     it('recovers a DOCX mislabeled as pdf regardless of extension', async () => {

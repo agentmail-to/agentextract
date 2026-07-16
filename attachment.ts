@@ -604,8 +604,22 @@ const trustsExplicitUnicodeCharset = (charset?: string): boolean => {
     return normalized === 'utf-16' || normalized === 'utf-16le' || normalized === 'utf-16be'
 }
 
-const bytesContradictTextClaim = (content: Buffer, charsetHint?: string): boolean =>
-    content.length > 0 && !bomCharset(content) && !trustsExplicitUnicodeCharset(charsetHint) && !looksLikeText(content)
+// Known binary-container magic — %PDF, zip (docx/xlsx), OLE (legacy .doc). A genuine text file never
+// starts with these, so their presence contradicts a text claim even under an explicit charset hint.
+const hasKnownBinaryMagic = (content: Buffer): boolean =>
+    startsWith(content, PDF_MAGIC) || startsWith(content, ZIP_MAGIC) || startsWith(content, OLE_MAGIC)
+
+const bytesContradictTextClaim = (content: Buffer, charsetHint?: string): boolean => {
+    if (content.length === 0 || bomCharset(content)) return false
+    // Binary magic beats even a charset=utf-16 hint: a real utf-16 text file never begins with %PDF /
+    // PK\x03\x04 / the OLE signature, but a binary mislabeled text/…;charset=utf-16 would otherwise be
+    // trusted because the utf-16 exemption below suppresses the printable-ratio check → gibberish
+    // reported as 'extracted'. Re-sniffing then recovers the real format (%PDF → pdf, zip → docx/xlsx).
+    if (hasKnownBinaryMagic(content)) return true
+    // Otherwise an explicit utf-16 hint is trusted (utf-16 text is NUL-heavy and fails looksLikeText);
+    // any other claim must actually look like text.
+    return !trustsExplicitUnicodeCharset(charsetHint) && !looksLikeText(content)
+}
 
 // Takes an AttachmentInput and produces the final routing decision. 
 // Tries each signal in priority order and stops as soon as one works.
