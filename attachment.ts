@@ -6,6 +6,7 @@
 // parsers stay out of the body extractor's bundle. New formats = new registry entries.
 
 import { isUtf8 } from 'node:buffer' // fast native check: are these bytes valid utf-8?
+import zlib from 'node:zlib' // streaming raw-inflate for the OOXML decompression-budget guard
 
 // Converts bytes into text using a specific character encoding
 import iconv from 'iconv-lite'
@@ -414,31 +415,109 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
     return d < x ? 'docx' : 'xlsx'
 }
 
-// Total DECLARED uncompressed size of a zip, read from its central directory (no decompression).
-// Returns Infinity for a ZIP64 archive (>= 4 GB — the 0xffffffff size sentinel means the real value
-// lives in an extra field we treat as over-budget), or 0 for a non-zip (no End-of-Central-Directory).
-const declaredUnzippedSize = (buf: Buffer): number => {
-    let eocd = -1 // End-of-Central-Directory: last 22 B + up to 64 KB comment; scan back for its sig.
+/////////////////////////////////////////////////////////////
+// DECOMPRESSION BUDGET (OOXML zip-bomb guard)
+//
+// A small in-cap .docx/.xlsx can inflate to hundreds of MB and OOM the worker. The zip central
+// directory carries a self-declared uncompressed size, but that field is attacker-controlled — a
+// crafted archive can declare "tiny" and still expand far past the cap. So we don't trust it: we
+// STREAM-inflate each entry and count the REAL output bytes, aborting the instant the archive-wide
+// total crosses the cap. Streaming (not inflateRawSync) keeps peak memory at ~one zlib chunk, never
+// the full expansion. Fail-closed: anything we can't measure — malformed metadata, ZIP64, a corrupt
+// stream, an unsupported compression method — is a skip, never waved through to the parser.
+
+const EOCD_SIG = 0x06054b50 // End-of-Central-Directory record
+const CD_SIG = 0x02014b50 // Central-Directory file header
+const LOCAL_SIG = 0x04034b50 // Local file header
+
+// The pre-parse decompression verdict. `ok` = safe to hand to the parser; otherwise `reason` is the
+// skip message (readable, never "Infinity bytes").
+type DecompressionCheck = { ok: true } | { ok: false; reason: string }
+
+// Inflate one raw-deflate region, adding its output onto `runningTotal`, aborting the moment the
+// total would exceed `cap`. Returns the new total, or a sentinel: -1 = over budget (destroyed
+// early, full expansion never materialized), -2 = corrupt/unreadable stream. Byte counts are >= 0,
+// so the negatives are unambiguous.
+const inflateCounting = (comp: Buffer, runningTotal: number, cap: number): Promise<number> =>
+    new Promise((resolve) => {
+        const inflate = zlib.createInflateRaw()
+        let total = runningTotal
+        let settled = false
+        const settle = (value: number) => {
+            if (settled) return
+            settled = true
+            resolve(value)
+        }
+        inflate.on('data', (chunk: Buffer) => {
+            total += chunk.length
+            if (total > cap) {
+                inflate.destroy() // stop inflating — we never hold the full expansion
+                settle(-1)
+            }
+        })
+        inflate.on('end', () => settle(total))
+        inflate.on('error', () => settle(-2)) // truncated / encrypted / garbage deflate stream
+        inflate.end(comp)
+    })
+
+// Find the EOCD by scanning back from the end for its signature, accepting only a candidate whose
+// declared comment length runs exactly to EOF. That invariant rejects a FAKE EOCD signature planted
+// inside the real archive's comment — which the naive last-match scan would otherwise pick and let
+// the attacker redirect the central-directory walk.
+const findEocd = (buf: Buffer): number => {
     for (let i = buf.length - 22; i >= Math.max(0, buf.length - (22 + 0xffff)); i--) {
-        if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break }
+        if (buf.readUInt32LE(i) === EOCD_SIG && i + 22 + buf.readUInt16LE(i + 20) === buf.length) return i
     }
-    if (eocd < 0) return 0
+    return -1
+}
+
+// Measure a zip's ACTUAL decompressed size, capped. Walks the central directory to each entry's real
+// (structural, not self-declared) compressed region, inflates it, and counts true output bytes.
+const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<DecompressionCheck> => {
+    const eocd = findEocd(buf)
+    if (eocd < 0) return { ok: false, reason: 'malformed zip: no end-of-central-directory record' }
+
     const entries = buf.readUInt16LE(eocd + 10)
-    const centralDirectorySize = buf.readUInt32LE(eocd + 12)
-    const centralDirectoryOffset = buf.readUInt32LE(eocd + 16)
-    if (entries === 0xffff || centralDirectorySize === 0xffffffff || centralDirectoryOffset === 0xffffffff) {
-        return Infinity
-    }
+    const cdOffset = buf.readUInt32LE(eocd + 16)
+    // ZIP64 / out-of-range sentinels: the true values live in a ZIP64 record we deliberately don't
+    // chase. Treat as over-budget rather than trust the classic field or crash on the sentinel.
+    if (entries === 0xffff || buf.readUInt32LE(eocd + 12) === 0xffffffff || cdOffset === 0xffffffff)
+        return { ok: false, reason: 'zip declares a ZIP64 / out-of-range size' }
+
     let total = 0
-    let p = centralDirectoryOffset // central-directory offset
+    let p = cdOffset
     for (let i = 0; i < entries; i++) {
-        if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) break // 0x02014b50 = CD file header
-        const uncompressed = buf.readUInt32LE(p + 24)
-        if (uncompressed === 0xffffffff) return Infinity // ZIP64 sentinel — real size >= 4 GB
-        total += uncompressed
+        // A missing/misaligned central-directory header means the offset was a lie (a partial walk
+        // must not silently return the accumulated total). Fail closed.
+        if (p + 46 > buf.length || buf.readUInt32LE(p) !== CD_SIG)
+            return { ok: false, reason: 'malformed zip: truncated or misaligned central directory' }
+        const method = buf.readUInt16LE(p + 10)
+        const compSize = buf.readUInt32LE(p + 20)
+        const localOffset = buf.readUInt32LE(p + 42)
+        if (compSize === 0xffffffff || localOffset === 0xffffffff)
+            return { ok: false, reason: 'zip declares a ZIP64 / out-of-range size' }
+        // The local header's name/extra lengths can differ from the central copy, so read them here
+        // to find where this entry's compressed bytes actually begin.
+        if (localOffset + 30 > buf.length || buf.readUInt32LE(localOffset) !== LOCAL_SIG)
+            return { ok: false, reason: 'malformed zip: bad local header offset' }
+        const dataStart = localOffset + 30 + buf.readUInt16LE(localOffset + 26) + buf.readUInt16LE(localOffset + 28)
+        const comp = buf.subarray(dataStart, dataStart + compSize)
+        if (comp.length < compSize)
+            return { ok: false, reason: 'malformed zip: compressed data runs past end of file' }
+
+        if (method === 0) {
+            total += comp.length // stored (no compression): output === input
+        } else if (method === 8) {
+            total = await inflateCounting(comp, total, cap)
+            if (total === -1) return { ok: false, reason: `decompresses to over ${cap} bytes` }
+            if (total === -2) return { ok: false, reason: 'malformed zip: unreadable compressed data' }
+        } else {
+            return { ok: false, reason: `zip uses unsupported compression method ${method}` }
+        }
+        if (total > cap) return { ok: false, reason: `decompresses to over ${cap} bytes` }
         p += 46 + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
     }
-    return total
+    return { ok: true }
 }
 
 // Does the content match a confident binary claim? Catches a wrong claim before we hand the bytes
@@ -588,14 +667,13 @@ export const extractAttachment = async (input: AttachmentInput): Promise<Extract
         return { status: 'skipped', reason: type ? `unsupported type ${type}` : 'unrecognized attachment' }
     }
 
-    // Decompression preflight: an OOXML (zip) attachment can balloon in memory far beyond its on-disk
-    // size, so skip one whose declared uncompressed size is over budget before exceljs/mammoth ever
-    // touch it. (pdf/doc/text aren't zips.)
+    // Decompression preflight: an OOXML (zip) attachment can inflate far beyond its on-disk size and
+    // OOM the worker, so MEASURE its actual decompressed size (streaming-inflate, capped) and skip
+    // before exceljs/mammoth ever touch it. Fail-closed — malformed/ZIP64/corrupt metadata is a skip,
+    // never a pass, since the zip's self-declared sizes are attacker-controlled. (pdf/doc/text aren't zips.)
     if (kind === 'docx' || kind === 'xlsx') {
-        const unzipped = declaredUnzippedSize(input.content)
-        if (unzipped > MAX_UNCOMPRESSED_BYTES) {
-            return { status: 'skipped', reason: `decompresses to ${unzipped} bytes, exceeds ${MAX_UNCOMPRESSED_BYTES}` }
-        }
+        const check = await checkDecompressionBudget(input.content, MAX_UNCOMPRESSED_BYTES)
+        if (!check.ok) return { status: 'skipped', reason: check.reason }
     }
 
     // Run the handler safely — catch errors/timeouts instead of crashing, and build the final result.

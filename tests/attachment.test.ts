@@ -1,10 +1,11 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import zlib from 'node:zlib'
 
 import { describe, it, expect } from 'vitest'
 import iconv from 'iconv-lite'
 
-import { extractAttachment, detectRoute, MAX_INPUT_BYTES, MAX_OUTPUT_CHARS } from '../attachment'
+import { extractAttachment, detectRoute, MAX_INPUT_BYTES, MAX_OUTPUT_CHARS, MAX_UNCOMPRESSED_BYTES } from '../attachment'
 
 // NOTE: result shape is { status, extraction?, reason? }; `extraction` is omitted (never '') when a
 // handler runs but produces no text. Nested emails (.eml) are out of scope in this version and skip.
@@ -530,15 +531,17 @@ describe('attachment — xlsx handler', () => {
         expect(r.status).toBe('skipped')
     })
 
-    // Bytes carrying the zip magic + the xl/workbook.xml marker (so content-detection routes them
-    // to xlsx) but with a corrupt body fail cleanly. NB: a bare "PK.." with no OOXML part is now
-    // rerouted by content-detection, not sent here.
-    it('returns failed (not a throw) on a corrupt xlsx', async () => {
+    // Bytes carrying the zip magic + the xl/workbook.xml marker (so content-detection routes them to
+    // xlsx) but with no valid central directory are caught by the fail-closed decompression preflight
+    // and skipped BEFORE exceljs ever loads — cleanly labeled, never a throw. NB: a bare "PK.." with
+    // no OOXML part is rerouted by content-detection, not sent here.
+    it('skips a structurally-corrupt xlsx at the preflight (not a throw)', async () => {
         const oxmlGarbage = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), buf('xl/workbook.xml'), buf(' corrupt body')])
         const input = { content: oxmlGarbage, contentType: XLSX_TYPE, filename: 'bad.xlsx' }
         expect(detectRoute(input).kind).toBe('xlsx')
         const r = await extractAttachment(input)
-        expect(r.status).toBe('failed')
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toMatch(/malformed zip/i)
     })
 })
 
@@ -743,65 +746,133 @@ describe('attachment — edge cases (regression)', () => {
     })
 })
 
-// OOXML decompression preflight — a small in-cap .docx/.xlsx can declare a huge uncompressed size in
-// its zip central directory and OOM the worker. The preflight reads ONLY those declared sizes, so the
-// malicious archive is hand-built (a valid EOCD + one central-directory header with an inflated
-// uncompressed field, pointing at an xl/workbook.xml part so it still routes to xlsx) — no real
-// compressed data needed.
+// OOXML decompression preflight — a small in-cap .docx/.xlsx can inflate to hundreds of MB and OOM
+// the worker. The guard no longer trusts the zip's self-declared uncompressed size (attacker-
+// controlled); it STREAM-inflates each entry and counts REAL output bytes, aborting past the cap.
+// So these archives carry actual deflate streams (pointing at an xl/workbook.xml part so they still
+// route to xlsx), and the fail-closed cases deliberately malform the metadata.
 describe('attachextract — OOXML decompression preflight', () => {
-    // Minimal zip: local header (zip magic + the xl/workbook.xml part name, for routing) + one
-    // central-directory header whose uncompressed field is `declaredUncompressed`, + an EOCD.
-    const fakeOoxmlZip = (
-        declaredUncompressed: number,
-        options: { entries?: number; centralDirectoryOffset?: number; centralDirectorySize?: number } = {}
+    // Build a routable single-entry OOXML zip with a REAL deflate stream. `opts` lets a test lie in
+    // the declared-uncompressed field (to prove the guard ignores it) or corrupt the metadata.
+    const craftOoxmlZip = (
+        content: Buffer,
+        opts: {
+            part?: string
+            method?: number // 8 = deflate (default), 0 = stored
+            declaredUncompressed?: number // the old lie vector — now ignored by the guard
+            entries?: number // EOCD entry count (0xffff = ZIP64 sentinel)
+            cdSize?: number // EOCD central-directory size (0xffffffff = ZIP64 sentinel)
+            cdOffset?: number // EOCD central-directory offset (0xffffffff = ZIP64; a wrong value = malformed)
+            entryCompSize?: number // CD compressed-size field (0xffffffff = ZIP64 sentinel)
+            localOffset?: number // CD → local-header pointer (out of range / wrong = malformed)
+            omitEocd?: boolean // drop the EOCD entirely
+            comment?: Buffer // trailing archive comment (EOCD commentLen is set to cover it)
+        } = {}
     ): Buffer => {
-        const name = Buffer.from('xl/workbook.xml') // makes ooxmlKind route the bytes to xlsx
+        const name = Buffer.from(opts.part ?? 'xl/workbook.xml') // routes the bytes to xlsx via ooxmlKind
+        const method = opts.method ?? 8
+        const comp = method === 0 ? content : zlib.deflateRawSync(content)
+        const declaredUncompressed = (opts.declaredUncompressed ?? content.length) >>> 0
         const lfh = Buffer.alloc(30 + name.length)
         lfh.writeUInt32LE(0x04034b50, 0) // local file header signature (PK\x03\x04)
+        lfh.writeUInt16LE(method, 8) // compression method
+        lfh.writeUInt32LE(comp.length, 18) // compressed size
+        lfh.writeUInt32LE(declaredUncompressed, 22) // uncompressed size (guard no longer reads this)
         lfh.writeUInt16LE(name.length, 26) // file name length
         name.copy(lfh, 30)
+        const localRec = Buffer.concat([lfh, comp])
         const cdh = Buffer.alloc(46 + name.length)
         cdh.writeUInt32LE(0x02014b50, 0) // central directory header signature
-        cdh.writeUInt32LE(declaredUncompressed >>> 0, 24) // the inflated uncompressed size (the lie)
+        cdh.writeUInt16LE(method, 10) // compression method
+        cdh.writeUInt32LE((opts.entryCompSize ?? comp.length) >>> 0, 20) // compressed size
+        cdh.writeUInt32LE(declaredUncompressed, 24) // uncompressed size (the old lie field)
         cdh.writeUInt16LE(name.length, 28) // file name length
+        cdh.writeUInt32LE((opts.localOffset ?? 0) >>> 0, 42) // local header offset
         name.copy(cdh, 46)
+        if (opts.omitEocd) return Buffer.concat([localRec, cdh])
         const eocd = Buffer.alloc(22)
         eocd.writeUInt32LE(0x06054b50, 0) // end of central directory signature
-        eocd.writeUInt16LE(options.entries ?? 1, 8) // entries on this disk
-        eocd.writeUInt16LE(options.entries ?? 1, 10) // total entries
-        eocd.writeUInt32LE(options.centralDirectorySize ?? cdh.length, 12) // central directory size
-        eocd.writeUInt32LE(options.centralDirectoryOffset ?? lfh.length, 16) // central directory offset
-        return Buffer.concat([lfh, cdh, eocd])
+        eocd.writeUInt16LE(opts.entries ?? 1, 8) // entries on this disk
+        eocd.writeUInt16LE(opts.entries ?? 1, 10) // total entries
+        eocd.writeUInt32LE((opts.cdSize ?? cdh.length) >>> 0, 12) // central directory size
+        eocd.writeUInt32LE((opts.cdOffset ?? localRec.length) >>> 0, 16) // central directory offset
+        const comment = opts.comment ?? Buffer.alloc(0)
+        eocd.writeUInt16LE(comment.length, 20) // comment length — findEocd requires this to run to EOF
+        return Buffer.concat([localRec, cdh, eocd, comment])
     }
 
-    // Declares 100 MB uncompressed (> the 50 MB cap) → skipped before exceljs is ever loaded.
-    it('skips an OOXML archive whose declared uncompressed size is over budget', async () => {
-        const bomb = fakeOoxmlZip(100 * 1024 * 1024)
+    // Content that genuinely inflates past the 50 MB cap (compresses to a few KB on disk).
+    const overCapContent = () => Buffer.alloc(MAX_UNCOMPRESSED_BYTES + 10 * 1024 * 1024, 0x41)
+
+    // The core fix: a bomb that inflates over the cap is skipped by MEASUREMENT, not by trusting
+    // the declared size — the metadata never touches exceljs.
+    it('skips an OOXML archive that actually inflates past the cap', async () => {
+        const bomb = craftOoxmlZip(overCapContent())
         const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
         expect(r.status).toBe('skipped')
         expect(r.reason).toMatch(/decompress/i)
         expect(r.extraction).toBeUndefined()
     })
 
-    // ZIP64 archives mark classic EOCD fields with sentinels and store the real values elsewhere.
-    // Treat those sentinels as over-budget instead of falling through to exceljs/mammoth, since the
-    // real declared size can be arbitrarily large and the preflight deliberately does not chase ZIP64
-    // extra records.
-    it('skips ZIP64 EOCD sentinels before loading the parser', async () => {
+    // The bypass regression test: the archive LIES, declaring a tiny uncompressed size while its
+    // deflate stream expands past the cap. The old metadata-trusting guard waved this through; the
+    // streaming guard catches it because it counts real output bytes.
+    it('skips a bomb even when it declares a tiny uncompressed size', async () => {
+        const bomb = craftOoxmlZip(overCapContent(), { declaredUncompressed: 100 })
+        const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toMatch(/decompress/i)
+        expect(r.extraction).toBeUndefined()
+    })
+
+    // ZIP64 / out-of-range sentinels mean the real values live in a ZIP64 record we don't chase —
+    // treat as over-budget rather than trust the classic field or fall through to the parser.
+    it('skips ZIP64 / out-of-range sentinels', async () => {
+        const small = Buffer.from('<workbook/>')
         for (const bomb of [
-            fakeOoxmlZip(1, { entries: 0xffff }),
-            fakeOoxmlZip(1, { centralDirectorySize: 0xffffffff }),
-            fakeOoxmlZip(1, { centralDirectoryOffset: 0xffffffff }),
+            craftOoxmlZip(small, { entries: 0xffff }),
+            craftOoxmlZip(small, { cdSize: 0xffffffff }),
+            craftOoxmlZip(small, { cdOffset: 0xffffffff }),
+            craftOoxmlZip(small, { entryCompSize: 0xffffffff }),
         ]) {
             const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
             expect(r.status).toBe('skipped')
-            expect(r.reason).toMatch(/decompress/i)
+            expect(r.reason).toMatch(/zip64|out-of-range/i)
             expect(r.extraction).toBeUndefined()
         }
     })
 
-    // A real, modestly-sized .xlsx (declared uncompressed well under the cap) sails through the
-    // preflight and extracts normally — the gate must not over-reject legitimate files.
+    // Fail-closed on malformed metadata — a partial/misdirected walk must never silently pass.
+    it('skips malformed archives (bad offsets / missing records) instead of passing them', async () => {
+        const small = Buffer.from('<workbook/>')
+        const cases: Array<[string, Buffer]> = [
+            ['no EOCD', craftOoxmlZip(small, { omitEocd: true })],
+            ['bad central-directory offset', craftOoxmlZip(small, { cdOffset: 3 })],
+            ['bad local-header offset', craftOoxmlZip(small, { localOffset: 0x0fffffff })],
+        ]
+        for (const [, bomb] of cases) {
+            const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
+            expect(r.status).toBe('skipped')
+            expect(r.reason).toMatch(/malformed zip/i)
+            expect(r.extraction).toBeUndefined()
+        }
+    })
+
+    // A fake EOCD signature planted in the archive COMMENT sits closer to EOF than the real record,
+    // so a naive last-match scan would pick it. The comment-length-runs-to-EOF invariant rejects the
+    // planted one (its trailing length doesn't reach EOF) and the true EOCD still governs the walk,
+    // so a well-formed archive extracts normally rather than misrouting off the fake record.
+    it('ignores a fake EOCD signature planted in the archive comment', async () => {
+        // Comment = a bare EOCD signature followed by zero padding; its own commentLen field reads 0,
+        // so the invariant fails at the fake position and holds only at the real trailing EOCD.
+        const comment = Buffer.concat([Buffer.from([0x50, 0x4b, 0x05, 0x06]), Buffer.alloc(40, 0)])
+        const zip = craftOoxmlZip(Buffer.from('<workbook><sheet>hi</sheet></workbook>'), { comment })
+        const r = await extractAttachment({ content: zip, contentType: XLSX_TYPE })
+        expect(r.status).not.toBe('skipped')
+    })
+
+    // A real, modestly-sized .xlsx inflates well under the cap and extracts normally — the streaming
+    // guard must not over-reject legitimate files (and pays only one extra inflate pass).
     it('lets a normal .xlsx through the preflight and extracts it', async () => {
         const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
         expect(r.status).toBe('extracted')
