@@ -294,14 +294,28 @@ const xlsxHandler: Handler = {
         // Cast: the value is a real Buffer; exceljs's load() type clashes with @types/node's generic Buffer.
         await workbook.xlsx.load(content as unknown as Parameters<typeof workbook.xlsx.load>[0])
         const sheets: string[] = []
+        // Stop flattening once we've built MAX_OUTPUT_CHARS of text: a dense workbook is already in
+        // memory after load(), so building the FULL flattened string (which the central cap would
+        // then trim) doubles peak memory for nothing. exceljs's eachRow/eachSheet can't break, so we
+        // gate on a running length and skip further work once over. The central cap does the final
+        // surrogate-safe slice; this just keeps the intermediate string near the cap, not the doc.
+        let length = 0
+        let capped = false
         workbook.eachSheet((sheet) => {
+            if (capped) return
             const rows: string[] = []
             // Drop empty cells/rows so a sparse sheet doesn't flatten into runs of empty tabs.
             sheet.eachRow({ includeEmpty: false }, (row) => {
+                if (capped) return
                 const cells: string[] = []
                 // cell.text = the shown value (formula result, formatted date), not the raw number/formula.
                 row.eachCell({ includeEmpty: false }, (cell) => cells.push(cell.text ?? ''))
-                if (cells.length > 0) rows.push(cells.join('\t'))
+                if (cells.length > 0) {
+                    const line = cells.join('\t')
+                    rows.push(line)
+                    length += line.length + 1 // + newline
+                    if (length > MAX_OUTPUT_CHARS) capped = true // one line of overshoot, trimmed centrally
+                }
             })
             // Header + rows per sheet; a text-less sheet contributes nothing → extracted_empty.
             if (rows.length > 0) sheets.push(`=== ${sheet.name} ===\n${rows.join('\n')}`)

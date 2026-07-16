@@ -4,6 +4,7 @@ import zlib from 'node:zlib'
 
 import { describe, it, expect } from 'vitest'
 import iconv from 'iconv-lite'
+import ExcelJS from 'exceljs'
 
 import { extractAttachment, detectRoute, MAX_INPUT_BYTES, MAX_OUTPUT_CHARS, MAX_UNCOMPRESSED_BYTES } from '../attachment'
 
@@ -562,6 +563,21 @@ describe('attachment — output cap', () => {
     it('leaves under-cap text whole', async () => {
         const r = await extractAttachment({ content: buf('short body'), contentType: 'text/plain' })
         expect(r.extraction).toBe('short body')
+    })
+
+    // The xlsx handler caps INCREMENTALLY as it flattens (it stops appending rows past the cap rather
+    // than building the whole workbook's text and letting the central cap trim it). A workbook that
+    // flattens to ~8x the cap still comes back bounded — and near the cap, proving the flatten ran.
+    it('caps an oversized xlsx to MAX_OUTPUT_CHARS', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Big')
+        const cell = 'x'.repeat(40)
+        for (let i = 0; i < 50_000; i++) sheet.addRow([cell, cell, cell]) // ~6M chars flattened, >> 250k cap
+        const content = Buffer.from(await workbook.xlsx.writeBuffer())
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction!.length).toBeLessThanOrEqual(MAX_OUTPUT_CHARS)
+        expect(r.extraction!.length).toBeGreaterThan(MAX_OUTPUT_CHARS - 500) // capping actually engaged
     })
 })
 
