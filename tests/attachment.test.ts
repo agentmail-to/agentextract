@@ -5,6 +5,7 @@ import zlib from 'node:zlib'
 import { describe, it, expect } from 'vitest'
 import iconv from 'iconv-lite'
 import ExcelJS from 'exceljs'
+import JSZip from 'jszip' // the zip reader inside exceljs/mammoth — the dual-EOCD tripwire pins our EOCD choice to its
 
 import { extractAttachment, detectRoute, MAX_INPUT_BYTES, MAX_OUTPUT_CHARS, MAX_UNCOMPRESSED_BYTES } from '../attachment'
 
@@ -857,7 +858,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         eocd.writeUInt32LE((opts.cdSize ?? cdh.length) >>> 0, 12) // central directory size
         eocd.writeUInt32LE((opts.cdOffset ?? localRec.length) >>> 0, 16) // central directory offset
         const comment = opts.comment ?? Buffer.alloc(0)
-        eocd.writeUInt16LE(comment.length, 20) // comment length — findEocd requires this to run to EOF
+        eocd.writeUInt16LE(comment.length, 20) // archive comment length (matches the appended comment bytes)
         return Buffer.concat([localRec, cdh, eocd, comment])
     }
 
@@ -926,6 +927,70 @@ describe('attachextract — OOXML decompression preflight', () => {
         const r = await extractAttachment({ content: withJunk, contentType: XLSX_TYPE })
         expect(r.status).toBe('extracted')
         expect(r.extraction).toContain('=== Q1 ===')
+    })
+
+    // Tripwire for the whole guarantee behind the last-signature EOCD scan: the preflight must select
+    // the SAME end-of-central-directory record the parser (jszip, inside exceljs/mammoth) selects, or
+    // it measures a different central directory than the parser inflates — a bomb-bypass. This crafts a
+    // zip with TWO EOCDs whose central directories differ: an earlier one listing a tiny entry, and a
+    // LAST one (which jszip's last-signature scan picks) listing an over-cap bomb. If either side drifts
+    // — our findEocd stops matching last-signature, or a jszip upgrade changes its selection — an
+    // assertion here breaks, instead of the split silently reopening.
+    it('measures the same EOCD/central directory the parser reads (dual-EOCD tripwire)', async () => {
+        const localFile = (name: string, data: Buffer, uncompressed: number, method: number) => {
+            const n = Buffer.from(name, 'latin1')
+            const h = Buffer.alloc(30 + n.length)
+            h.writeUInt32LE(0x04034b50, 0)
+            h.writeUInt16LE(method, 8)
+            h.writeUInt32LE(data.length, 18) // compressed size
+            h.writeUInt32LE(uncompressed, 22) // uncompressed size (the preflight ignores this)
+            h.writeUInt16LE(n.length, 26)
+            n.copy(h, 30)
+            return Buffer.concat([h, data])
+        }
+        const central = (name: string, comp: number, uncompressed: number, localOffset: number, method: number) => {
+            const n = Buffer.from(name, 'latin1')
+            const h = Buffer.alloc(46 + n.length)
+            h.writeUInt32LE(0x02014b50, 0)
+            h.writeUInt16LE(method, 10)
+            h.writeUInt32LE(comp, 20)
+            h.writeUInt32LE(uncompressed, 24)
+            h.writeUInt16LE(n.length, 28)
+            h.writeUInt32LE(localOffset, 42)
+            n.copy(h, 46)
+            return h
+        }
+        const eocd = (entries: number, cdSize: number, cdOffset: number) => {
+            const e = Buffer.alloc(22)
+            e.writeUInt32LE(0x06054b50, 0)
+            e.writeUInt16LE(entries, 8)
+            e.writeUInt16LE(entries, 10)
+            e.writeUInt32LE(cdSize, 12)
+            e.writeUInt32LE(cdOffset, 16)
+            return e
+        }
+        const bombUncompressed = MAX_UNCOMPRESSED_BYTES + 5 * 1024 * 1024
+        const bombData = zlib.deflateRawSync(Buffer.alloc(bombUncompressed, 0x41)) // inflates past the cap
+        const bombLocal = localFile('xl/workbook.xml', bombData, bombUncompressed, 8) // deflate; data starts at offset 45
+        const smallLocal = localFile('small.txt', buf('tiny'), 4, 0) // stored
+        const cdSmall = central('small.txt', 4, 4, bombLocal.length, 0)
+        const cdSmallOffset = bombLocal.length + smallLocal.length
+        const eocdEarly = eocd(1, cdSmall.length, cdSmallOffset) // earlier EOCD → tiny central directory
+        const cdBomb = central('xl/workbook.xml', bombData.length, bombUncompressed, 0, 8)
+        const cdBombOffset = cdSmallOffset + cdSmall.length + eocdEarly.length
+        const eocdLast = eocd(1, cdBomb.length, cdBombOffset) // LAST EOCD → bomb central directory
+        const file = Buffer.concat([bombLocal, smallLocal, cdSmall, eocdEarly, cdBomb, eocdLast])
+
+        // The parser (jszip) picks the LAST EOCD, so it sees the bomb entry — never the earlier tiny CD.
+        const parsed = await JSZip.loadAsync(file)
+        expect(Object.keys(parsed.files)).toContain('xl/workbook.xml')
+        expect(Object.keys(parsed.files)).not.toContain('small.txt')
+
+        // The preflight must therefore measure the bomb via that same last EOCD and skip — not measure
+        // the earlier tiny CD and wave it through to a parser that would inflate the bomb.
+        const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toMatch(/decompress/i)
     })
 
     // A real, modestly-sized .xlsx inflates well under the cap and extracts normally — the streaming
