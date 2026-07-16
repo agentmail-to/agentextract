@@ -61,6 +61,26 @@ The heavy parsers (`unpdf`, `mammoth`, `exceljs`, …) are lazy-loaded per handl
 available on its own subpath — `import { extractAttachment } from 'agentextract/attachment'` — if
 you want to reach it without touching the body-extraction entry point.
 
+### Resource limits & the safety boundary
+
+`extractAttachment` never throws on hostile input, but its in-process guards are **soft** — they
+bound what this library accumulates, not what the OS lets a parser allocate. Treat real CPU/OOM
+containment as the host's job (a Lambda memory limit, or a terminable worker/subprocess). These
+guards reduce blast radius; they are **not** a sandbox.
+
+- **Input size** — attachments over `MAX_INPUT_BYTES` (10 MB) are skipped before any decode or parse.
+- **Decompression** — OOXML (`.docx`/`.xlsx`) archives are stream-inflated and **measured**; one that
+  actually expands past `MAX_UNCOMPRESSED_BYTES` (50 MB) is skipped before the parser loads. Malformed
+  or ZIP64 metadata is treated as over-budget (fail-closed), not trusted.
+- **Output** — extracted text is capped at `MAX_OUTPUT_CHARS` (250k). The `.xlsx` and PDF handlers
+  apply this **incrementally** as they build, so a huge sheet/PDF never materializes in full. The
+  `.docx` (mammoth) and HTML (html-to-text) handlers return a complete string that is then trimmed —
+  there the cap is **post-materialization**, so peak memory follows the whole document.
+- **Timeout** — `HANDLER_TIMEOUT_MS` (10 s) stops *awaiting* a slow async parse, but cannot cancel
+  synchronous CPU already running inside a parser.
+- **PDF** — page count and accumulated output are bounded (`MAX_PDF_PAGES`, `MAX_OUTPUT_CHARS`), but
+  pdf.js's internal per-page decompression is **not** bounded in-library (no hook exists).
+
 ## What it does that off-the-shelf engines don't
 
 Benchmarked against TalonJS and Mailgun Talon on a real corpus of ~41k messages (exact-match vs a

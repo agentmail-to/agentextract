@@ -30,10 +30,12 @@ export const MAX_OUTPUT_CHARS = 250_000
 // email PDF is a handful of pages, so this is far above any real attachment while still capping abuse.
 export const MAX_PDF_PAGES = 2000
 
-// Max total DECLARED uncompressed size of an OOXML (zip) attachment. A small in-cap .docx/.xlsx can
-// still decompress to hundreds of MB and OOM the worker — MAX_INPUT_BYTES only bounds the COMPRESSED
-// size. Parsers then build an in-memory model on top (~8x for a cell-dense sheet), so keep this well
-// under the heavy-parser memory floor (1024 MB): 50 MB uncompressed → ~400 MB RSS worst case.
+// Max total ACTUAL uncompressed size of an OOXML (zip) attachment, MEASURED by streaming inflation
+// (see the DECOMPRESSION BUDGET guard — the declared central-directory size is attacker-controlled
+// and not trusted). A small in-cap .docx/.xlsx can still decompress to hundreds of MB and OOM the
+// worker — MAX_INPUT_BYTES only bounds the COMPRESSED size. Parsers then build an in-memory model on
+// top (~8x for a cell-dense sheet), so keep this well under the heavy-parser memory floor (1024 MB):
+// 50 MB uncompressed → ~400 MB RSS worst case.
 export const MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 
 // Guard: if a handler takes >= 10 seconds, we stop awaiting it. Note: this can't
@@ -727,7 +729,11 @@ export const extractAttachment = async (input: AttachmentInput): Promise<Extract
         )
         const isEmpty = output.empty ?? output.text.trim().length === 0
         // Cap output centrally so a pathological document can't dump megabytes into S3 + the search
-        // index. Don't split a surrogate pair at the boundary (a lone half serializes as U+FFFD).
+        // index. NB: the xlsx and pdf handlers already cap INCREMENTALLY as they build, so this is
+        // just the final precise trim for them; the docx (mammoth) and html (html-to-text) handlers
+        // return a full string, so for those this is a POST-MATERIALIZATION cap (peak memory follows
+        // the whole document — hard containment is the host memory limit, see README).
+        // Don't split a surrogate pair at the boundary (a lone half serializes as U+FFFD).
         const overCap = output.text.length > MAX_OUTPUT_CHARS
         const capEnd =
             overCap && output.text.charCodeAt(MAX_OUTPUT_CHARS - 1) >= 0xd800 && output.text.charCodeAt(MAX_OUTPUT_CHARS - 1) <= 0xdbff
