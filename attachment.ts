@@ -448,10 +448,23 @@ const XLSX_PART = Buffer.from('xl/workbook.xml')
 const startsWith = (content: Buffer, magic: Buffer): boolean =>
     content.length >= magic.length && content.subarray(0, magic.length).equals(magic)
 
-// Which OOXML kind a zip is, by its main-part path. When both appear (a docx with an embedded
-// spreadsheet), the container's own part sits earlier in the file than the embedded object's, so
-// the earlier marker wins. Returns undefined for a non-OOXML zip (jar, plain archive, pptx).
+// Which OOXML kind a zip is, by its main root part (word/document.xml vs xl/workbook.xml). A docx can
+// embed a workbook, so identify the package's OWN parts by exact zip entry name — not by whichever
+// marker appears first in the raw bytes, which an embedded object can reorder. Returns undefined for a
+// non-OOXML zip (jar, plain archive, pptx).
 const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
+    // Prefer exact zip ENTRY names from the central directory: an embedded object (an xlsx inside a
+    // docx) contributes its xl/workbook.xml as bytes within another entry, NOT as an entry of this
+    // package, so a root-entry match is not fooled by storage order the way a raw byte scan is.
+    const names = zipEntryNames(content)
+    if (names) {
+        const hasDocx = names.includes('word/document.xml')
+        const hasXlsx = names.includes('xl/workbook.xml')
+        if (hasDocx) return 'docx' // a real word/document.xml root part wins (docx may embed a workbook)
+        if (hasXlsx) return 'xlsx'
+        return undefined // OOXML zip with neither root part (pptx, jar, plain archive)
+    }
+    // Fallback (archive not walkable): raw-bytes scan, earlier main-part marker wins.
     const d = content.indexOf(DOCX_PART)
     const x = content.indexOf(XLSX_PART)
     if (d === -1 && x === -1) return undefined
@@ -515,6 +528,27 @@ const inflateCounting = (comp: Buffer, runningTotal: number, cap: number): Promi
 const findEocd = (buf: Buffer): number => {
     const eocd = buf.lastIndexOf(EOCD_MAGIC)
     return eocd >= 0 && eocd + 22 <= buf.length ? eocd : -1 // need room for the 22-byte fixed record
+}
+
+// Read every entry's stored name from the central directory. Unlike scanning raw bytes, this sees
+// only the PACKAGE's own parts: an embedded object's internal paths (e.g. an xlsx embedded inside a
+// docx) live in another entry's data, not as entries here, so they can't fool root detection.
+// Returns undefined when the central directory can't be walked (caller falls back to a raw scan).
+const zipEntryNames = (buf: Buffer): string[] | undefined => {
+    const eocd = findEocd(buf)
+    if (eocd < 0) return undefined
+    const entries = buf.readUInt16LE(eocd + 10)
+    if (entries === 0xffff) return undefined // ZIP64 entry count — not chased here
+    const names: string[] = []
+    let p = buf.readUInt32LE(eocd + 16)
+    for (let i = 0; i < entries; i++) {
+        if (p + 46 > buf.length || buf.readUInt32LE(p) !== CD_SIG) return undefined
+        const nameLen = buf.readUInt16LE(p + 28)
+        if (p + 46 + nameLen > buf.length) return undefined
+        names.push(buf.toString('latin1', p + 46, p + 46 + nameLen))
+        p += 46 + nameLen + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
+    }
+    return names
 }
 
 // Measure a zip's ACTUAL decompressed size, capped. Walks the central directory to each entry's real

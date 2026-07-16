@@ -679,6 +679,59 @@ describe('attachment — magic-verify of binary claims', () => {
         const r = await extractAttachment(input)
         expect(r.status).toBe('extracted')
     })
+
+    // A DOCX that embeds a workbook: the embedded xlsx contributes its internal `xl/workbook.xml` as
+    // bytes stored EARLIER in the archive than the package's own `word/document.xml`. A raw-bytes scan
+    // (earlier marker wins) would misread the package as xlsx; matching exact zip ENTRY names keeps it
+    // docx, because the embedded workbook's path is not an entry of this package.
+    const storedZip = (entries: Array<{ name: string; content: Buffer }>): Buffer => {
+        const locals: Buffer[] = []
+        const centrals: Buffer[] = []
+        let offset = 0
+        for (const { name, content } of entries) {
+            const nameBuf = Buffer.from(name, 'latin1')
+            const lfh = Buffer.alloc(30 + nameBuf.length)
+            lfh.writeUInt32LE(0x04034b50, 0) // local file header sig (PK\x03\x04 — also the zip magic)
+            lfh.writeUInt32LE(content.length, 18) // compressed size (method 0 = stored)
+            lfh.writeUInt32LE(content.length, 22) // uncompressed size
+            lfh.writeUInt16LE(nameBuf.length, 26)
+            nameBuf.copy(lfh, 30)
+            const localRec = Buffer.concat([lfh, content])
+            const cdh = Buffer.alloc(46 + nameBuf.length)
+            cdh.writeUInt32LE(0x02014b50, 0) // central directory header sig
+            cdh.writeUInt32LE(content.length, 20)
+            cdh.writeUInt32LE(content.length, 24)
+            cdh.writeUInt16LE(nameBuf.length, 28)
+            cdh.writeUInt32LE(offset, 42) // local header offset
+            nameBuf.copy(cdh, 46)
+            locals.push(localRec)
+            centrals.push(cdh)
+            offset += localRec.length
+        }
+        const cd = Buffer.concat(centrals)
+        const eocd = Buffer.alloc(22)
+        eocd.writeUInt32LE(0x06054b50, 0)
+        eocd.writeUInt16LE(entries.length, 8)
+        eocd.writeUInt16LE(entries.length, 10)
+        eocd.writeUInt32LE(cd.length, 12)
+        eocd.writeUInt32LE(offset, 16) // central directory offset
+        return Buffer.concat([...locals, cd, eocd])
+    }
+
+    // Embedded workbook stored first (its bytes carry the literal `xl/workbook.xml`), real Word part second.
+    const docxWithEmbeddedWorkbook = () =>
+        storedZip([
+            { name: 'word/embeddings/oleObject1.xlsx', content: buf('PK xl/workbook.xml embedded blob') },
+            { name: 'word/document.xml', content: buf('<w:document>hello</w:document>') },
+        ])
+
+    it('keeps a DOCX-with-embedded-workbook as docx (entry name, not raw byte order)', () => {
+        const bytes = docxWithEmbeddedWorkbook()
+        // Claimed docx: must stay docx (the declared route is retained; no misroute to xlsx).
+        expect(detectRoute({ content: bytes, contentType: DOCX, filename: 'report.docx' }).kind).toBe('docx')
+        // Pure content sniff (no type/name): still docx from the root entry, despite byte order.
+        expect(detectRoute({ content: bytes }).kind).toBe('docx')
+    })
 })
 
 // Image-heavy documents (no OCR) ---------------------------------------------
