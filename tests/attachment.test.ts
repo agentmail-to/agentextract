@@ -2,12 +2,19 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import zlib from 'node:zlib'
 
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import iconv from 'iconv-lite'
 import ExcelJS from 'exceljs'
 import JSZip from 'jszip' // the zip reader inside exceljs/mammoth — the dual-EOCD tripwire pins our EOCD choice to its
 
-import { extractAttachment, detectRoute, MAX_INPUT_BYTES, MAX_OUTPUT_CHARS, MAX_UNCOMPRESSED_BYTES } from '../attachment'
+import {
+    extractAttachment,
+    detectRoute,
+    HANDLER_TIMEOUT_MS,
+    MAX_INPUT_BYTES,
+    MAX_OUTPUT_CHARS,
+    MAX_UNCOMPRESSED_BYTES,
+} from '../attachment'
 
 // NOTE: result shape is { status, extraction?, reason? }; `extraction` is omitted (never '') when a
 // handler runs but produces no text. Nested emails (.eml) are out of scope in this version and skip.
@@ -85,6 +92,15 @@ describe('attachment — slim result contract', () => {
 // Routing lives on detectRoute now, so we assert the decision there and the extraction on the result.
 
 describe('attachment — routing (never trust one signal)', () => {
+    // detectRoute is exported and has no zero-byte shortcut of its own (extractAttachment resolves
+    // empties before ever calling it), so the sniff must survive being handed nothing to sniff.
+    it('routes zero bytes to nothing rather than guessing', () => {
+        expect(detectRoute({ content: Buffer.alloc(0), contentType: 'application/octet-stream' })).toEqual({
+            routedBy: 'none',
+        })
+        expect(detectRoute({ content: Buffer.alloc(0) })).toEqual({ routedBy: 'none' })
+    })
+
     // Honest content-type: the common case. Routes on the type, extracts, reports it.
     it('routes text/csv by content-type', async () => {
         const input = { content: buf('a,b\n1,2'), contentType: 'text/csv', filename: 'data.csv' }
@@ -305,6 +321,46 @@ describe('attachment — charset-correct decoding', () => {
         expect(r.extraction).toBe('hello world')
     })
 
+    // The bottom two rungs of resolveCharset's ladder, below the confidence gate. Neither claims to
+    // be a CORRECT decode — the point is that both beat the alternative of decoding as utf-8 and
+    // turning every high byte into an irreversible U+FFFD.
+    it("takes jschardet's guess even below the confidence gate rather than mangle high bytes", async () => {
+        // jschardet reads these as KOI8-R at ~0.49 confidence — under the 0.7 gate, so only the floor
+        // can rescue them. A plausible decode beats guaranteed replacement characters.
+        const content = Buffer.from(Array.from({ length: 60 }, (_, i) => 0xc0 + (i % 16)))
+        const r = await extractAttachment({ content, contentType: 'text/plain' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).not.toContain('�') // every byte mapped to something
+    })
+
+    it('floors on latin1 when nothing is detected at all', async () => {
+        // Invalid utf-8 lead bytes, too short and too mixed for jschardet to name any encoding (it
+        // returns encoding: null), so the ladder runs out. latin1 catches it: every byte maps to a
+        // character — possibly the wrong one, but reversibly so.
+        const content = Buffer.from([0x41, 0xc0, 0x41, 0xc1, 0x41, 0xf5, 0x41])
+        const r = await extractAttachment({ content, contentType: 'text/plain' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBe('AÀAÁAõA')
+    })
+
+    // The BE half of the same rule. Its byte order is the mirror image of the LE case above, so a
+    // sign/endianness slip in bomCharset would leave that test green and only break this one.
+    it('decodes a UTF-16BE file by its BOM (FE FF)', async () => {
+        const content = iconv.encode('hello world', 'utf-16be', { addBOM: true })
+        expect(content.subarray(0, 2)).toEqual(Buffer.from([0xfe, 0xff])) // the sample really is BE-marked
+        const r = await extractAttachment({ content, contentType: 'text/plain' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBe('hello world')
+    })
+
+    // The three-byte UTF-8 BOM, stripped from the output rather than surfacing as a leading U+FEFF.
+    it('decodes a UTF-8 BOM file and strips the mark from the extraction', async () => {
+        const content = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), buf('héllo wörld')])
+        const r = await extractAttachment({ content, contentType: 'text/plain' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBe('héllo wörld') // no leading
+    })
+
     // Some real text attachments declare UTF-16 in Content-Type but omit the BOM. The explicit
     // charset is the only signal that the NUL-heavy bytes are text, so the binary-contradiction
     // guard must not reroute them to a skip.
@@ -487,6 +543,17 @@ describe('attachment — doc handler', () => {
         expect(r.extraction).toContain('First paragraph about revenue')
     })
 
+    // The other side of that gate. A .doc filename normally routes by EXTENSION, so sniff's OLE rule
+    // never runs — it only becomes reachable once a text claim is voided by the OLE magic, which is
+    // the mislabeled-as-text/plain case. Without this the rule's accept path is dead in the suite.
+    it('rescues an OLE .doc mislabeled text/plain through the sniff', async () => {
+        const input = { content: fixture('sample.doc'), contentType: 'text/plain', filename: 'note.doc' }
+        expect(detectRoute(input)).toEqual({ kind: 'doc', routedBy: 'sniff' })
+        const r = await extractAttachment(input)
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('First paragraph about revenue')
+    })
+
     // OLE bytes with a non-.doc name must NOT be claimed as doc (could be xls/ppt/msg).
     it('does not claim OLE bytes as doc without a .doc extension', async () => {
         const input = { content: fixture('sample.doc'), contentType: 'application/octet-stream', filename: 'book.xls' }
@@ -600,6 +667,23 @@ describe('attachment — output cap', () => {
     // The xlsx handler caps INCREMENTALLY as it flattens (it stops appending rows past the cap rather
     // than building the whole workbook's text and letting the central cap trim it). A workbook that
     // flattens to ~8x the cap still comes back bounded — and near the cap, proving the flatten ran.
+    // The xlsx cap is incremental precisely so a dense workbook is never flattened in full and then
+    // trimmed. A single-sheet cap only proves the ROW gate; this proves the SHEET gate — once the cap
+    // is reached, later sheets are skipped whole rather than built and thrown away. Asserted through
+    // the absence of the later sheet's header, which is the only externally visible trace of it.
+    it('stops flattening later sheets once the cap is reached', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const big = workbook.addWorksheet('Big')
+        const cell = 'x'.repeat(40)
+        for (let i = 0; i < 5_000; i++) big.addRow([cell, cell, cell]) // ~600k chars flattened, past the 250k cap
+        workbook.addWorksheet('Later').addRow(['this sheet sits past the cap and must never be flattened'])
+        const content = Buffer.from(await workbook.xlsx.writeBuffer())
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('=== Big ===')
+        expect(r.extraction).not.toContain('=== Later ===')
+    })
+
     it('caps an oversized xlsx to MAX_OUTPUT_CHARS', async () => {
         const workbook = new ExcelJS.Workbook()
         const sheet = workbook.addWorksheet('Big')
@@ -816,7 +900,31 @@ describe('attachment — edge cases (regression)', () => {
         expect(asPdf.extraction).toBeUndefined()
     })
 
-    // Documented limitation — withTimeout (attachment.ts:514) is not exported, so replicate it
+    // The real guard, end to end. The replica below proves a PROPERTY of the timeout (that the work
+    // it abandons keeps running) but executes a copy, so the shipped withTimeout/HandlerTimeoutError
+    // were never run by this suite. Here a stubbed parser hangs forever and fake timers jump the
+    // deadline, so the actual code path runs: reject at HANDLER_TIMEOUT_MS → caught → labeled 'failed',
+    // never propagated to the caller.
+    it('reports a hung handler as failed at HANDLER_TIMEOUT_MS', async () => {
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({ getDocumentProxy: () => new Promise(() => {}) })) // never settles
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            vi.useFakeTimers()
+            const pending = extract({ content: buf('%PDF-1.4 hung'), contentType: 'application/pdf' })
+            await vi.advanceTimersByTimeAsync(HANDLER_TIMEOUT_MS + 10)
+            const r = await pending
+            expect(r.status).toBe('failed')
+            expect(r.reason).toMatch(new RegExp(`handler exceeded ${HANDLER_TIMEOUT_MS}ms`))
+            expect(r.extraction).toBeUndefined()
+        } finally {
+            vi.useRealTimers()
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
+
+    // Documented limitation — withTimeout (attachment.ts:781) is not exported, so replicate it
     // verbatim. Rejecting the wrapper does NOT cancel the underlying handler: its CPU work runs to
     // completion regardless (wasted CPU/memory after we time out). Can't be fixed without a
     // cancellable/off-thread parser.
@@ -929,6 +1037,46 @@ describe('attachextract — OOXML decompression preflight', () => {
     // Content that genuinely inflates past the 50 MB cap (compresses to a few KB on disk).
     const overCapContent = () => Buffer.alloc(MAX_UNCOMPRESSED_BYTES + 10 * 1024 * 1024, 0x41)
 
+    // Raw zip-record builders, for the tripwires below that need to lay out records by hand rather
+    // than accept craftOoxmlZip's well-formed arrangement (two EOCDs, two central directories, a
+    // record hidden past the declared count). Every field a tripwire lies in is a parameter here.
+    const localFile = (name: string, data: Buffer, uncompressed: number, method: number) => {
+        const n = Buffer.from(name, 'latin1')
+        const h = Buffer.alloc(30 + n.length)
+        h.writeUInt32LE(0x04034b50, 0)
+        h.writeUInt16LE(method, 8)
+        h.writeUInt32LE(data.length, 18) // compressed size
+        h.writeUInt32LE(uncompressed, 22) // uncompressed size (the preflight ignores this)
+        h.writeUInt16LE(n.length, 26)
+        n.copy(h, 30)
+        return Buffer.concat([h, data])
+    }
+    const central = (name: string, comp: number, uncompressed: number, localOffset: number, method: number) => {
+        const n = Buffer.from(name, 'latin1')
+        const h = Buffer.alloc(46 + n.length)
+        h.writeUInt32LE(0x02014b50, 0)
+        h.writeUInt16LE(method, 10)
+        h.writeUInt32LE(comp, 20)
+        h.writeUInt32LE(uncompressed, 24)
+        h.writeUInt16LE(n.length, 28)
+        h.writeUInt32LE(localOffset, 42)
+        n.copy(h, 46)
+        return h
+    }
+    const eocd = (entries: number, cdSize: number, cdOffset: number) => {
+        const e = Buffer.alloc(22)
+        e.writeUInt32LE(0x06054b50, 0)
+        e.writeUInt16LE(entries, 8)
+        e.writeUInt16LE(entries, 10)
+        e.writeUInt32LE(cdSize, 12)
+        e.writeUInt32LE(cdOffset, 16)
+        return e
+    }
+
+    // A deflate stream that genuinely inflates past the cap — the payload every bomb tripwire points at.
+    const bombUncompressed = MAX_UNCOMPRESSED_BYTES + 5 * 1024 * 1024
+    const bombStream = () => zlib.deflateRawSync(Buffer.alloc(bombUncompressed, 0x41))
+
     // The core fix: a bomb that inflates over the cap is skipped by MEASUREMENT, not by trusting
     // the declared size — the metadata never touches exceljs.
     it('skips an OOXML archive that actually inflates past the cap', async () => {
@@ -1001,40 +1149,7 @@ describe('attachextract — OOXML decompression preflight', () => {
     // — our findEocd stops matching last-signature, or a jszip upgrade changes its selection — an
     // assertion here breaks, instead of the split silently reopening.
     it('measures the same EOCD/central directory the parser reads (dual-EOCD tripwire)', async () => {
-        const localFile = (name: string, data: Buffer, uncompressed: number, method: number) => {
-            const n = Buffer.from(name, 'latin1')
-            const h = Buffer.alloc(30 + n.length)
-            h.writeUInt32LE(0x04034b50, 0)
-            h.writeUInt16LE(method, 8)
-            h.writeUInt32LE(data.length, 18) // compressed size
-            h.writeUInt32LE(uncompressed, 22) // uncompressed size (the preflight ignores this)
-            h.writeUInt16LE(n.length, 26)
-            n.copy(h, 30)
-            return Buffer.concat([h, data])
-        }
-        const central = (name: string, comp: number, uncompressed: number, localOffset: number, method: number) => {
-            const n = Buffer.from(name, 'latin1')
-            const h = Buffer.alloc(46 + n.length)
-            h.writeUInt32LE(0x02014b50, 0)
-            h.writeUInt16LE(method, 10)
-            h.writeUInt32LE(comp, 20)
-            h.writeUInt32LE(uncompressed, 24)
-            h.writeUInt16LE(n.length, 28)
-            h.writeUInt32LE(localOffset, 42)
-            n.copy(h, 46)
-            return h
-        }
-        const eocd = (entries: number, cdSize: number, cdOffset: number) => {
-            const e = Buffer.alloc(22)
-            e.writeUInt32LE(0x06054b50, 0)
-            e.writeUInt16LE(entries, 8)
-            e.writeUInt16LE(entries, 10)
-            e.writeUInt32LE(cdSize, 12)
-            e.writeUInt32LE(cdOffset, 16)
-            return e
-        }
-        const bombUncompressed = MAX_UNCOMPRESSED_BYTES + 5 * 1024 * 1024
-        const bombData = zlib.deflateRawSync(Buffer.alloc(bombUncompressed, 0x41)) // inflates past the cap
+        const bombData = bombStream() // inflates past the cap
         const bombLocal = localFile('xl/workbook.xml', bombData, bombUncompressed, 8) // deflate; data starts at offset 45
         const smallLocal = localFile('small.txt', buf('tiny'), 4, 0) // stored
         const cdSmall = central('small.txt', 4, 4, bombLocal.length, 0)
@@ -1057,11 +1172,396 @@ describe('attachextract — OOXML decompression preflight', () => {
         expect(r.reason).toMatch(/decompress/i)
     })
 
+    // AGREEMENT INVARIANT 1 — the central directory must end exactly where the EOCD begins.
+    // jszip does NOT always read from the declared cdOffset: it derives
+    // extraBytes = eocdPos - (cdOffset + cdSize) and, when positive, rebases every offset by
+    // `reader.zero = extraBytes` (its support for data prepended before the archive). Both readers
+    // agree on WHICH EOCD here — the dual-EOCD tripwire above covers that — and still walk different
+    // central directories. So: a benign CD at the declared cdOffset (what a raw walk measures) and a
+    // bomb CD at cdOffset + extraBytes (what the parser actually reads). Both CD records are the same
+    // byte length, so the single declared cdSize describes either one.
+    it('skips a zip whose central directory is not where its EOCD says (reader.zero rebase tripwire)', async () => {
+        const BENIGN = 'xl/workbook.xml' // 15 chars → 61-byte CD record; also what routes us to xlsx
+        const BOMB = 'xl/bombPart.xml' // 15 chars → identical record size, distinct name
+        const CD_SIZE = 46 + BENIGN.length
+        const bombData = bombStream()
+
+        // extraBytes lands on CD_SIZE, so the bomb's local header must sit at file offset CD_SIZE for
+        // its declared localOffset of 0 to resolve there once jszip rebases (local headers shift too).
+        const filler = Buffer.alloc(CD_SIZE, 0x00)
+        const bombLocal = localFile(BOMB, bombData, bombUncompressed, 8)
+        const benignLocal = localFile(BENIGN, buf('tiny'), 4, 0)
+        const benignLocalPos = filler.length + bombLocal.length
+        const cdOffset = benignLocalPos + benignLocal.length
+        const cdBenign = central(BENIGN, 4, 4, benignLocalPos, 0) // stored, 4 bytes — the decoy
+        const cdBomb = central(BOMB, bombData.length, bombUncompressed, 0, 8)
+        const file = Buffer.concat([filler, bombLocal, benignLocal, cdBenign, cdBomb, eocd(1, CD_SIZE, cdOffset)])
+
+        // eocdPos - (cdOffset + cdSize) === CD_SIZE > 0, so jszip rebases and lands on the bomb CD.
+        const parsed = await JSZip.loadAsync(file)
+        expect(Object.keys(parsed.files)).toEqual([BOMB]) // the parser never sees the decoy we'd measure
+        expect((await parsed.file(BOMB)!.async('nodebuffer')).length).toBeGreaterThan(MAX_UNCOMPRESSED_BYTES)
+
+        // So measuring the decoy at the raw cdOffset would approve a bomb. Reject the layout instead.
+        const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toMatch(/does not end at the end-of-central-directory/i)
+        expect(r.extraction).toBeUndefined()
+    })
+
+    // AGREEMENT INVARIANT 2 — walking exactly `entries` records must land exactly on the EOCD.
+    // Invariant 1 is not sufficient: jszip ignores the declared record count entirely, reading central
+    // directory headers until the signature stops matching, and does NOT error when its tally
+    // disagrees with the count. So an archive can declare one entry, store two, and still size its
+    // directory honestly — extraBytes === 0, invariant 1 satisfied, no rebase — while a count-driven
+    // walk measures only the first record and the parser inflates both.
+    it('skips a zip hiding a central-directory record past its declared count (entry-count tripwire)', async () => {
+        const BENIGN = 'xl/workbook.xml' // the only record a count-driven walk reaches; routes us to xlsx
+        const BOMB = 'xl/sharedStrings.xml' // reachable only by a signature-driven walk
+        const bombData = bombStream()
+
+        const bombLocal = localFile(BOMB, bombData, bombUncompressed, 8)
+        const benignLocal = localFile(BENIGN, buf('<workbook/>'), 11, 0)
+        const cdOffset = bombLocal.length + benignLocal.length
+        const cdBenign = central(BENIGN, 11, 11, bombLocal.length, 0)
+        const cdBomb = central(BOMB, bombData.length, bombUncompressed, 0, 8)
+        // cdSize is the HONEST total of both records, so eocdPos === cdOffset + cdSize: no rebase,
+        // and invariant 1 passes. Only the declared entry count (1, not 2) is a lie.
+        const cdSize = cdBenign.length + cdBomb.length
+        const file = Buffer.concat([bombLocal, benignLocal, cdBenign, cdBomb, eocd(1, cdSize, cdOffset)])
+
+        // The parser reads until the signature stops — so it sees BOTH, despite the count saying one.
+        const parsed = await JSZip.loadAsync(file)
+        expect(Object.keys(parsed.files)).toEqual([BENIGN, BOMB])
+        expect((await parsed.file(BOMB)!.async('nodebuffer')).length).toBeGreaterThan(MAX_UNCOMPRESSED_BYTES)
+
+        const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toMatch(/more records than it declares/i)
+        expect(r.extraction).toBeUndefined()
+    })
+
+    // The agreement invariants reject a LAYOUT, so they must not start rejecting honest archives:
+    // measured against every real .docx/.xlsx reachable on disk (73 zips, 59 Office files), each one
+    // satisfied both. A crafted-but-well-formed archive with a trailing comment covers the same
+    // ground here — the comment sits after the EOCD, so it must not perturb either invariant.
+    it('accepts a well-formed archive, including one with a trailing archive comment', async () => {
+        const plain = craftOoxmlZip(buf('<workbook/>'))
+        expect((await extractAttachment({ content: plain, contentType: XLSX_TYPE })).status).not.toBe('skipped')
+        const commented = craftOoxmlZip(buf('<workbook/>'), { comment: buf('a trailing archive comment') })
+        expect((await extractAttachment({ content: commented, contentType: XLSX_TYPE })).status).not.toBe('skipped')
+    })
+
+    // The remaining fail-closed exits. Everything the walk cannot MEASURE has to be a skip, never a
+    // pass — the declared metadata is attacker-controlled, so "we could not tell" and "it is fine"
+    // must not collapse into the same answer. One test per exit; each asserts its own reason so a
+    // future guard that swallows another's case shows up as a changed message rather than silence.
+
+    // Invariant 1 now rejects a wrong cdOffset before the walk is even reached, so reaching the
+    // walk's own signature check needs an offset whose ARITHMETIC is honest — cdOffset + cdSize lands
+    // exactly on the EOCD — while the bytes it points at are not a central-directory header.
+    it('fails closed when the central-directory offset points at non-CD bytes', async () => {
+        const junk = Buffer.concat([
+            Buffer.from([0x50, 0x4b, 0x03, 0x04]), // zip magic: the bytes still look like an archive
+            buf('xl/workbook.xml'), // found by ooxmlKind's raw-scan fallback, so this still routes to xlsx
+            Buffer.alloc(40, 0x5a),
+        ])
+        const file = Buffer.concat([junk, eocd(1, junk.length, 0)]) // 0 + junk.length === eocdPos
+        const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toMatch(/truncated or misaligned central directory/i)
+    })
+
+    // When the central directory cannot be walked, ooxmlKind falls back to scanning raw bytes for a
+    // main-part marker. That fallback is order-dependent (the very thing entry-name matching fixed for
+    // walkable archives), so pin which kind each shape yields. Note the outcome is a skip either way —
+    // an unwalkable archive never survives the preflight — so this pins ROUTING, not the verdict.
+    it.each([
+        ['word/document.xml alone', ['word/document.xml'], 'docx'],
+        ['xl/workbook.xml alone', ['xl/workbook.xml'], 'xlsx'],
+        ['both, word stored first', ['word/document.xml', 'xl/workbook.xml'], 'docx'],
+        ['both, xl stored first', ['xl/workbook.xml', 'word/document.xml'], 'xlsx'],
+    ])('raw-scan fallback reads %s as %s', (_label, markers, kind) => {
+        const junk = Buffer.concat([
+            Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+            ...markers.map((m) => buf(m)),
+            Buffer.alloc(20, 0x5a),
+        ])
+        const file = Buffer.concat([junk, eocd(1, junk.length, 0)]) // arithmetic honest, bytes not a CD header
+        expect(detectRoute({ content: file, contentType: XLSX_TYPE }).kind).toBe(kind)
+    })
+
+    // The other way the walk gives up: a record whose declared name length runs off the end of the
+    // file. The name cannot be read, so no entry list can be trusted and the raw scan takes over.
+    it('falls back to the raw scan when a central-directory name runs past the end of the file', () => {
+        const junk = Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), buf('xl/workbook.xml'), Buffer.alloc(20, 0x5a)])
+        const cd = Buffer.alloc(46)
+        cd.writeUInt32LE(0x02014b50, 0) // a real CD signature...
+        cd.writeUInt16LE(5000, 28) // ...whose declared name length runs far past EOF
+        const file = Buffer.concat([junk, cd, eocd(1, cd.length, junk.length)])
+        expect(detectRoute({ content: file, contentType: XLSX_TYPE }).kind).toBe('xlsx')
+    })
+
+    it('fails closed when an entry claims compressed bytes that run past the end of the file', async () => {
+        const bomb = craftOoxmlZip(buf('<workbook/>'), { entryCompSize: 0x0ffffff0 }) // huge, but not the ZIP64 sentinel
+        const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toMatch(/runs past end of file/i)
+    })
+
+    // Distinct from "too big": the stream cannot be read at all. Fail closed rather than treat an
+    // unreadable entry as contributing zero bytes to the total.
+    it('fails closed when a deflate stream is corrupt rather than merely oversized', async () => {
+        const garbage = buf('this is not a deflate stream, only ascii pretending to be one')
+        const local = localFile('xl/workbook.xml', garbage, 4096, 8) // claims deflate; payload is not
+        const cd = central('xl/workbook.xml', garbage.length, 4096, 0, 8)
+        const file = Buffer.concat([local, cd, eocd(1, cd.length, local.length)])
+        const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toMatch(/unreadable compressed data/i)
+    })
+
+    it('fails closed on a compression method it cannot measure', async () => {
+        const zip = craftOoxmlZip(buf('<workbook/>'), { method: 12 }) // 12 = bzip2; we only measure store/deflate
+        const r = await extractAttachment({ content: zip, contentType: XLSX_TYPE })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toMatch(/unsupported compression method 12/i)
+    })
+
+    // The budget is ARCHIVE-wide, not per-entry. A stored entry cannot exceed the cap on its own
+    // (MAX_INPUT_BYTES bounds the whole file well below it), so the only way to cross the line with
+    // one is as the last straw on a running total — which is exactly what the cap must catch.
+    it('skips when the archive-wide running total crosses the cap, not just one entry', async () => {
+        const exact = zlib.deflateRawSync(Buffer.alloc(MAX_UNCOMPRESSED_BYTES, 0x41)) // inflates to EXACTLY the cap
+        const l1 = localFile('xl/workbook.xml', exact, MAX_UNCOMPRESSED_BYTES, 8)
+        const l2 = localFile('xl/tipItOver.bin', buf('the last straw'), 14, 0) // stored
+        const c1 = central('xl/workbook.xml', exact.length, MAX_UNCOMPRESSED_BYTES, 0, 8)
+        const c2 = central('xl/tipItOver.bin', 14, 14, l1.length, 0)
+        const file = Buffer.concat([l1, l2, c1, c2, eocd(2, c1.length + c2.length, l1.length + l2.length)])
+        const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toMatch(/decompresses to over/i)
+    })
+
+    // An OOXML-shaped zip with NEITHER root part (a .pptx, a .jar, a plain archive) is not something
+    // any handler claims, so it must land on a labeled skip rather than be forced into one.
+    it('skips a zip that is neither a docx nor an xlsx (pptx root part)', async () => {
+        const pptx = craftOoxmlZip(buf('<presentation/>'), { part: 'ppt/presentation.xml' })
+        expect(detectRoute({ content: pptx, contentType: XLSX_TYPE })).toEqual({ routedBy: 'none' })
+        const r = await extractAttachment({ content: pptx, contentType: XLSX_TYPE })
+        expect(r.status).toBe('skipped')
+    })
+
     // A real, modestly-sized .xlsx inflates well under the cap and extracts normally — the streaming
     // guard must not over-reject legitimate files (and pays only one extra inflate pass).
     it('lets a normal .xlsx through the preflight and extracts it', async () => {
         const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
         expect(r.status).toBe('extracted')
         expect(r.extraction).toContain('=== Q1 ===')
+    })
+})
+
+// A utf-16 charset claim must be EARNED by the bytes ---------------------------------------------
+// An explicit charset=utf-16* hint suppresses the printable-ratio check, because genuine BOM-less
+// utf-16 is NUL-heavy and looksLikeText would void it as binary. That exemption used to be granted on
+// the sender's word alone, overridden only by hasKnownBinaryMagic — an allowlist of exactly three
+// (%PDF, zip, OLE). Every other binary kept the exemption and decoded into gibberish reported as
+// 'extracted': a silent quality failure, worse than a labeled skip. The hint is now honoured only if
+// the content is structurally well-formed utf-16.
+describe('attachment — a utf-16 charset claim must be earned by the bytes', () => {
+    // Deterministic high-entropy filler, standing in for the compressed body of a real image. Seeded
+    // LCG rather than random so a failure here is always reproducible.
+    const entropy = (seed: number, length: number): Buffer => {
+        const out = Buffer.alloc(length)
+        let s = seed >>> 0
+        for (let i = 0; i < length; i++) {
+            s = (Math.imul(s, 1664525) + 1013904223) >>> 0
+            out[i] = (s >>> 24) & 0xff
+        }
+        return out
+    }
+    const binaryWith = (magic: number[]) => Buffer.concat([Buffer.from(magic), entropy(0x5eed, 1024)])
+
+    // Formats whose magic is NOT one of the three hasKnownBinaryMagic knows. Verified against real
+    // files on disk (a real PNG, JFIF JPEG and GIF89a) before being reduced to these signatures.
+    const NOT_ALLOWLISTED: Array<[string, number[]]> = [
+        ['png', [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]],
+        ['jpeg', [0xff, 0xd8, 0xff, 0xe0]],
+        ['gif', [0x47, 0x49, 0x46, 0x38, 0x39, 0x61]],
+        ['gzip', [0x1f, 0x8b, 0x08, 0x00]],
+    ]
+    for (const [name, magic] of NOT_ALLOWLISTED) {
+        it(`does not report a ${name} mislabeled text/plain; charset=utf-16 as extracted text`, async () => {
+            const r = await extractAttachment({
+                content: binaryWith(magic),
+                filename: `photo.${name}`,
+                contentType: 'text/plain; charset=utf-16',
+            })
+            expect(r.status).toBe('skipped') // never 'extracted' with a gibberish decode
+            expect(r.extraction).toBeUndefined()
+        })
+    }
+
+    // The allowlisted magics keep their stronger behaviour: not merely skipped, but re-sniffed back to
+    // the real handler. Guards against a regression that closes the hole by dropping hasKnownBinaryMagic.
+    it('still recovers an allowlisted binary (PDF) mislabeled charset=utf-16 via the sniff', async () => {
+        const r = await extractAttachment({
+            content: fixture('sample.pdf'),
+            filename: 'note.txt',
+            contentType: 'text/plain; charset=utf-16',
+        })
+        expect(detectRoute({ content: fixture('sample.pdf'), contentType: 'text/plain; charset=utf-16' })).toEqual({
+            kind: 'pdf',
+            routedBy: 'sniff',
+        })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('Hello from a PDF document')
+    })
+
+    // The other half of the contract: tightening the exemption must not start voiding real utf-16.
+    // This is what stops the check from degenerating into "reject anything NUL-heavy".
+    it('still extracts genuine BOM-less utf-16 text under an explicit charset hint', async () => {
+        const body = 'Hello from a UTF-16 encoded note. Nothing binary here at all. '.repeat(12)
+        for (const [charset, encoding] of [
+            ['utf-16le', 'utf-16le'],
+            ['utf-16be', 'utf-16be'],
+            ['utf-16', 'utf-16le'], // bare utf-16, BOM-less: iconv picks an endianness heuristically
+        ] as const) {
+            const r = await extractAttachment({
+                content: iconv.encode(body, encoding, { addBOM: false }),
+                filename: 'note.txt',
+                contentType: `text/plain; charset=${charset}`,
+            })
+            expect(r.status, `charset=${charset}`).toBe('extracted')
+            expect(r.extraction, `charset=${charset}`).toContain('Hello from a UTF-16 encoded note.')
+        }
+    })
+
+    // Every other utf-16 sample in this suite is BMP-only (ASCII and CJK alike), so none of them
+    // exercise surrogate PAIRING — only the absence of surrogates. These two cover both halves of the
+    // rule the check actually enforces: a correctly paired high+low is real text and must survive; an
+    // unpaired high is not and must not. Without the first, a check that over-rejected (voiding any
+    // surrogate at all) would pass this whole suite while silently skipping every real attachment
+    // containing an emoji.
+    it('extracts utf-16 text containing an astral character (valid surrogate pair)', async () => {
+        const body = 'Hi 😀 — a grinning face, and some ordinary text after it. '.repeat(8)
+        for (const [charset, encoding] of [
+            ['utf-16le', 'utf-16le'],
+            ['utf-16be', 'utf-16be'],
+        ] as const) {
+            const content = iconv.encode(body, encoding, { addBOM: false })
+            // Guard the guard: prove the sample really carries the D83D/DE00 pair (U+1F600), so this
+            // test can never quietly degrade into yet another BMP-only case.
+            const pair = encoding === 'utf-16le' ? [0x3d, 0xd8, 0x00, 0xde] : [0xd8, 0x3d, 0xde, 0x00]
+            expect(content.includes(Buffer.from(pair)), `${charset} sample carries a surrogate pair`).toBe(true)
+
+            const r = await extractAttachment({
+                content,
+                filename: 'note.txt',
+                contentType: `text/plain; charset=${charset}`,
+            })
+            expect(r.status, `charset=${charset}`).toBe('extracted')
+            expect(r.extraction, `charset=${charset}`).toContain('Hi 😀')
+        }
+    })
+
+    // The two halves of the sample-edge rule. A high surrogate with nothing after it inside the
+    // sniff window is ambiguous, and which way it resolves depends on WHY there is nothing after it:
+    // a truncated sample hides the low half (say nothing), a file that simply ends there does not
+    // (broken). Collapsing the two either voids real text or waves an unpaired surrogate through.
+    it('does not extract utf-16 that ends on an unpaired high surrogate (sample IS the whole file)', async () => {
+        const u16le = (units: number[]) => {
+            const b = Buffer.alloc(units.length * 2)
+            units.forEach((u, i) => b.writeUInt16LE(u, i * 2))
+            return b
+        }
+        const trailing = u16le([...[...'Hi there'].map((c) => c.charCodeAt(0)), 0xd83d])
+        expect(trailing.length).toBeLessThan(8 * 1024) // whole file fits the sniff window: no truncation
+        const r = await extractAttachment({
+            content: trailing,
+            filename: 'note.txt',
+            contentType: 'text/plain; charset=utf-16le',
+        })
+        expect(r.status).not.toBe('extracted')
+        expect(r.extraction).toBeUndefined()
+    })
+
+    it('still extracts utf-16 whose surrogate pair straddles the sniff-window edge', async () => {
+        // SNIFF_BYTES (8192) is module-private, so it is spelled out here; the byte assertions below
+        // pin the construction so this cannot silently stop probing the edge. Filler is sized to put
+        // the pair's HIGH half at bytes 8190-8191 — the last code unit inside the window — and its LOW
+        // half at 8192-8193, just outside. The sample therefore ends mid-pair: the exact shape the
+        // truncation branch exists for, and the one it must not reject.
+        const SNIFF = 8 * 1024
+        const body = 'a'.repeat(SNIFF / 2 - 1) + '😀' + ' and more ordinary text past the window.'
+        const content = iconv.encode(body, 'utf-16le', { addBOM: false })
+        expect(content.length).toBeGreaterThan(SNIFF) // sample really is truncated
+        expect(content.readUInt16LE(SNIFF - 2)).toBe(0xd83d) // high half: last unit in the window
+        expect(content.readUInt16LE(SNIFF)).toBe(0xde00) // low half: first unit outside it
+
+        const r = await extractAttachment({ content, filename: 'note.txt', contentType: 'text/plain; charset=utf-16le' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('😀')
+    })
+
+    it('does not extract utf-16 whose surrogate pair is broken (high surrogate, then an ASCII char)', async () => {
+        const u16le = (units: number[]) => {
+            const b = Buffer.alloc(units.length * 2)
+            units.forEach((u, i) => b.writeUInt16LE(u, i * 2))
+            return b
+        }
+        const ascii = (s: string) => [...s].map((c) => c.charCodeAt(0))
+        // D83D is a HIGH surrogate, so utf-16 requires a low (DC00–DFFF) next. Here an 'A' follows it:
+        // structurally impossible in real utf-16, and exactly the signature of binary read through the
+        // wrong lens. No encoder will emit this, hence the hand-built code units.
+        const broken = u16le([...ascii('Hi '), 0xd83d, ...ascii('A and then some more ordinary text.')])
+        const r = await extractAttachment({
+            content: broken,
+            filename: 'note.txt',
+            contentType: 'text/plain; charset=utf-16le',
+        })
+        expect(r.status).not.toBe('extracted')
+        expect(r.extraction).toBeUndefined()
+    })
+
+    // The other two things that prove bytes are not the utf-16 they claim to be. A LOW surrogate with
+    // no high before it is as impossible as an unpaired high; U+FFFE/U+FFFF are permanent
+    // noncharacters. Both are common in binary read through a utf-16 lens and absent from real text.
+    it.each([
+        ['a lone low surrogate (DE00 with no high before it)', 0xde00],
+        ['the U+FFFF noncharacter', 0xffff],
+        ['the U+FFFE noncharacter', 0xfffe],
+    ])('does not extract utf-16 containing %s', async (_label, unit) => {
+        const units = [...[...'Hi '].map((c) => c.charCodeAt(0)), unit, ...[...' and more text.'].map((c) => c.charCodeAt(0))]
+        const content = Buffer.alloc(units.length * 2)
+        units.forEach((u, i) => content.writeUInt16LE(u, i * 2))
+        const r = await extractAttachment({
+            content,
+            filename: 'note.txt',
+            contentType: 'text/plain; charset=utf-16le',
+        })
+        expect(r.status).not.toBe('extracted')
+        expect(r.extraction).toBeUndefined()
+    })
+
+    // Too short to hold even one whole code unit, so the claim cannot be verified either way — and an
+    // unverifiable utf-16 claim must not be honoured on the sender's word. Re-sniffing still rescues
+    // it as the plain ASCII it actually is, which is the point: voiding the claim is not a skip.
+    it('does not honour a utf-16 claim on content too short to hold a code unit', async () => {
+        const route = detectRoute({ content: Buffer.from([0x41]), contentType: 'text/plain; charset=utf-16' })
+        expect(route).toEqual({ kind: 'text', routedBy: 'sniff' }) // 'sniff', not 'content-type': the claim was voided
+    })
+
+    // utf-16 CJK has no NUL bytes at all, so any check keyed on NUL count or NUL parity would reject
+    // it. Pins the check to well-formedness (surrogate pairing / noncharacters) instead.
+    it('still extracts utf-16 text with no NUL bytes at all (CJK)', async () => {
+        const body = '日本語のテキストです。これは添付ファイルの本文です。'.repeat(8)
+        const r = await extractAttachment({
+            content: iconv.encode(body, 'utf-16le', { addBOM: false }),
+            filename: 'note.txt',
+            contentType: 'text/plain; charset=utf-16le',
+        })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('日本語のテキストです。')
     })
 })

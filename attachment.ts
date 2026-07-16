@@ -558,11 +558,24 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
     if (eocd < 0) return { ok: false, reason: 'malformed zip: no end-of-central-directory record' }
 
     const entries = buf.readUInt16LE(eocd + 10)
+    const cdSize = buf.readUInt32LE(eocd + 12)
     const cdOffset = buf.readUInt32LE(eocd + 16)
     // ZIP64 / out-of-range sentinels: the true values live in a ZIP64 record we deliberately don't
     // chase. Treat as over-budget rather than trust the classic field or crash on the sentinel.
-    if (entries === 0xffff || buf.readUInt32LE(eocd + 12) === 0xffffffff || cdOffset === 0xffffffff)
+    if (entries === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff)
         return { ok: false, reason: 'zip declares a ZIP64 / out-of-range size' }
+
+    // AGREEMENT INVARIANT 1 — the central directory must END exactly where the EOCD begins.
+    // Measuring is only worth anything if we measure the directory the PARSER reads, and jszip does
+    // not read from cdOffset unconditionally: it computes extraBytes = eocdPos - (cdOffset + cdSize)
+    // and, when that is positive, rebases EVERY subsequent offset — central directory and local
+    // headers alike — by `reader.zero = extraBytes` (its handling for data prepended ahead of the
+    // archive, e.g. self-extracting exes). A nonzero gap therefore points the two readers at two
+    // different central directories, and a second CD planted at the rebased position is a bomb the
+    // preflight never sees. Rejecting the gap outright keeps us off jszip's internals entirely: this
+    // asserts the FILE is self-consistent, not that we mimic a particular parser version.
+    if (cdOffset + cdSize !== eocd)
+        return { ok: false, reason: 'malformed zip: central directory does not end at the end-of-central-directory record' }
 
     let total = 0
     let p = cdOffset
@@ -597,6 +610,16 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
         if (total > cap) return { ok: false, reason: `decompresses to over ${cap} bytes` }
         p += 46 + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
     }
+    // AGREEMENT INVARIANT 2 — walking exactly `entries` records must land exactly on the EOCD.
+    // Invariant 1 alone is not enough: jszip IGNORES the declared record count and reads central
+    // directory headers until the signature stops matching, and when its tally disagrees with the
+    // declared count it does not error — it keeps what it found. So an archive can declare one entry,
+    // store two, and size the directory honestly (extraBytes === 0, invariant 1 satisfied): this loop
+    // measures only the first while the parser inflates both. Landing on the EOCD proves no record
+    // hides past the declared count — the next bytes are the EOCD signature, so the parser's
+    // signature-driven loop stops exactly where this counted one did, on the same set of records.
+    if (p !== eocd)
+        return { ok: false, reason: 'malformed zip: central directory holds more records than it declares' }
     return { ok: true }
 }
 
@@ -627,15 +650,12 @@ const sniff = (content: Buffer, ext?: string): HandlerKind | undefined => {
     return undefined
 }
 
-// A text/html claim is only as good as its bytes: a PDF shipped as text/plain would
-// latin1-decode into garbage and be reported as 'extracted' — a silent quality failure,
-// worse than a labeled skip. Provably-binary bytes (no BOM, NULs / non-printable head)
-// void the claim; the sniff then rescues what the magic bytes prove (%PDF, zip+.docx)
-// and anything else is left unrouted. Empty content stays with the claimed handler so a
-// zero-byte text attachment still lands on extracted_empty rather than a skip.
-const trustsExplicitUnicodeCharset = (charset?: string): boolean => {
+// Which utf-16 flavour an explicit charset= names, if any. A BOM-less utf-16 attachment is NUL-heavy
+// and so fails looksLikeText — the hint is the only thing that keeps it routable. The hint alone must
+// not be enough to earn that exemption, though: see isWellFormedUtf16.
+const claimsUtf16 = (charset?: string): 'utf-16' | 'utf-16le' | 'utf-16be' | undefined => {
     const normalized = charset?.trim().toLowerCase().replace(/_/g, '-')
-    return normalized === 'utf-16' || normalized === 'utf-16le' || normalized === 'utf-16be'
+    return normalized === 'utf-16' || normalized === 'utf-16le' || normalized === 'utf-16be' ? normalized : undefined
 }
 
 // Known binary-container magic — %PDF, zip (docx/xlsx), OLE (legacy .doc). A genuine text file never
@@ -643,16 +663,62 @@ const trustsExplicitUnicodeCharset = (charset?: string): boolean => {
 const hasKnownBinaryMagic = (content: Buffer): boolean =>
     startsWith(content, PDF_MAGIC) || startsWith(content, ZIP_MAGIC) || startsWith(content, OLE_MAGIC)
 
+// Are the bytes STRUCTURALLY well-formed utf-16? A printable-ratio test cannot answer this: read as
+// utf-16, arbitrary bytes become code units spread across the BMP, nearly all of which are
+// "printable", so png/jpeg/gif all pass it. Well-formedness separates them. The surrogate block
+// (U+D800–U+DFFF) is 1/32 of the BMP, so binary lands in it roughly every 32 code units and
+// essentially never as a correct high-then-low pair, whereas genuine utf-16 pairs every surrogate.
+// U+FFFE/U+FFFF are permanent noncharacters that real text never contains either. Either one proves
+// the bytes are not the utf-16 they claim to be.
+const isWellFormedUtf16 = (content: Buffer, bigEndian: boolean): boolean => {
+    const sample = content.subarray(0, SNIFF_BYTES)
+    const end = sample.length - (sample.length % 2) // whole code units only
+    if (end === 0) return false
+    for (let i = 0; i < end; i += 2) {
+        const unit = bigEndian ? sample.readUInt16BE(i) : sample.readUInt16LE(i)
+        if (unit === 0xfffe || unit === 0xffff) return false // noncharacter
+        if (unit >= 0xdc00 && unit <= 0xdfff) return false // low surrogate with no high before it
+        if (unit >= 0xd800 && unit <= 0xdbff) {
+            // A high surrogate with nothing after it inside the sample means one of two things, and
+            // they differ: if the sample was TRUNCATED at SNIFF_BYTES the low half is simply out of
+            // view, so this is no evidence and real text must not be voided over a sampling artifact;
+            // if the sample IS the whole file, the file genuinely ends on an unpaired high surrogate,
+            // which real utf-16 never does.
+            if (i + 2 >= end) return content.length > SNIFF_BYTES
+            const low = bigEndian ? sample.readUInt16BE(i + 2) : sample.readUInt16LE(i + 2)
+            if (low < 0xdc00 || low > 0xdfff) return false // high surrogate not followed by a low
+            i += 2 // consume the pair
+        }
+    }
+    return true
+}
+
+// A text/html claim is only as good as its bytes: a PDF shipped as text/plain would
+// latin1-decode into garbage and be reported as 'extracted' — a silent quality failure,
+// worse than a labeled skip. Provably-binary bytes (no BOM, NULs / non-printable head)
+// void the claim; the sniff then rescues what the magic bytes prove (%PDF, zip+.docx)
+// and anything else is left unrouted. Empty content stays with the claimed handler so a
+// zero-byte text attachment still lands on 'extracted' with no extraction rather than a skip.
 const bytesContradictTextClaim = (content: Buffer, charsetHint?: string): boolean => {
     if (content.length === 0 || bomCharset(content)) return false
     // Binary magic beats even a charset=utf-16 hint: a real utf-16 text file never begins with %PDF /
-    // PK\x03\x04 / the OLE signature, but a binary mislabeled text/…;charset=utf-16 would otherwise be
-    // trusted because the utf-16 exemption below suppresses the printable-ratio check → gibberish
-    // reported as 'extracted'. Re-sniffing then recovers the real format (%PDF → pdf, zip → docx/xlsx).
+    // PK\x03\x04 / the OLE signature. Cheap and decisive, so it runs first — but it is an allowlist of
+    // exactly three, which is why the utf-16 branch below cannot lean on it.
     if (hasKnownBinaryMagic(content)) return true
-    // Otherwise an explicit utf-16 hint is trusted (utf-16 text is NUL-heavy and fails looksLikeText);
-    // any other claim must actually look like text.
-    return !trustsExplicitUnicodeCharset(charsetHint) && !looksLikeText(content)
+    const utf16 = claimsUtf16(charsetHint)
+    if (utf16) {
+        // The utf-16 exemption suppresses the printable-ratio check, so it has to be earned by the
+        // bytes, not just asserted by the sender: honour the hint only if the content really is
+        // well-formed utf-16. Without this, every binary whose magic is not one of the three above —
+        // png, jpeg, gif, gzip, … — keeps the exemption and decodes to gibberish reported as
+        // 'extracted'. A bare `utf-16` is BOM-less here (a BOM already returned above), so iconv picks
+        // an endianness heuristically; accept either direction, since either is what it may choose.
+        const le = utf16 !== 'utf-16be' && isWellFormedUtf16(content, false)
+        const be = utf16 !== 'utf-16le' && isWellFormedUtf16(content, true)
+        return !le && !be
+    }
+    // Any other claim must actually look like text.
+    return !looksLikeText(content)
 }
 
 // Takes an AttachmentInput and produces the final routing decision. 
