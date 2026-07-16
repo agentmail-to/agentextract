@@ -918,17 +918,14 @@ describe('attachextract — OOXML decompression preflight', () => {
         }
     })
 
-    // A fake EOCD signature planted in the archive COMMENT sits closer to EOF than the real record,
-    // so a naive last-match scan would pick it. The comment-length-runs-to-EOF invariant rejects the
-    // planted one (its trailing length doesn't reach EOF) and the true EOCD still governs the walk,
-    // so a well-formed archive extracts normally rather than misrouting off the fake record.
-    it('ignores a fake EOCD signature planted in the archive comment', async () => {
-        // Comment = a bare EOCD signature followed by zero padding; its own commentLen field reads 0,
-        // so the invariant fails at the fake position and holds only at the real trailing EOCD.
-        const comment = Buffer.concat([Buffer.from([0x50, 0x4b, 0x05, 0x06]), Buffer.alloc(40, 0)])
-        const zip = craftOoxmlZip(Buffer.from('<workbook><sheet>hi</sheet></workbook>'), { comment })
-        const r = await extractAttachment({ content: zip, contentType: XLSX_TYPE })
-        expect(r.status).not.toBe('skipped')
+    // Trailing bytes after the EOCD (some archivers/signers append them) must NOT cause a false skip:
+    // the last-signature scan still finds the real EOCD, matching the parser, so a normal .xlsx with
+    // junk appended still extracts. (The earlier comment-to-EOF invariant wrongly skipped these.)
+    it('does not false-skip a normal .xlsx with trailing bytes after the EOCD', async () => {
+        const withJunk = Buffer.concat([fixture('sample.xlsx'), Buffer.alloc(500, 0x2a)]) // 500 '*' bytes, no EOCD sig
+        const r = await extractAttachment({ content: withJunk, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('=== Q1 ===')
     })
 
     // A real, modestly-sized .xlsx inflates well under the cap and extracts normally — the streaming

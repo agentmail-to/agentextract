@@ -471,7 +471,7 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
 // the full expansion. Fail-closed: anything we can't measure — malformed metadata, ZIP64, a corrupt
 // stream, an unsupported compression method — is a skip, never waved through to the parser.
 
-const EOCD_SIG = 0x06054b50 // End-of-Central-Directory record
+const EOCD_MAGIC = Buffer.from([0x50, 0x4b, 0x05, 0x06]) // End-of-Central-Directory signature bytes
 const CD_SIG = 0x02014b50 // Central-Directory file header
 const LOCAL_SIG = 0x04034b50 // Local file header
 
@@ -505,15 +505,16 @@ const inflateCounting = (comp: Buffer, runningTotal: number, cap: number): Promi
         inflate.end(comp)
     })
 
-// Find the EOCD by scanning back from the end for its signature, accepting only a candidate whose
-// declared comment length runs exactly to EOF. That invariant rejects a FAKE EOCD signature planted
-// inside the real archive's comment — which the naive last-match scan would otherwise pick and let
-// the attacker redirect the central-directory walk.
+// Find the EOCD the SAME way the parser's zip reader (jszip, used by exceljs/mammoth) does: the LAST
+// occurrence of the signature in the whole buffer, no comment-length check. Matching the parser's
+// selection is the point — the preflight must measure the exact central directory the parser will
+// read. A comment-to-EOF invariant would DIVERGE: a second EOCD planted after the real one is picked
+// by jszip's last-match scan but rejected by the invariant, so the parser could follow it to a bomb CD
+// the preflight never measured. Measuring (not trusting declared sizes) makes following whichever EOCD
+// jszip picks safe. As a bonus, last-match doesn't false-skip zips with trailing bytes after the EOCD.
 const findEocd = (buf: Buffer): number => {
-    for (let i = buf.length - 22; i >= Math.max(0, buf.length - (22 + 0xffff)); i--) {
-        if (buf.readUInt32LE(i) === EOCD_SIG && i + 22 + buf.readUInt16LE(i + 20) === buf.length) return i
-    }
-    return -1
+    const eocd = buf.lastIndexOf(EOCD_MAGIC)
+    return eocd >= 0 && eocd + 22 <= buf.length ? eocd : -1 // need room for the 22-byte fixed record
 }
 
 // Measure a zip's ACTUAL decompressed size, capped. Walks the central directory to each entry's real
