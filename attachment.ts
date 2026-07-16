@@ -550,6 +550,9 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
     return { ok: true }
 }
 
+/////////////////////////////////////////////////////////////
+// ROUTING (continued) — claim verification + the final decision
+
 // Do the bytes back up a binary claim? Catches a wrong one before the parser sees it. text/html have
 // no single signature, so they always pass here — lying text claims go to bytesContradictTextClaim.
 const magicOk = (kind: HandlerKind, content: Buffer): boolean => {
