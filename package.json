@@ -1,6 +1,6 @@
 {
   "name": "agentextract",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Email quote & signature extractor — strips quoted history and boilerplate, keeping the sender's new content. Pure regex: no DOM parser, no ML.",
   "license": "MIT",
   "author": {
