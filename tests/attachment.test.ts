@@ -13,11 +13,13 @@ import {
     HANDLER_TIMEOUT_MS,
     MAX_INPUT_BYTES,
     MAX_OUTPUT_CHARS,
+    MAX_PDF_PAGES,
     MAX_UNCOMPRESSED_BYTES,
 } from '../attachment'
 
-// NOTE: result shape is { status, extraction?, reason? }; `extraction` is omitted (never '') when a
-// handler runs but produces no text. Nested emails (.eml) are out of scope in this version and skip.
+// NOTE: result shape is { status, extraction?, reason?, truncated? }; `extraction` is omitted (never
+// '') when a handler runs but produces no text, and `truncated` says whether the document continues
+// past it. Nested emails (.eml) are out of scope in this version and skip.
 
 // Real fixtures generated once with macOS textutil (.docx) and cupsfilter (.pdf), and exceljs (.xlsx).
 // vitest runs from the repo root, so resolve against cwd.
@@ -28,9 +30,9 @@ const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.s
 // ---------------------------------------------------------------------------
 // Synthetic tests for attachment.ts
 // ---------------------------------------------------------------------------
-// The RESULT is deliberately slim: { status, extraction?, reason? }. Routing is NOT on the result —
-// it's a separate concern verified through detectRoute(). So routing-decision assertions here call
-// detectRoute(input) directly; extraction assertions read the slim result.
+// The RESULT is deliberately slim: { status, extraction?, reason?, truncated? }. Routing is NOT on
+// the result — it's a separate concern verified through detectRoute(). So routing-decision
+// assertions here call detectRoute(input) directly; extraction assertions read the slim result.
 
 const buf = (s: string) => Buffer.from(s, 'utf8')
 
@@ -66,17 +68,19 @@ const buildPdf = (pages: string[][]): Buffer => {
 }
 
 // Result-shape guard ---------------------------------------------------------
-// The whole point of the slim contract: the top-level result carries no routing/diagnostic noise,
-// no top-level filename, and no truncation flag. If any of those leak back in, this fails.
+// The whole point of the slim contract: the top-level result carries no routing/diagnostic noise
+// and no top-level filename. If any of that leaks back in, this fails. `truncated` IS part of the
+// contract — a deliberate addition, since a partial extraction that reads as complete is worse than
+// a missing one — but it is the only field that has been allowed back.
 
 describe('attachment — slim result contract', () => {
-    it('returns only the three contract fields, never routing/diagnostic noise', async () => {
+    it('returns only the four contract fields, never routing/diagnostic noise', async () => {
         const r = await extractAttachment({ content: buf('hello'), contentType: 'text/plain', filename: 'hi.txt' })
-        // Every key present must be one of the three contract fields — nothing else.
-        const allowed = ['status', 'extraction', 'reason']
+        // Every key present must be one of the four contract fields — nothing else.
+        const allowed = ['status', 'extraction', 'reason', 'truncated']
         expect(Object.keys(r).every((k) => allowed.includes(k))).toBe(true)
         // The removed fields must be absent (not merely undefined-valued).
-        for (const gone of ['filename', 'byteSize', 'detectedType', 'routedBy', 'charset', 'extractedText', 'truncated', 'children', 'lowTextDensity', 'pageCount', 'emptyPageCount']) {
+        for (const gone of ['filename', 'byteSize', 'detectedType', 'routedBy', 'charset', 'extractedText', 'children', 'lowTextDensity', 'pageCount', 'emptyPageCount']) {
             expect(gone in r).toBe(false)
         }
     })
@@ -940,6 +944,20 @@ describe('attachment — edge cases (regression)', () => {
         expect(asPdf.extraction).toBeUndefined()
     })
 
+    // That early gate is the one 'extracted' return that never reaches the cap logic, so it is the
+    // one that can forget `truncated`. Every 'extracted' result owes the field: a consumer testing
+    // `=== false`, or copying it into the S3 companion's metadata unconditionally, must not get
+    // `undefined` from the most complete extraction there is. Asserted as presence, not just value —
+    // `undefined === false` is false, but `'truncated' in r` is what catches an omitted key.
+    it('reports truncated false on a zero-byte attachment rather than omitting it', async () => {
+        for (const contentType of ['text/plain', 'application/pdf', XLSX_TYPE, undefined]) {
+            const r = await extractAttachment({ content: Buffer.alloc(0), contentType })
+            expect(r.status).toBe('extracted')
+            expect('truncated' in r).toBe(true)
+            expect(r.truncated).toBe(false)
+        }
+    })
+
     // The real guard, end to end. The replica below proves a PROPERTY of the timeout (that the work
     // it abandons keeps running) but executes a copy, so the shipped withTimeout/HandlerTimeoutError
     // were never run by this suite. Here a stubbed parser hangs forever and fake timers jump the
@@ -1007,15 +1025,14 @@ describe('attachment — edge cases (regression)', () => {
         expect(ranToCompletion).toBe(true) // ...and completes its CPU work anyway
     })
 
-    // ACCEPTED BY DESIGN — the 3-field slim intentionally carries NO truncation signal, so over-cap
-    // output is bounded silently. Asserted positively (a normal green test): if a `truncated` field
-    // is ever added, `not.toHaveProperty` below fails, forcing a conscious update to the contract.
-    it('caps over-limit output silently — the slim contract has no truncation signal (by design)', async () => {
+    // Formerly pinned the opposite ("caps silently — no truncation signal by design"), with a note
+    // that adding a `truncated` field must force a conscious contract update. This is that update.
+    it('reports over-limit output as truncated rather than capping it silently', async () => {
         const content = Buffer.alloc(2 * MAX_OUTPUT_CHARS, 0x41) // 500k "A", under the 10MB input cap
         const r = await extractAttachment({ content, contentType: 'text/plain' })
         expect(r.status).toBe('extracted')
-        expect(r.extraction?.length).toBe(MAX_OUTPUT_CHARS) // capped
-        expect(r).not.toHaveProperty('truncated') // deliberate: no field signals truncation
+        expect(r.extraction?.length).toBe(MAX_OUTPUT_CHARS) // still capped
+        expect(r.truncated).toBe(true) // ...but no longer silently
     })
 })
 
@@ -1613,5 +1630,464 @@ describe('attachment — a utf-16 charset claim must be earned by the bytes', ()
         })
         expect(r.status).toBe('extracted')
         expect(r.extraction).toContain('日本語のテキストです。')
+    })
+})
+
+// Extract options: maxOutputChars + trailer ----------------------------------
+// The cap may only tighten, the trailer only appears on a real cut, and omitting both must
+// reproduce the pre-options behaviour exactly (the non-breaking guarantee for existing callers).
+
+describe('attachment — extract options', () => {
+    // 500k "A" against the 250k ceiling: over-cap under every setting below, so each case isolates
+    // the option under test rather than whether the input was big enough.
+    const oversized = () => Buffer.alloc(2 * MAX_OUTPUT_CHARS, 0x41)
+    const asText = { contentType: 'text/plain' }
+
+    it('tightens the cap when asked', async () => {
+        const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 100 })
+        expect(r.extraction).toHaveLength(100)
+        expect(r.truncated).toBe(true)
+    })
+
+    it('clamps a cap above the ceiling instead of honouring it', async () => {
+        // The footgun this exists to stop: a streaming handler reads until the cap, so a caller must
+        // not be able to widen how far we read into a document.
+        const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 10 * MAX_OUTPUT_CHARS })
+        expect(r.extraction).toHaveLength(MAX_OUTPUT_CHARS)
+    })
+
+    it('ignores a non-finite or negative cap rather than producing an empty extraction', async () => {
+        for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
+            const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: bad })
+            expect(r.extraction).toHaveLength(MAX_OUTPUT_CHARS)
+        }
+        // Negative clamps to 0 — a cap of "no text at all" is coherent, so it is honoured, not ignored.
+        const zero = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: -5 })
+        expect(zero.extraction).toBeUndefined() // '' collapses to omitted, per the contract
+        expect(zero.status).toBe('extracted')
+    })
+
+    it('floors a fractional cap', async () => {
+        const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 10.9 })
+        expect(r.extraction).toHaveLength(10)
+    })
+
+    it('appends the trailer only when the text was actually cut', async () => {
+        const trailer = '\n[truncated]'
+        const cut = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 100, trailer })
+        expect(cut.extraction?.endsWith(trailer)).toBe(true)
+
+        const whole = await extractAttachment({ content: buf('short'), ...asText }, { trailer })
+        expect(whole.extraction).toBe('short')
+        expect(whole.truncated).toBe(false)
+    })
+
+    it('keeps the trailer outside cap accounting — the cap bounds text, not the returned string', async () => {
+        // Documented deliberately: a consumer sizing a buffer on maxOutputChars must add the trailer.
+        const trailer = '\n[truncated]'
+        const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 100, trailer })
+        expect(r.extraction).toHaveLength(100 + trailer.length)
+        expect(r.extraction?.slice(0, 100)).toBe('A'.repeat(100))
+    })
+
+    it('reports truncated independently of the trailer, so a consumer need not parse the text', async () => {
+        const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 100 })
+        expect(r.truncated).toBe(true)
+        expect(r.extraction?.endsWith('A')).toBe(true) // no trailer supplied, none appended
+    })
+
+    it('omits truncated on skipped and failed — there is no text to have cut', async () => {
+        const skipped = await extractAttachment({ content: Buffer.alloc(MAX_INPUT_BYTES + 1), ...asText })
+        expect(skipped.status).toBe('skipped')
+        expect('truncated' in skipped).toBe(false)
+    })
+
+    it('reproduces pre-options behaviour when both options are omitted', async () => {
+        // AC#6, stated as a test: the default path must be byte-identical to passing nothing.
+        const content = oversized()
+        const bare = await extractAttachment({ content, ...asText })
+        const empty = await extractAttachment({ content, ...asText }, {})
+        expect(bare).toEqual(empty)
+        expect(bare.extraction).toHaveLength(MAX_OUTPUT_CHARS)
+    })
+
+    it('does not split a surrogate pair at a tightened cap boundary', async () => {
+        // The existing surrogate guard has to follow the resolved cap, not the module constant.
+        const content = buf('a' + '😀'.repeat(50)) // 😀 is a surrogate PAIR: cap 2 lands mid-pair
+        const r = await extractAttachment({ content, ...asText }, { maxOutputChars: 2 })
+        expect(r.extraction).toBe('a') // the lone high half was dropped, not emitted as U+FFFD
+        expect(r.extraction).not.toContain('�')
+    })
+})
+
+// xlsx streaming: entry-order workaround --------------------------------------
+// The handler streams via exceljs's stream.xlsx.WorkbookReader, which loses zip entries whenever a
+// worksheet reaches it before xl/sharedStrings.xml and xl/_rels/workbook.xml.rels have been parsed:
+// it spools that worksheet to a temp file and awaits it while the zip stream is paused, and the zip
+// stream then halts (exceljs #2790 / #3064 / #2147, all open; no release since 4.4.0). Symptoms are
+// a dropped worksheet or a "reading 'sheets'" throw, on the SAME bytes, run to run.
+//
+// reorderForStreaming rewrites the entry order so that never happens. These are the regression
+// tests for it — and because the bug is a race, each asserts over repeated reads: a single green
+// read proves nothing when the failure rate is partial. Measured before the reorder, the
+// multi-sheet case below dropped a sheet or threw on most reads; the no-shared-strings case dropped
+// sheets on 35 of 50.
+
+describe('attachment — xlsx streaming determinism', () => {
+    // exceljs's own writer emits xl/workbook.xml LAST, which is the layout that used to throw.
+    const workbookWith = async (sheets: number, rows: number) => {
+        const workbook = new ExcelJS.Workbook()
+        for (let s = 1; s <= sheets; s++) {
+            const sheet = workbook.addWorksheet(`S${s}`)
+            for (let r = 1; r <= rows; r++) sheet.addRow([`s${s}r${r}`, r])
+        }
+        return Buffer.from(await workbook.xlsx.writeBuffer())
+    }
+
+    const READS = 12 // enough to catch a partial-rate race; the workbooks are tiny
+
+    it('returns every worksheet, on every read', async () => {
+        const content = await workbookWith(5, 10)
+        for (let i = 0; i < READS; i++) {
+            const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+            expect(r.status).toBe('extracted')
+            for (let s = 1; s <= 5; s++) expect(r.extraction).toContain(`=== S${s} ===`)
+        }
+    })
+
+    it('returns byte-identical extraction across repeated reads of the same workbook', async () => {
+        const content = await workbookWith(4, 25)
+        const first = await extractAttachment({ content, contentType: XLSX_TYPE })
+        for (let i = 0; i < READS; i++) {
+            expect(await extractAttachment({ content, contentType: XLSX_TYPE })).toEqual(first)
+        }
+    })
+
+    it('keeps worksheets in workbook order', async () => {
+        const r = await extractAttachment({ content: await workbookWith(4, 3), contentType: XLSX_TYPE })
+        const headers = r.extraction!.match(/^=== .* ===$/gm)
+        expect(headers).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ===', '=== S4 ==='])
+    })
+
+    // A workbook with no strings has no xl/sharedStrings.xml at all, so ordering alone cannot set
+    // the flag that keeps the reader off the lossy path — the handler injects an empty table.
+    // Numeric-only cells are the realistic shape of such a workbook.
+    it('returns every worksheet when the workbook has no shared-string table', async () => {
+        const workbook = new ExcelJS.Workbook()
+        for (let s = 1; s <= 3; s++) {
+            const sheet = workbook.addWorksheet(`N${s}`)
+            for (let r = 1; r <= 10; r++) sheet.addRow([s * 1000 + r, r * 2, r * 3])
+        }
+        const content = Buffer.from(await workbook.xlsx.writeBuffer())
+        for (let i = 0; i < READS; i++) {
+            const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+            expect(r.status).toBe('extracted')
+            for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`=== N${s} ===`)
+        }
+    })
+
+    // The reorder rewrites the archive before the parser sees it, so it must not disturb the values.
+    it('preserves cell values, formula results and sheet names through the reorder', async () => {
+        const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
+        expect(r.extraction).toContain('=== Q1 ===')
+        expect(r.extraction).toContain('=== Notes ===')
+        expect(r.extraction).toContain('West\t4200')
+        expect(r.extraction).toContain('Total\t7300') // formula RESULT survived
+        expect(r.extraction).not.toContain('SUM(')
+    })
+})
+
+// Post-cap emptiness, CRC pin, and the lost-worksheet backstop --------------------------
+
+describe('attachment — emptiness is decided after the cap', () => {
+    // The pdf handler reports `empty` from its PRE-cap page join, so on a tight cap it answers
+    // `false` about text the central slice then reduces to nothing. Reading that answer with `??`
+    // would emit extraction: '' — or, with a trailer, a bare trailer and no document text at all.
+    // Routed through a PDF deliberately: pdf is the only handler that sets `empty`, so a text/plain
+    // input cannot exercise this at all.
+    const pdfWithText = () => buildPdf([['some real extractable text on page one']])
+
+    it('omits extraction when the cap slices a pdf to nothing, rather than returning an empty string', async () => {
+        const r = await extractAttachment({ content: pdfWithText(), contentType: 'application/pdf' }, { maxOutputChars: 0 })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBeUndefined() // never '', per the contract
+        expect('extraction' in r).toBe(false)
+    })
+
+    it('never returns a bare trailer with no document text in front of it', async () => {
+        const trailer = '\n[truncated]'
+        const r = await extractAttachment(
+            { content: pdfWithText(), contentType: 'application/pdf' },
+            { maxOutputChars: 0, trailer }
+        )
+        expect(r.extraction).toBeUndefined()
+        expect(r.extraction ?? '').not.toBe(trailer)
+    })
+
+    // The pdf handler's own `empty: true` must still be honoured — the guard only stops a stale
+    // `false` from overriding a genuinely-empty slice, it does not ignore the handler entirely.
+    it('still honours a handler that reports itself empty', async () => {
+        const r = await extractAttachment({ content: fixture('blank.pdf'), contentType: 'application/pdf' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBeUndefined()
+    })
+})
+
+// xlsx deadline enforcement ---------------------------------------------------
+// The handler's deadline check has to run once per ROW, not once per row that produced text. A row
+// whose cells are all empty is skipped, so a check sitting below that skip never sees one — and a
+// sheet of blank-but-present rows is precisely the shape that spins the loop while producing nothing
+// to trip the output cap. With the check below the skip, the budget goes unenforced exactly where
+// the loop is cheapest to spin, leaving only withTimeout: a race, which frees the caller's
+// concurrency slot while the parse runs on detached.
+
+describe('attachment — xlsx honours the deadline on contentless rows', () => {
+    // addRow(['']) emits a <row> that yields no non-empty cells — measured: 30 such rows are all
+    // yielded by the reader and all skipped by the handler. (addRow([]) emits nothing at all, so it
+    // cannot exercise this.) The marker row last is what makes the stop observable from outside.
+    const sheetOfBlankRows = async (blanks: number) => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Blanks')
+        for (let i = 0; i < blanks; i++) sheet.addRow([''])
+        sheet.addRow(['TRAILING-MARKER'])
+        return Buffer.from(await workbook.xlsx.writeBuffer())
+    }
+
+    it('stops on a sheet of blank-but-present rows instead of iterating to the end', async () => {
+        const content = await sheetOfBlankRows(400)
+
+        // Blunt, like the pdf deadline test: extractAttachment's FIRST Date.now() sets the deadline,
+        // every call after it lands past it. exceljs/unzipper may read the clock themselves, so a
+        // mock that tried to let N rows through would depend on how often they do.
+        const base = Date.now()
+        let calls = 0
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => {
+            calls += 1
+            return calls === 1 ? base : base + HANDLER_TIMEOUT_MS + 1
+        })
+        const stopped = await extractAttachment({ content, contentType: XLSX_TYPE })
+        clock.mockRestore()
+
+        expect(stopped.status).toBe('extracted') // a deadline stop is not a failure
+        expect(stopped.truncated).toBe(true)
+        // The point of the test: the blank rows must not have been walked through to reach this.
+        expect(stopped.extraction ?? '').not.toContain('TRAILING-MARKER')
+
+        // Control: a real clock reads the same bytes to the end and flags nothing. Without it the
+        // assertions above would also pass if the handler simply failed on this workbook.
+        const whole = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(whole.truncated).toBe(false)
+        expect(whole.extraction).toContain('TRAILING-MARKER')
+    })
+})
+
+describe('attachment — xlsx lost-worksheet backstop', () => {
+    // Pins the precomputed CRC against a fresh computation so the constant and the literal it
+    // describes cannot drift apart if the injected XML is ever edited.
+    it('the injected shared-string table matches its precomputed CRC', () => {
+        const body = Buffer.from(
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+                '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>',
+            'latin1'
+        )
+        expect(zlib.crc32(body)).toBe(0x2949bd0b)
+    })
+
+    // The reorder closes the two KNOWN triggers. This proves the CLASS is closed: whenever the
+    // reader yields fewer worksheets than the archive holds — for any reason, including one not yet
+    // discovered — extraction must fail loudly rather than return a partial workbook labelled
+    // 'extracted'. Deleting a worksheet part cannot simulate that (it lowers the archive's count
+    // too, so there is no mismatch); the failure is a reader that under-yields against an intact
+    // archive, so that is what is stubbed here.
+    it('fails rather than silently returning a workbook with a missing worksheet', async () => {
+        const workbook = new ExcelJS.Workbook()
+        for (const name of ['Alpha', 'Beta', 'Gamma']) workbook.addWorksheet(name).addRow([`${name} data`])
+        const content = Buffer.from(await workbook.xlsx.writeBuffer())
+
+        vi.resetModules()
+        vi.doMock('exceljs', async () => {
+            const actual = await vi.importActual<{ default: typeof ExcelJS }>('exceljs')
+            const Real = actual.default.stream.xlsx.WorkbookReader
+            // Yields the first two of the archive's three worksheets, then stops — exactly the shape
+            // of the upstream entry loss, minus the nondeterminism.
+            class UnderYieldingReader extends Real {
+                async *[Symbol.asyncIterator]() {
+                    let yielded = 0
+                    for await (const worksheet of super[Symbol.asyncIterator]()) {
+                        if (yielded++ >= 2) return
+                        yield worksheet
+                    }
+                }
+            }
+            return {
+                ...actual,
+                default: {
+                    ...actual.default,
+                    stream: { xlsx: { ...actual.default.stream.xlsx, WorkbookReader: UnderYieldingReader } },
+                },
+            }
+        })
+
+        const { extractAttachment: withLossyReader } = await import('../attachment')
+        const r = await withLossyReader({ content, contentType: XLSX_TYPE })
+        vi.doUnmock('exceljs')
+        vi.resetModules()
+
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/yielded 2 of 3 worksheets/)
+    })
+
+    // The backstop must not fire on a deliberate stop: truncation leaves later sheets unread BY
+    // DESIGN, and turning that into a failure would break every capped large workbook.
+    it('does not fire when extraction stopped early at the cap', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const big = workbook.addWorksheet('Big')
+        const cell = 'x'.repeat(40)
+        for (let i = 0; i < 5_000; i++) big.addRow([cell, cell, cell]) // flattens past the 250k cap
+        workbook.addWorksheet('Later').addRow(['never reached'])
+        const content = Buffer.from(await workbook.xlsx.writeBuffer())
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted') // not 'failed', despite 1 of 2 worksheets read
+        expect(r.truncated).toBe(true)
+        expect(r.extraction).not.toContain('=== Later ===')
+    })
+})
+
+// xlsx archive-rewrite limits -------------------------------------------------
+// The rewrite re-emits the archive with a fresh end-of-central-directory record, whose entry count
+// is a 16-bit field. 0xffff in that field means "ZIP64, the real count is elsewhere", so it can
+// never be written as a literal count. The walk already refuses an archive that declares 0xffff —
+// but the rewrite ADDS an entry when the workbook has no shared-string table, so an archive one
+// below the sentinel is the input that would push the emitted count onto it.
+//
+// Built by hand: no writer emits a 65534-entry workbook, and this needs the count exactly, not
+// approximately. Every entry is empty and stored, which keeps the fixture ~5.6 MB (inside
+// MAX_INPUT_BYTES) and its decompressed total at zero (inside the decompression budget), so the
+// archive reaches the rewrite rather than being turned away by a gate in front of it.
+
+describe('attachment — xlsx archive rewrite limits', () => {
+    const zipWithEntryCount = (count: number): Buffer => {
+        // One entry must be xl/workbook.xml so the archive routes as .xlsx; the rest are filler.
+        const names = Array.from({ length: count }, (_, i) =>
+            i === 0 ? 'xl/workbook.xml' : `p/${i.toString(36).padStart(5, '0')}`
+        )
+        const locals: Buffer[] = []
+        const centrals: Buffer[] = []
+        const offsets: number[] = []
+        let offset = 0
+        for (const entry of names) {
+            const name = Buffer.from(entry, 'latin1')
+            const local = Buffer.alloc(30) // method 0, crc 0, both sizes 0 — an empty stored entry
+            local.writeUInt32LE(0x04034b50, 0)
+            local.writeUInt16LE(20, 4)
+            local.writeUInt16LE(name.length, 26)
+            locals.push(local, name)
+            offsets.push(offset)
+            offset += 30 + name.length
+        }
+        names.forEach((entry, i) => {
+            const name = Buffer.from(entry, 'latin1')
+            const central = Buffer.alloc(46)
+            central.writeUInt32LE(0x02014b50, 0)
+            central.writeUInt16LE(20, 4)
+            central.writeUInt16LE(20, 6)
+            central.writeUInt16LE(name.length, 28)
+            central.writeUInt32LE(offsets[i], 42)
+            centrals.push(central, name)
+        })
+        const directory = Buffer.concat(centrals)
+        const end = Buffer.alloc(22)
+        end.writeUInt32LE(0x06054b50, 0)
+        end.writeUInt16LE(count, 8)
+        end.writeUInt16LE(count, 10)
+        end.writeUInt32LE(directory.length, 12)
+        end.writeUInt32LE(offset, 16)
+        return Buffer.concat([...locals, directory, end])
+    }
+
+    it('refuses an archive whose rewrite would land on the 0xffff entry-count sentinel', async () => {
+        // 65534 real entries + the injected shared-string part = 65535 = 0xffff.
+        const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 1), contentType: XLSX_TYPE })
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/central directory could not be read/)
+    })
+
+    it('accepts one entry below that boundary, so the refusal is the sentinel and not the size', async () => {
+        // 65533 + 1 = 65534, a legal count. Same shape, same ~5.6 MB, one fewer entry: without this
+        // the test above would also pass if the rewrite simply gave up on large archives.
+        const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2), contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+    })
+})
+
+// PDF truncation signals ------------------------------------------------------
+// The pdf handler is the only one that can stop for three different reasons, and each has to reach
+// the caller as `truncated`. All three are asserted here because they fail differently: the cap is
+// content-driven, the page ceiling is structural, and the deadline is time-driven — a regression in
+// any one of them silently returns a partial document that reads as complete.
+
+describe('attachment — pdf reports every way it can stop early', () => {
+    const PDF = 'application/pdf'
+
+    // Two mechanisms produce the flag here, and this asserts the caller-visible result of both: the
+    // handler sets it on its own break, AND the page of overshoot it leaves behind trips the entry
+    // point's over-cap check. Breaking the handler's flag alone does NOT fail this test. They are
+    // not quite redundant — the handler's running total counts a trailing page join the final text
+    // doesn't have, so a document landing within ~2 chars of the cap is flagged only by the handler.
+    it('reports truncated when the output cap stops it', async () => {
+        // 90 pages x 55 lines (~57 chars each) ≈ 280k extractable chars, past the 250k cap.
+        const line = 'the quick brown fox jumps over the lazy dog and then some'
+        const pdf = buildPdf(Array.from({ length: 90 }, () => Array.from({ length: 55 }, () => line)))
+        const r = await extractAttachment({ content: pdf, contentType: PDF })
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(true)
+        expect(r.extraction!.length).toBeLessThanOrEqual(MAX_OUTPUT_CHARS)
+    })
+
+    // Pages past MAX_PDF_PAGES are never read, so their text is missing whether or not the cap was
+    // reached — a document that is 2001 pages of one word each stays far under the cap and would
+    // otherwise look complete. This is the only signal that says otherwise.
+    it('reports truncated when the page ceiling stops it, even far under the output cap', async () => {
+        const pdf = buildPdf(Array.from({ length: MAX_PDF_PAGES + 1 }, (_, i) => [`page${i + 1}`]))
+        const r = await extractAttachment({ content: pdf, contentType: PDF })
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(true)
+        expect(r.extraction!.length).toBeLessThan(MAX_OUTPUT_CHARS) // nowhere near the cap
+        expect(r.extraction).toContain('page1')
+        expect(r.extraction).not.toContain(`page${MAX_PDF_PAGES + 1}`) // the page past the ceiling
+    })
+
+    it('reports truncated when the deadline stops it', async () => {
+        const pdf = buildPdf(Array.from({ length: 20 }, (_, i) => [`page ${i + 1} of the document`]))
+
+        // extractAttachment's FIRST Date.now() is the one that sets the deadline; every call after it
+        // lands past that deadline, so the page loop stops on its first check. Deliberately blunt:
+        // pdf.js may call Date.now() itself, and a mock that tried to let N pages through would
+        // depend on how many times it does.
+        const base = Date.now()
+        let calls = 0
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => {
+            calls += 1
+            return calls === 1 ? base : base + HANDLER_TIMEOUT_MS + 1
+        })
+        const stopped = await extractAttachment({ content: pdf, contentType: PDF })
+        clock.mockRestore()
+
+        expect(stopped.status).toBe('extracted') // a deadline stop is not a failure
+        expect(stopped.truncated).toBe(true)
+
+        // Control: the same bytes with a real clock are complete and NOT flagged — without this the
+        // assertion above would also pass if `truncated` were hardcoded true.
+        const whole = await extractAttachment({ content: pdf, contentType: PDF })
+        expect(whole.truncated).toBe(false)
+        expect(whole.extraction).toContain('page 20 of the document')
+    })
+
+    it('leaves truncated false for a pdf that is read completely', async () => {
+        const r = await extractAttachment({ content: buildPdf([['short document']]), contentType: PDF })
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(false)
+        expect(r.extraction).toContain('short document')
     })
 })

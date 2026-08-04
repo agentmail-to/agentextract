@@ -54,12 +54,28 @@ const result = await extractAttachment({
 })
 // result.status === 'extracted'
 // result.extraction === 'Q3 revenue …'
+// result.truncated === false
 ```
 
 The heavy parsers (`unpdf`, `mammoth`, `exceljs`, …) are lazy-loaded per handler, so importing
 `extractAttachment` costs nothing until you actually call it on a matching attachment. It's also
 available on its own subpath — `import { extractAttachment } from 'agentextract/attachment'` — if
 you want to reach it without touching the body-extraction entry point.
+
+An optional second argument tunes the extraction. Both fields are optional and omitting them
+reproduces the default behaviour exactly:
+
+```ts
+const result = await extractAttachment(input, {
+  maxOutputChars: 50_000, // tighten the output cap; clamped to MAX_OUTPUT_CHARS, never loosened
+  trailer: '\n[truncated — the source document continues past this point.]',
+})
+```
+
+`trailer` is appended to `extraction` only when the text was actually cut, and sits **outside** cap
+accounting — the cap bounds extracted text, so the returned string may exceed it by the trailer's
+length. `result.truncated` reports the same fact programmatically, whether or not a trailer was
+supplied, so a consumer never has to parse the text to find out.
 
 ### Resource limits & the safety boundary
 
@@ -72,14 +88,33 @@ guards reduce blast radius; they are **not** a sandbox.
 - **Decompression** — OOXML (`.docx`/`.xlsx`) archives are stream-inflated and **measured**; one that
   actually expands past `MAX_UNCOMPRESSED_BYTES` (50 MB) is skipped before the parser loads. Malformed
   or ZIP64 metadata is treated as over-budget (fail-closed), not trusted.
-- **Output** — extracted text is capped at `MAX_OUTPUT_CHARS` (250k). The `.xlsx` and PDF handlers
-  apply this **incrementally** as they build, so a huge sheet/PDF never materializes in full. The
-  `.docx` (mammoth) and HTML (html-to-text) handlers return a complete string that is then trimmed —
-  there the cap is **post-materialization**, so peak memory follows the whole document.
-- **Timeout** — `HANDLER_TIMEOUT_MS` (10 s) stops *awaiting* a slow async parse, but cannot cancel
-  synchronous CPU already running inside a parser.
+- **Output** — extracted text is capped at `MAX_OUTPUT_CHARS` (250k), or lower via `maxOutputChars`.
+  Cutting sets `truncated` on the result, so a partial extraction is never mistaken for a complete
+  one. The PDF and `.xlsx` handlers apply the cap **incrementally** as they build — and stop reading
+  the document once they reach it — so neither ever materializes in full. The `.docx` (mammoth) and
+  HTML (html-to-text) handlers return a complete string that is then trimmed, so for those the cap is
+  **post-materialization** and peak memory follows the whole document.
+- **Timeout** — `HANDLER_TIMEOUT_MS` (10 s) stops *awaiting* a slow async parse. It cannot cancel
+  synchronous CPU already running inside a parser, so handlers that yield between units of work (PDF
+  per page, `.xlsx` per row) also check the deadline themselves and stop; the others cannot.
 - **PDF** — page count and accumulated output are bounded (`MAX_PDF_PAGES`, `MAX_OUTPUT_CHARS`), but
   pdf.js's internal per-page decompression is **not** bounded in-library (no hook exists).
+- **`.xlsx`** — read row-by-row through `exceljs`'s streaming reader rather than loaded whole, so
+  peak memory tracks the shared-string table plus one row instead of a live object per cell
+  (measured: 294 MB → 171 MB, and 3.7x faster, on a 5 MB / 38 MB-uncompressed workbook). It is not
+  independent of document size — a workbook with a very large string table still costs — so `.xlsx`
+  remains the format most likely to reach the host's memory limit.
+  That reader loses zip entries unless `xl/sharedStrings.xml` and `xl/_rels/workbook.xml.rels` are
+  parsed before the first worksheet ([exceljs #2790](https://github.com/exceljs/exceljs/issues/2790),
+  [#3064](https://github.com/exceljs/exceljs/issues/3064)), so the archive's entry order is rewritten
+  in memory first. See `reorderForStreaming`. That rewrite is also what keeps the decompression
+  budget binding on this format: the streaming reader walks local file headers, not the central
+  directory the budget measured, and only the rebuilt copy is guaranteed to carry exactly the
+  measured entries — so an archive that cannot be rebuilt is `failed`, never streamed as it arrived.
+  Behind that, a workbook read to completion that yields fewer worksheets than the archive holds
+  returns `failed` rather than a partial workbook reported as `extracted` — silent partial output is
+  the one outcome worth failing over, since a caller can retry a failure but cannot tell a truncated
+  document from a complete one.
 
 ## What it does that off-the-shelf engines don't
 
