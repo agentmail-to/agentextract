@@ -69,9 +69,8 @@ const buildPdf = (pages: string[][]): Buffer => {
 
 // Result-shape guard ---------------------------------------------------------
 // The whole point of the slim contract: the top-level result carries no routing/diagnostic noise
-// and no top-level filename. If any of that leaks back in, this fails. `truncated` IS part of the
-// contract — a deliberate addition, since a partial extraction that reads as complete is worse than
-// a missing one — but it is the only field that has been allowed back.
+// and no top-level filename. If any of that leaks back in, this fails. `truncated` is the one field
+// deliberately allowed back — a partial extraction that reads as complete is worse than a missing one.
 
 describe('attachment — slim result contract', () => {
     it('returns only the four contract fields, never routing/diagnostic noise', async () => {
@@ -945,10 +944,8 @@ describe('attachment — edge cases (regression)', () => {
     })
 
     // That early gate is the one 'extracted' return that never reaches the cap logic, so it is the
-    // one that can forget `truncated`. Every 'extracted' result owes the field: a consumer testing
-    // `=== false`, or copying it into the S3 companion's metadata unconditionally, must not get
-    // `undefined` from the most complete extraction there is. Asserted as presence, not just value —
-    // `undefined === false` is false, but `'truncated' in r` is what catches an omitted key.
+    // one that can forget `truncated`. Asserted as presence, not just value: `undefined === false`
+    // is false either way, and only `'truncated' in r` catches an omitted key.
     it('reports truncated false on a zero-byte attachment rather than omitting it', async () => {
         for (const contentType of ['text/plain', 'application/pdf', XLSX_TYPE, undefined]) {
             const r = await extractAttachment({ content: Buffer.alloc(0), contentType })
@@ -1025,8 +1022,8 @@ describe('attachment — edge cases (regression)', () => {
         expect(ranToCompletion).toBe(true) // ...and completes its CPU work anyway
     })
 
-    // Formerly pinned the opposite ("caps silently — no truncation signal by design"), with a note
-    // that adding a `truncated` field must force a conscious contract update. This is that update.
+    // Formerly pinned the opposite, with a note that adding `truncated` must force a conscious
+    // contract update. This is that update.
     it('reports over-limit output as truncated rather than capping it silently', async () => {
         const content = Buffer.alloc(2 * MAX_OUTPUT_CHARS, 0x41) // 500k "A", under the 10MB input cap
         const r = await extractAttachment({ content, contentType: 'text/plain' })
@@ -1635,11 +1632,11 @@ describe('attachment — a utf-16 charset claim must be earned by the bytes', ()
 
 // Extract options: maxOutputChars + trailer ----------------------------------
 // The cap may only tighten, the trailer only appears on a real cut, and omitting both must
-// reproduce the pre-options behaviour exactly (the non-breaking guarantee for existing callers).
+// reproduce pre-options behaviour exactly.
 
 describe('attachment — extract options', () => {
     // 500k "A" against the 250k ceiling: over-cap under every setting below, so each case isolates
-    // the option under test rather than whether the input was big enough.
+    // the option under test rather than the input size.
     const oversized = () => Buffer.alloc(2 * MAX_OUTPUT_CHARS, 0x41)
     const asText = { contentType: 'text/plain' }
 
@@ -1650,8 +1647,8 @@ describe('attachment — extract options', () => {
     })
 
     it('clamps a cap above the ceiling instead of honouring it', async () => {
-        // The footgun this exists to stop: a streaming handler reads until the cap, so a caller must
-        // not be able to widen how far we read into a document.
+        // The footgun this stops: a streaming handler reads until the cap, so a caller must not be
+        // able to widen how far we read into a document.
         const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 10 * MAX_OUTPUT_CHARS })
         expect(r.extraction).toHaveLength(MAX_OUTPUT_CHARS)
     })
@@ -1721,17 +1718,10 @@ describe('attachment — extract options', () => {
 })
 
 // xlsx streaming: entry-order workaround --------------------------------------
-// The handler streams via exceljs's stream.xlsx.WorkbookReader, which loses zip entries whenever a
-// worksheet reaches it before xl/sharedStrings.xml and xl/_rels/workbook.xml.rels have been parsed:
-// it spools that worksheet to a temp file and awaits it while the zip stream is paused, and the zip
-// stream then halts (exceljs #2790 / #3064 / #2147, all open; no release since 4.4.0). Symptoms are
-// a dropped worksheet or a "reading 'sheets'" throw, on the SAME bytes, run to run.
-//
-// reorderForStreaming rewrites the entry order so that never happens. These are the regression
-// tests for it — and because the bug is a race, each asserts over repeated reads: a single green
-// read proves nothing when the failure rate is partial. Measured before the reorder, the
-// multi-sheet case below dropped a sheet or threw on most reads; the no-shared-strings case dropped
-// sheets on 35 of 50.
+// Regressions for reorderForStreaming; the entry-loss bug it works around is documented at its
+// definition. Each asserts over repeated reads because that bug is a race — a single green read
+// proves nothing at a partial failure rate. Before the reorder the multi-sheet case dropped a sheet
+// or threw on most reads; the no-shared-strings case dropped sheets on 35 of 50.
 
 describe('attachment — xlsx streaming determinism', () => {
     // exceljs's own writer emits xl/workbook.xml LAST, which is the layout that used to throw.
@@ -1769,9 +1759,9 @@ describe('attachment — xlsx streaming determinism', () => {
         expect(headers).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ===', '=== S4 ==='])
     })
 
-    // A workbook with no strings has no xl/sharedStrings.xml at all, so ordering alone cannot set
-    // the flag that keeps the reader off the lossy path — the handler injects an empty table.
-    // Numeric-only cells are the realistic shape of such a workbook.
+    // No strings means no xl/sharedStrings.xml, so ordering alone cannot set the flag that keeps the
+    // reader off the lossy path — the handler injects an empty table. Numeric-only cells are the
+    // realistic shape of such a workbook.
     it('returns every worksheet when the workbook has no shared-string table', async () => {
         const workbook = new ExcelJS.Workbook()
         for (let s = 1; s <= 3; s++) {
@@ -1801,10 +1791,9 @@ describe('attachment — xlsx streaming determinism', () => {
 
 describe('attachment — emptiness is decided after the cap', () => {
     // The pdf handler reports `empty` from its PRE-cap page join, so on a tight cap it answers
-    // `false` about text the central slice then reduces to nothing. Reading that answer with `??`
-    // would emit extraction: '' — or, with a trailer, a bare trailer and no document text at all.
-    // Routed through a PDF deliberately: pdf is the only handler that sets `empty`, so a text/plain
-    // input cannot exercise this at all.
+    // `false` about text the central slice then reduces to nothing; `??` would emit that as '', or
+    // as a bare trailer with no document text. Routed through a PDF because pdf is the only handler
+    // that sets `empty` — a text/plain input cannot exercise this.
     const pdfWithText = () => buildPdf([['some real extractable text on page one']])
 
     it('omits extraction when the cap slices a pdf to nothing, rather than returning an empty string', async () => {
@@ -1824,8 +1813,8 @@ describe('attachment — emptiness is decided after the cap', () => {
         expect(r.extraction ?? '').not.toBe(trailer)
     })
 
-    // The pdf handler's own `empty: true` must still be honoured — the guard only stops a stale
-    // `false` from overriding a genuinely-empty slice, it does not ignore the handler entirely.
+    // A handler's own `empty: true` must still be honoured: the guard only stops a stale `false`
+    // from overriding a genuinely-empty slice.
     it('still honours a handler that reports itself empty', async () => {
         const r = await extractAttachment({ content: fixture('blank.pdf'), contentType: 'application/pdf' })
         expect(r.status).toBe('extracted')
@@ -1834,17 +1823,14 @@ describe('attachment — emptiness is decided after the cap', () => {
 })
 
 // xlsx deadline enforcement ---------------------------------------------------
-// The handler's deadline check has to run once per ROW, not once per row that produced text. A row
-// whose cells are all empty is skipped, so a check sitting below that skip never sees one — and a
-// sheet of blank-but-present rows is precisely the shape that spins the loop while producing nothing
-// to trip the output cap. With the check below the skip, the budget goes unenforced exactly where
-// the loop is cheapest to spin, leaving only withTimeout: a race, which frees the caller's
-// concurrency slot while the parse runs on detached.
+// The deadline check has to run once per ROW, not once per row that produced text: an all-empty row
+// is skipped and trips no cap, so a check below that skip leaves the budget unenforced exactly where
+// the loop is cheapest to spin.
 
 describe('attachment — xlsx honours the deadline on contentless rows', () => {
-    // addRow(['']) emits a <row> that yields no non-empty cells — measured: 30 such rows are all
-    // yielded by the reader and all skipped by the handler. (addRow([]) emits nothing at all, so it
-    // cannot exercise this.) The marker row last is what makes the stop observable from outside.
+    // addRow(['']) emits a <row> yielding no non-empty cells — measured: all 30 reach the reader and
+    // all are skipped by the handler. addRow([]) emits nothing, so it cannot exercise this. The
+    // trailing marker row is what makes the stop observable from outside.
     const sheetOfBlankRows = async (blanks: number) => {
         const workbook = new ExcelJS.Workbook()
         const sheet = workbook.addWorksheet('Blanks')
@@ -1856,9 +1842,9 @@ describe('attachment — xlsx honours the deadline on contentless rows', () => {
     it('stops on a sheet of blank-but-present rows instead of iterating to the end', async () => {
         const content = await sheetOfBlankRows(400)
 
-        // Blunt, like the pdf deadline test: extractAttachment's FIRST Date.now() sets the deadline,
-        // every call after it lands past it. exceljs/unzipper may read the clock themselves, so a
-        // mock that tried to let N rows through would depend on how often they do.
+        // Blunt, like the pdf deadline test: the FIRST Date.now() sets the deadline, every later
+        // call lands past it. exceljs/unzipper may read the clock themselves, so a mock letting N
+        // rows through would depend on how often they do.
         const base = Date.now()
         let calls = 0
         const clock = vi.spyOn(Date, 'now').mockImplementation(() => {
@@ -1882,8 +1868,8 @@ describe('attachment — xlsx honours the deadline on contentless rows', () => {
 })
 
 describe('attachment — xlsx lost-worksheet backstop', () => {
-    // Pins the precomputed CRC against a fresh computation so the constant and the literal it
-    // describes cannot drift apart if the injected XML is ever edited.
+    // Pins the precomputed CRC against a fresh computation, so the constant and the literal it
+    // describes cannot drift if the injected XML is edited.
     it('the injected shared-string table matches its precomputed CRC', () => {
         const body = Buffer.from(
             '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
@@ -1893,12 +1879,9 @@ describe('attachment — xlsx lost-worksheet backstop', () => {
         expect(zlib.crc32(body)).toBe(0x2949bd0b)
     })
 
-    // The reorder closes the two KNOWN triggers. This proves the CLASS is closed: whenever the
-    // reader yields fewer worksheets than the archive holds — for any reason, including one not yet
-    // discovered — extraction must fail loudly rather than return a partial workbook labelled
-    // 'extracted'. Deleting a worksheet part cannot simulate that (it lowers the archive's count
-    // too, so there is no mismatch); the failure is a reader that under-yields against an intact
-    // archive, so that is what is stubbed here.
+    // The reorder closes the two KNOWN triggers; this proves the CLASS is closed. Deleting a
+    // worksheet part cannot simulate it — that lowers the archive's count too, so there is no
+    // mismatch. The failure is a reader under-yielding against an intact archive, so that is stubbed.
     it('fails rather than silently returning a workbook with a missing worksheet', async () => {
         const workbook = new ExcelJS.Workbook()
         for (const name of ['Alpha', 'Beta', 'Gamma']) workbook.addWorksheet(name).addRow([`${name} data`])
@@ -1955,16 +1938,9 @@ describe('attachment — xlsx lost-worksheet backstop', () => {
 })
 
 // xlsx archive-rewrite limits -------------------------------------------------
-// The rewrite re-emits the archive with a fresh end-of-central-directory record, whose entry count
-// is a 16-bit field. 0xffff in that field means "ZIP64, the real count is elsewhere", so it can
-// never be written as a literal count. The walk already refuses an archive that declares 0xffff —
-// but the rewrite ADDS an entry when the workbook has no shared-string table, so an archive one
-// below the sentinel is the input that would push the emitted count onto it.
-//
-// Built by hand: no writer emits a 65534-entry workbook, and this needs the count exactly, not
-// approximately. Every entry is empty and stored, which keeps the fixture ~5.6 MB (inside
-// MAX_INPUT_BYTES) and its decompressed total at zero (inside the decompression budget), so the
-// archive reaches the rewrite rather than being turned away by a gate in front of it.
+// Built by hand: no writer emits a 65534-entry workbook, and this needs the count exactly. Every
+// entry is empty and stored, keeping the fixture ~5.6 MB (inside MAX_INPUT_BYTES) with a
+// decompressed total of zero, so it reaches the rewrite instead of a gate in front of it.
 
 describe('attachment — xlsx archive rewrite limits', () => {
     const zipWithEntryCount = (count: number): Buffer => {
@@ -2022,19 +1998,17 @@ describe('attachment — xlsx archive rewrite limits', () => {
 })
 
 // PDF truncation signals ------------------------------------------------------
-// The pdf handler is the only one that can stop for three different reasons, and each has to reach
-// the caller as `truncated`. All three are asserted here because they fail differently: the cap is
-// content-driven, the page ceiling is structural, and the deadline is time-driven — a regression in
-// any one of them silently returns a partial document that reads as complete.
+// The pdf handler stops for three reasons, each of which has to reach the caller as `truncated`.
+// All three are asserted because they fail differently — content-driven cap, structural page
+// ceiling, time-driven deadline.
 
 describe('attachment — pdf reports every way it can stop early', () => {
     const PDF = 'application/pdf'
 
-    // Two mechanisms produce the flag here, and this asserts the caller-visible result of both: the
-    // handler sets it on its own break, AND the page of overshoot it leaves behind trips the entry
-    // point's over-cap check. Breaking the handler's flag alone does NOT fail this test. They are
-    // not quite redundant — the handler's running total counts a trailing page join the final text
-    // doesn't have, so a document landing within ~2 chars of the cap is flagged only by the handler.
+    // Two mechanisms produce the flag — the handler's own break, and the page of overshoot tripping
+    // the entry point's over-cap check — so breaking the handler's flag alone does NOT fail this.
+    // Not quite redundant: the handler's running total counts a trailing page join the final text
+    // lacks, so a document landing within ~2 chars of the cap is flagged only by the handler.
     it('reports truncated when the output cap stops it', async () => {
         // 90 pages x 55 lines (~57 chars each) ≈ 280k extractable chars, past the 250k cap.
         const line = 'the quick brown fox jumps over the lazy dog and then some'
@@ -2046,8 +2020,8 @@ describe('attachment — pdf reports every way it can stop early', () => {
     })
 
     // Pages past MAX_PDF_PAGES are never read, so their text is missing whether or not the cap was
-    // reached — a document that is 2001 pages of one word each stays far under the cap and would
-    // otherwise look complete. This is the only signal that says otherwise.
+    // reached — 2001 pages of one word each stays far under the cap and would otherwise look
+    // complete. This flag is the only signal that says otherwise.
     it('reports truncated when the page ceiling stops it, even far under the output cap', async () => {
         const pdf = buildPdf(Array.from({ length: MAX_PDF_PAGES + 1 }, (_, i) => [`page${i + 1}`]))
         const r = await extractAttachment({ content: pdf, contentType: PDF })
@@ -2061,10 +2035,9 @@ describe('attachment — pdf reports every way it can stop early', () => {
     it('reports truncated when the deadline stops it', async () => {
         const pdf = buildPdf(Array.from({ length: 20 }, (_, i) => [`page ${i + 1} of the document`]))
 
-        // extractAttachment's FIRST Date.now() is the one that sets the deadline; every call after it
-        // lands past that deadline, so the page loop stops on its first check. Deliberately blunt:
-        // pdf.js may call Date.now() itself, and a mock that tried to let N pages through would
-        // depend on how many times it does.
+        // extractAttachment's FIRST Date.now() sets the deadline; every later call lands past it, so
+        // the page loop stops on its first check. Deliberately blunt — pdf.js may read the clock
+        // itself, so a mock letting N pages through would depend on how often it does.
         const base = Date.now()
         let calls = 0
         const clock = vi.spyOn(Date, 'now').mockImplementation(() => {

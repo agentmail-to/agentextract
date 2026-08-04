@@ -17,10 +17,8 @@ import jschardet from 'jschardet' // guesses which encoding bytes are in
 export const MAX_INPUT_BYTES = 10 * 1024 * 1024
 
 // Input is byte-capped; output isn't. A big sheet or HTML table can balloon into megabytes that then
-// hit S3 and the search index. This is the CEILING: a caller may tighten it via
-// ExtractOptions.maxOutputChars but never loosen it. Cutting here sets `truncated` on the result, so
-// a consumer can tell a complete extraction from a partial one — a truncated document otherwise
-// reads as complete, which is worse than a missing one.
+// hit S3 and the search index. The CEILING: ExtractOptions.maxOutputChars may only tighten it.
+// Cutting sets `truncated` — a partial extraction that reads as complete is worse than a missing one.
 export const MAX_OUTPUT_CHARS = 250_000
 
 // A PDF can declare an enormous page count. Bounds parse work when per-page text is too sparse to
@@ -65,17 +63,13 @@ export interface AttachmentInput {
     contentType?: string
 }
 
-// How to extract, as opposed to AttachmentInput's what. Both fields optional: omitting them
-// reproduces the pre-options behaviour exactly, so this is non-breaking for existing callers.
+// How to extract, as opposed to AttachmentInput's what. Omitting both reproduces 0.3.0 behaviour.
 export interface ExtractOptions {
-    // Tighten the output cap below MAX_OUTPUT_CHARS. Clamped to it — never loosened. A streaming
-    // handler reads until the cap, so a caller-supplied ceiling above ours would turn a safety
-    // constant into a footgun.
+    // Clamped to MAX_OUTPUT_CHARS — may only tighten. A streaming handler reads until the cap, so a
+    // caller-supplied ceiling above ours would turn a safety constant into a footgun.
     maxOutputChars?: number
-    // Appended to the text when, and only when, it was truncated. The library owns WHEN (it is the
-    // only place that knows a parse stopped early); the caller owns WHAT, so the wording stays
-    // tunable without a publish. Sits OUTSIDE cap accounting: the cap bounds extracted text, and the
-    // returned string may exceed it by this trailer's length. Size buffers accordingly.
+    // Appended only when the text was cut. The library owns WHEN, the caller owns WHAT, so wording
+    // is tunable without a publish. OUTSIDE cap accounting: output may exceed the cap by this length.
     trailer?: string
 }
 
@@ -83,9 +77,8 @@ export interface ExtractionResult {
     status: ExtractionStatus
     extraction?: string // omitted entirely (never '') when the handler produced no text
     reason?: string // set on skipped / failed
-    // Set on `extracted` (omitted on skipped/failed, where there is no text to have cut): whether
-    // the document continues past what `extraction` holds. Reported independently of `trailer`, so a
-    // consumer can act on it without parsing the text.
+    // Whether the document continues past `extraction`. Set on `extracted` only — skipped/failed
+    // have no text to have cut. Independent of `trailer`, so a consumer never parses the text for it.
     truncated?: boolean
 }
 
@@ -93,7 +86,7 @@ interface HandlerContext {
     content: Buffer
     filename?: string
     charsetHint?: string // from the content-type charset= param
-    // Both resolved centrally in extractAttachment, so no handler defaults for itself.
+    // Both resolved centrally in extractAttachment; no handler defaults either for itself.
     maxOutputChars: number // the effective cap; handlers that build incrementally stop here
     deadline: number // Date.now() ceiling; handlers that yield check it between units of work
 }
@@ -101,9 +94,8 @@ interface HandlerContext {
 interface HandlerOutput {
     text: string
     empty?: boolean // handler's own emptiness call; defaults to text.trim() === ''
-    // A handler that stopped early sets this. The entry point ORs it with its own over-cap check:
-    // handlers that overshoot and let the central trim cut them are already covered by that, but a
-    // handler that stops ON the cap, or on the deadline, lands under it and would otherwise look complete.
+    // Set by a handler that stopped early; ORed with the entry point's over-cap check. A handler
+    // stopping ON the cap or on the deadline lands under it and would otherwise look complete.
     truncated?: boolean
 }
 
@@ -263,8 +255,7 @@ const pdfHandler: Handler = {
         let truncated = false
         for (let n = 1; n <= pageCount; n++) {
             // This loop awaits per page, so the deadline is enforceable here in a way withTimeout's
-            // race is not. Checked before the page is fetched: stopping is only useful if it
-            // precedes the work.
+            // race is not. Before the fetch: stopping is only useful if it precedes the work.
             if (Date.now() > deadline) {
                 truncated = true
                 break
@@ -286,7 +277,7 @@ const pdfHandler: Handler = {
                 }
             }
         }
-        // Pages left unread are text the document still holds, however we stopped.
+        // Pages past the ceiling are text we never read.
         if (pageCount < pdf.numPages) truncated = true
         const joined = pages.join('\n\n').trim()
         return { text: joined, empty: joined.length === 0, truncated }
@@ -318,9 +309,8 @@ const docHandler: Handler = {
     },
 }
 
-// The slice of exceljs's Row we actually touch. Declared structurally because the streaming
-// iterator's declared element type (Row) disagrees with what it yields at runtime (Row[]), so
-// narrowing the array puts the real element type out of reach.
+// The slice of exceljs's Row we touch. Structural because the streaming iterator's declared element
+// type (Row) disagrees with what it yields at runtime (Row[]), putting the real element out of reach.
 interface StreamedRow {
     eachCell: (options: { includeEmpty: boolean }, callback: (cell: { text?: string }) => void) => void
 }
@@ -333,16 +323,13 @@ const xlsxHandler: Handler = {
     extract: async ({ content, maxOutputChars, deadline }) => {
         const { Readable } = await import('node:stream')
         const { default: ExcelJS } = await import('exceljs') // not SheetJS: no known parse-time CVEs
-        // Stream rather than workbook.xlsx.load(): load() materializes every cell of every sheet as a
-        // live object before any cap can apply, which is what made a 4 MB in-cap .xlsx peak at
-        // hundreds of MB and OOM a 1024 MB worker. Streaming holds one row at a time instead, so peak
-        // follows the shared-string table rather than the cell graph, and stopping early actually
-        // stops the work. See reorderForStreaming for why the bytes are rewritten first — without
-        // that, this reader silently drops worksheets.
+        // Stream rather than workbook.xlsx.load(), which materializes every cell as a live object
+        // before any cap can apply — a 4 MB in-cap .xlsx peaked at hundreds of MB and OOMed a 1024 MB
+        // worker. Peak now follows the shared-string table, not the cell graph. See
+        // reorderForStreaming: without it this reader drops worksheets.
         const rewritten = reorderForStreaming(content)
-        // Fail closed. The decompression budget measured the central directory, but unzipper (under
-        // the streaming reader) inflates what its LOCAL-header walk finds — so the budget only binds
-        // this path through the rewritten archive. Without it we would be streaming unmeasured bytes.
+        // Fail closed: the budget measured the central directory, but unzipper inflates what its
+        // LOCAL-header walk finds, so the budget binds this path only through the rewritten archive.
         if (!rewritten) throw new Error('xlsx central directory could not be read for streaming')
         const { content: ordered, worksheets: expected } = rewritten
         const reader = new ExcelJS.stream.xlsx.WorkbookReader(Readable.from(ordered), {
@@ -361,20 +348,14 @@ const xlsxHandler: Handler = {
             seen++
             const rows: string[] = []
             for await (const batch of worksheet) {
-                // Documented quirk: the row iterator yields an ARRAY of rows, not a row
-                // ("worksheetReader returns an array of rows ... for performance reasons"). Older
-                // exceljs yielded one, so normalize rather than assume.
+                // Documented quirk: this yields an ARRAY of rows ("worksheetReader returns an array
+                // of rows ... for performance reasons"); older exceljs yielded one.
                 const batchRows = (Array.isArray(batch) ? batch : [batch]) as StreamedRow[]
                 for (const row of batchRows) {
-                    // Deadline first, and deliberately ABOVE the empty-row skip below. A row that
-                    // yields no cells is `continue`d, so a check placed after that skip never runs on
-                    // one — and a sheet of blank-but-present rows is exactly the shape that spins this
-                    // loop while producing nothing to trip the cap. Enforcing here is what makes the
-                    // budget real: this loop awaits, so breaking out ends the parse, whereas
-                    // withTimeout only wins a race — it frees the caller's concurrency slot while the
-                    // parse runs on detached, the failure the API's EXTRACT_BUDGET_MS note says it
-                    // cannot contain. Checked before the row is read, since stopping is only useful
-                    // if it precedes the work.
+                    // ABOVE the empty-row skip: a contentless row is `continue`d, and a sheet of them
+                    // trips no cap either, so a check below would never run. This loop awaits, so
+                    // breaking really ends the parse — unlike withTimeout's race, which frees the
+                    // slot while the parse detaches.
                     if (Date.now() > deadline) {
                         truncated = true
                         break
@@ -387,7 +368,6 @@ const xlsxHandler: Handler = {
                     const line = cells.join('\t')
                     rows.push(line)
                     length += line.length + 1 // + newline
-                    // Unlike under load(), breaking here stops the parse rather than just the copying.
                     if (length > maxOutputChars) {
                         truncated = true
                         break // one line of overshoot, trimmed centrally
@@ -395,28 +375,22 @@ const xlsxHandler: Handler = {
                 }
                 if (truncated) break
             }
-            // The cast is for the TYPE, not the value: exceljs's .d.ts omits `name` from
-            // WorksheetReader, while at runtime the constructor always sets it (worksheet-reader.js:21)
-            // and _parseWorksheet then overwrites it from the workbook model when a rel matches
-            // (workbook-reader.js:306). So the fallback is unreachable against 4.4.0 — kept as
-            // belt-and-braces, not because a nameless worksheet has been observed. This library has
-            // already moved undocumented behaviour under us twice (the spool branch, the row batching);
-            // a sheet silently headed `undefined` is a poor way to learn of a third.
+            // Cast for the TYPE, not the value: the .d.ts omits `name`, but the constructor always
+            // sets it (worksheet-reader.js:21) and _parseWorksheet overwrites it from the model
+            // (workbook-reader.js:306). The fallback is unreachable at 4.4.0, kept because this
+            // library has already moved undocumented behaviour under us twice.
             const name = (worksheet as unknown as { name?: string }).name ?? `Sheet${sheets.length + 1}`
             if (rows.length > 0) sheets.push(`=== ${name} ===\n${rows.join('\n')}`)
-            // Safe to abandon the reader mid-archive: the reorder keeps every worksheet on exceljs's
-            // inline path, which spools nothing, so there are no temp files to strand (their #2147).
+            // Safe to abandon mid-archive: the reorder keeps every worksheet on the inline path,
+            // which spools nothing, so no temp files are stranded (#2147).
             if (truncated) break
         }
 
-        // Behavioural backstop, not a repeat of the reorder's reasoning. The reorder closes the two
-        // conditions that are KNOWN to put exceljs on its data-losing path; this closes the class.
-        // Any third condition — a workbook shape not anticipated here, a future change to the
-        // reader's inline/spool test — shows up as worksheets that were never yielded, and this is
-        // what turns that into a labeled failure instead of half a spreadsheet reported as
-        // 'extracted'. Silent partial output is the one outcome worth failing over: a caller can see
-        // and retry a failure, but cannot tell a truncated document from a complete one.
-        // Only when we read to the end — a deliberate stop leaves later sheets unread by design.
+        // The reorder closes the two KNOWN paths to entry loss; this closes the class. Any third
+        // surfaces as worksheets never yielded, and becomes a labeled failure rather than half a
+        // spreadsheet reported as 'extracted' — a caller can retry a failure but cannot tell a
+        // truncated document from a complete one. Gated on !truncated: a deliberate stop leaves
+        // sheets unread by design.
         if (!truncated && seen < expected) {
             throw new Error(`xlsx reader yielded ${seen} of ${expected} worksheets`)
         }
@@ -532,22 +506,17 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
 // declared size is attacker-controlled. So measure it: stream-inflate each entry (peak stays ~one
 // zlib chunk), count REAL bytes, abort once the total crosses the cap. Unmeasurable = fail closed.
 //
-// WHICH READER THIS HAS TO BIND — the two formats no longer share one, and the difference decides
-// how the measurement is made to stick:
+// WHICH READER THIS BINDS — the two formats no longer share one:
 //
-//   .docx -> mammoth -> jszip. Reads the CENTRAL DIRECTORY, so measuring that directory measures
-//     what it will inflate. The two invariants below are what pin the two readers to the same
-//     records; they are written for this case and the jszip reasoning in them is about this case.
+//   .docx -> mammoth -> jszip reads the CENTRAL DIRECTORY, so measuring it measures what jszip will
+//     inflate. The invariants below pin both walks to the same records; their reasoning is this case.
 //
-//   .xlsx -> exceljs's streaming reader -> unzipper. Reads nothing of the sort: its parser
-//     dispatches on LOCAL file-header signatures front-to-back (unzipper/lib/parse.js:51) and only
-//     skips PAST central-directory records. So the invariants below do not bind it at all — a local
-//     entry the central directory omits is invisible to this walk and would still be inflated.
-//     What binds it instead is reorderForStreaming: it re-emits the archive from the central
-//     directory, one local header per measured entry and nothing else, so unzipper's walk and this
-//     measurement see the same set by construction. That is why the xlsx handler FAILS when the
-//     rewrite can't be produced rather than falling back to the original bytes — the fallback would
-//     silently drop the budget on the floor.
+//   .xlsx -> exceljs -> unzipper dispatches on LOCAL file-header signatures front-to-back
+//     (unzipper/lib/parse.js:51), only skipping PAST directory records — so the invariants do not
+//     bind it, and a local entry the directory omits would still be inflated unmeasured.
+//     reorderForStreaming binds it instead: it re-emits one local header per measured entry and
+//     nothing else, so both walks see the same set by construction. Hence the xlsx handler FAILS
+//     when the rewrite can't be produced; the original bytes would drop the budget on the floor.
 
 const EOCD_MAGIC = Buffer.from([0x50, 0x4b, 0x05, 0x06]) // End-of-Central-Directory
 const CD_SIG = 0x02014b50 // Central-Directory file header
@@ -729,34 +698,24 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
 /////////////////////////////////////////////////////////////
 // XLSX STREAMING PREFLIGHT (exceljs entry-order workaround)
 //
-// exceljs's streaming reader has two paths for a worksheet entry (workbook-reader.js:110):
+// A worksheet entry reaching exceljs's reader before `this.sharedStrings && this.workbookRels` are
+// both set takes a spool branch (workbook-reader.js:110) that pipes it to a temp file and awaits
+// that with the zip stream paused — violating unzipper's contract ("If you do not intend to consume
+// an entry stream's raw data, call autodrain() ... Otherwise the stream will halt"). It halts, and
+// later entries are never emitted: measured on a 2-sheet workbook, entries dropped in ~34% of reads,
+// and where xl/workbook.xml is also lost the reader throws "Cannot read properties of undefined
+// (reading 'sheets')". Upstream exceljs #2790, #3064, #2147 — all open, none since 4.4.0 (Oct 2023).
 //
-//     if (this.sharedStrings && this.workbookRels) {
-//       yield* this._parseWorksheet(iterateStream(entry), sheetNo)   // inline — correct
-//     } else {
-//       ... tmp.file(...); entry.pipe(tempStream) ...                // spool  — LOSES DATA
-//     }
+// We can't fix their reader, only choose what bytes it reads: ordering both parts ahead of every
+// worksheet keeps it off that branch. Entry bytes are copied still-compressed, so nothing is
+// inflated or recompressed and peak stays ~2x the (already capped) compressed size.
 //
-// The spool branch pipes the entry to a temp file and awaits it while the outer zip stream sits
-// paused. That violates unzipper's documented contract ("If you do not intend to consume an entry
-// stream's raw data, call autodrain() ... Otherwise the stream will halt"), and the zip stream halts
-// early: entries after it are never emitted. Measured on a 2-sheet workbook: entries silently
-// dropped in ~34% of reads, and where xl/workbook.xml is also lost the reader throws
-// "Cannot read properties of undefined (reading 'sheets')". Upstream: exceljs #2790, #3064, #2147 —
-// all open, no release since 4.4.0 (Oct 2023), so there is no version to upgrade to.
-//
-// We can't fix their reader, but we choose what bytes it reads. Both flags are set by entries the
-// reader has already seen, so an archive whose xl/sharedStrings.xml and xl/_rels/workbook.xml.rels
-// precede every worksheet never enters the spool branch at all. This rewrites the entry ORDER to
-// guarantee that. Entry bytes are copied still-compressed, so nothing is inflated or recompressed
-// here and peak stays ~2x the (already capped) compressed size.
-//
-// Verified: 300 reads across 6 workbooks, byte-identical output to workbook.xlsx.load(), zero drops
-// and zero throws — against 0/50 clean on the worst of those workbooks before the reorder.
+// Verified: 300 reads across 6 workbooks, byte-identical to workbook.xlsx.load(), zero drops and
+// zero throws — against 0/50 clean on the worst of them before the reorder.
 
 // Ordered first, so every flag the worksheet branch tests is set before a worksheet is reached.
-// xl/workbook.xml is not one of those flags but leads anyway: it sets this.model, which the same
-// function dereferences for the sheet NAME, and which is what throws when it is missing.
+// xl/workbook.xml is not one of those flags but leads anyway: it sets this.model, dereferenced by
+// the same function for the sheet NAME, and the source of the 'sheets' throw when missing.
 const XLSX_LEADING_ENTRIES = [
     '[Content_Types].xml',
     '_rels/.rels',
@@ -768,17 +727,15 @@ const XLSX_LEADING_ENTRIES = [
 
 // A workbook with no strings has no xl/sharedStrings.xml, so this.sharedStrings is never set and
 // ordering alone cannot lift it out of the spool branch (measured: 35 of 50 reads dropped sheets).
-// Injecting an empty table sets the flag. Never written back to the user — this buffer exists only
-// to be handed to the reader — and an empty table changes no cell, since a workbook that omits the
-// part by definition has no `t="s"` cell to resolve through it.
+// Injecting an empty table sets the flag and changes no cell — a workbook omitting the part has no
+// `t="s"` cell to resolve through it. Handed to the reader only, never written back.
 const EMPTY_SHARED_STRINGS = Buffer.from(
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
         '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>',
     'latin1'
 )
-// CRC32 of the literal above, precomputed. Nothing computes a CRC at runtime: the payload is a
-// fixed constant, so deriving its checksum on every extraction would be work with one possible
-// answer. Pinned by a test that recomputes it, so the two can't drift if the literal is edited.
+// CRC32 of the literal above, precomputed — the payload is fixed, so computing it per extraction
+// would be work with one possible answer. A test recomputes it, so the two can't drift.
 const EMPTY_SHARED_STRINGS_CRC = 0x2949bd0b
 
 const LOCAL_HEADER_BYTES = 30
@@ -786,23 +743,17 @@ const CENTRAL_HEADER_BYTES = 46
 const EOCD_BYTES = 22
 const ZIP_VERSION = 20 // 2.0 — the floor for deflate, which is all we re-emit
 
-// One xl/worksheets/sheetN.xml per worksheet the reader is expected to yield. Counted from the
-// archive rather than from xl/workbook.xml's <sheet> list: that list also names chartsheets, which
-// have no worksheet part and would make a correct read look like it had lost one.
+// One xl/worksheets/sheetN.xml per worksheet the reader should yield. Counted from the archive, not
+// xl/workbook.xml's <sheet> list: that list also names chartsheets, which have no worksheet part and
+// would make a correct read look like it had lost one.
 const WORKSHEET_ENTRY = /^xl\/worksheets\/sheet\d+\.xml$/
 
-// Rebuild the archive with XLSX_LEADING_ENTRIES first, everything else after in its original order,
-// and report how many worksheets it holds so the caller can verify it got them all.
-//
-// Returns undefined when the central directory can't be walked, and the caller MUST fail rather
-// than fall back to the original bytes. That is not caution about a malformed file — it is what
-// keeps the decompression budget binding on this path. unzipper inflates whatever its front-to-back
-// LOCAL-header walk finds; only the archive re-emitted here is guaranteed to hold exactly the
-// entries the budget measured (see DECOMPRESSION BUDGET). Handing back the original buffer would
-// hand unzipper any local entry the central directory omits — unmeasured, and a zip bomb's whole
-// game. No known archive reaches this: every bail below is also a budget rejection, and the one
-// divergence (a name length overrunning the buffer) is caught by the budget's Invariant 2. Failing
-// closed costs nothing today and keeps that from being load-bearing.
+// Rebuild with XLSX_LEADING_ENTRIES first, everything else after in its original order, reporting
+// the worksheet count so the caller can verify it got them all. Returns undefined when the directory
+// can't be walked, and the caller MUST fail rather than fall back to the original bytes (see
+// DECOMPRESSION BUDGET). No known archive reaches this — every bail below is also a budget
+// rejection, and the lone divergence (a name length overrunning the buffer) is caught by Invariant
+// 2 — so failing closed only keeps that from being load-bearing.
 const reorderForStreaming = (buf: Buffer): { content: Buffer; worksheets: number } | undefined => {
     const entries = zipEntries(buf)
     if (!entries) return undefined
@@ -821,11 +772,10 @@ const reorderForStreaming = (buf: Buffer): { content: Buffer; worksheets: number
               },
           ]
 
-    // The EOCD's entry count is a 16-bit field in which 0xffff means "ZIP64, the real count is
-    // elsewhere". zipEntries refuses an archive that already declares it, but the injection above can
-    // carry a 65534-entry archive onto it, and this would then write a sentinel where a count belongs.
-    // Reachable inside MAX_INPUT_BYTES — an entry costs ~76 bytes of headers, so 65534 of them fit in
-    // ~5 MB — so guard rather than reason about it. Fails closed like every other bail here.
+    // The EOCD's entry count is 16-bit, where 0xffff means "ZIP64, the real count is elsewhere".
+    // zipEntries refuses an archive already declaring it, but the injection above can carry a
+    // 65534-entry archive onto it, writing a sentinel where a count belongs. Reachable inside
+    // MAX_INPUT_BYTES: ~76 bytes of headers per entry, so 65534 fit in ~5 MB.
     if (complete.length >= 0xffff) return undefined
 
     const rank = (name: string) => {
@@ -1047,8 +997,8 @@ const errorMessage = (error: unknown): string => (error instanceof Error ? error
 /////////////////////////////////////////////////////////////
 // ENTRY POINT — every step in order, each risky one inside its own safety net.
 
-// A caller's cap may only tighten. Anything absent, non-finite or negative falls back to the
-// ceiling; a fractional value floors (a cap is a whole number of chars).
+// A caller's cap may only tighten: absent or non-finite falls back to the ceiling, negative clamps
+// to 0, fractional floors (a cap is a whole number of chars).
 const resolveCap = (requested?: number): number =>
     requested === undefined || !Number.isFinite(requested)
         ? MAX_OUTPUT_CHARS
@@ -1065,11 +1015,8 @@ export const extractAttachment = async (
     // Resolve empties here so the status doesn't depend on the declared type — otherwise an empty
     // PDF routes into a parser that throws on zero bytes ('failed') while empty text is 'extracted'.
     // All empties are ran-but-empty.
-    // `truncated: false` is stated rather than left off: this is the one 'extracted' return that
-    // never reaches the cap logic below, and every 'extracted' result owes the field. Omitting it
-    // would hand `undefined` to a consumer testing `=== false`, or writing the S3 metadata field
-    // unconditionally, for the most complete extraction there is — nothing was cut because there was
-    // nothing to cut.
+    // `truncated: false` is stated because this is the one 'extracted' return that never reaches the
+    // cap logic below, and omitting it would hand `undefined` to a consumer testing `=== false`.
     if (byteSize === 0) {
         return { status: 'extracted', truncated: false }
     }
@@ -1105,9 +1052,8 @@ export const extractAttachment = async (
                 filename: input.filename,
                 charsetHint,
                 maxOutputChars,
-                // Same budget withTimeout races on, but as a value a handler can actually act on:
-                // the race can't cancel work already inside a parser, whereas a handler that checks
-                // this between units of work stops itself.
+                // The same budget withTimeout races on, as a value a handler can act on: the race
+                // can't cancel work already inside a parser; a handler checking this stops itself.
                 deadline: Date.now() + HANDLER_TIMEOUT_MS,
             }),
             HANDLER_TIMEOUT_MS
@@ -1123,13 +1069,11 @@ export const extractAttachment = async (
                 ? maxOutputChars - 1
                 : maxOutputChars
         const text = overCap ? output.text.slice(0, capEnd) : output.text
-        // Decided on the FINAL text, never the pre-cap text: a tight enough cap slices a non-empty
-        // extraction down to '', and the contract is that `extraction` is omitted entirely rather
-        // than ever being ''.
-        // The handler's own call can only ADD emptiness, never deny it — hence `||`, not `??`. A
-        // handler that computes `empty` before the cap (pdf, from its pre-cap page join) answers
-        // `false` for text this then slices to nothing, and `??` would take that stale `false` and
-        // emit '' — or, with a trailer, a bare trailer with no document text in front of it.
+        // Decided on the FINAL text: a tight enough cap slices a non-empty extraction to '', and the
+        // contract is that `extraction` is omitted rather than ever being ''. `||`, not `??`, because
+        // the handler's call can only ADD emptiness — pdf computes `empty` from its pre-cap page join
+        // and answers `false` for text this then slices away, which `??` would emit as '' (or, with a
+        // trailer, as a bare trailer and no document text).
         const isEmpty = text.trim().length === 0 || (output.empty ?? false)
         // Either signal means the document continues past `text`: the handler stopped itself, or it
         // handed back more than the cap and we cut it.
