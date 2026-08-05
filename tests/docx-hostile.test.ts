@@ -19,11 +19,17 @@ import { extractAttachment, HANDLER_TIMEOUT_MS } from '../attachment'
 // close-tag text as content and descends into elements mammoth drops — silent wrong output, which is
 // the one outcome this library fails over everywhere else.
 //
-// Measured against mammoth on the twelve cases below: eight agree, two we are STRICTER on (a raw
+// Measured against mammoth on the eleven cases below: seven agree, two we are STRICTER on (a raw
 // 0x0B, and the same character as a numeric reference — U+000B is not a legal XML character, and
 // xmldom passed it through where saxes refuses), and two we are MORE AVAILABLE on (trailing junk
 // after the root, and an unclosed root, both of which made mammoth throw away the whole document).
 // Each case below names which.
+//
+// An undeclared namespace prefix is NOT in this file, deliberately. It used to be, asserting
+// `truncated` — but the fixture put the offending element after `</w:document>`, so it was measuring
+// trailing junk under a misleading name and duplicating the case above it. Undeclared prefixes no
+// longer break the parse at all (see the resolvePrefix block in docx-streaming.test.ts), which is
+// what a test measuring the right thing would have said.
 
 const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 const W = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"'
@@ -78,15 +84,24 @@ describe('docx — malformed XML', () => {
         expect(r.truncated).toBe(true)
     })
 
-    // Same policy, cases where mammoth also recovered. The text matches it exactly; what differs is
+    // Same policy, a case where mammoth also recovered. The text matches it exactly; what differs is
     // that we say the document was cut and it did not.
-    it.each([
-        ['an unbound namespace prefix', `${body(para('ok'))}<zz:thing xmlns:nope="x"/>`],
-        ['a mismatched close tag', `<?xml version="1.0"?><w:document ${W}><w:body>${para('one')}</w:zzz></w:body></w:document>`],
-    ])('keeps the text and flags truncated on %s', async (_name, documentXml) => {
-        const r = await extract(documentXml)
+    it('keeps the text and flags truncated on a mismatched close tag', async () => {
+        const r = await extract(
+            `<?xml version="1.0"?><w:document ${W}><w:body>${para('one')}</w:zzz></w:body></w:document>`
+        )
         expect(r.status).toBe('extracted')
         expect(r.truncated).toBe(true)
+    })
+
+    // The degradation the two `failed` cases above only show the worst end of. The same illegal
+    // character, moved off the first text node, costs everything after it and nothing before —
+    // which is what makes "stricter than mammoth" a bounded loss rather than a cliff.
+    it('keeps everything before an illegal character that appears partway through', async () => {
+        const r = await extract(body(`${para('first')}${para('second')}${para(`third${VT}broken`)}${para('fourth')}`))
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(true)
+        expect(r.extraction).toBe('first\n\nsecond\n\n')
     })
 
     // mammoth threw on both of these too, so this is agreement rather than a change.
