@@ -168,7 +168,7 @@ const decodeText = (content: Buffer, hint?: string): string => {
 // HANDLER REGISTRY
 
 // Handlers lazy-load their parsers: a Lambda that only ever sees text never pays to load pdf.js
-// or mammoth.
+// or saxes.
 
 // Text — txt, csv, calendar, vcard, json, xml, yaml
 const textHandler: Handler = {
@@ -284,19 +284,69 @@ const pdfHandler: Handler = {
     },
 }
 
-// DOCX — modern OOXML Word
+// DOCX — modern OOXML Word. Streams word/document.xml; see DOCX STREAMING READER for the machinery,
+// and for why the output contract is mammoth's, reproduced rather than invented.
 const docxHandler: Handler = {
     kind: 'docx',
     contentTypes: ['application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
     extensions: ['.docx'],
-    extract: async ({ content }) => {
-        const { default: mammoth } = await import('mammoth')
-        const { value } = await mammoth.extractRawText({ buffer: content })
-        return { text: value }
+    extract: async ({ content, maxOutputChars, deadline }) => {
+        // Fail closed, as the xlsx handler does on !rewritten. Both bails are unreachable rather
+        // than defensive: an archive whose central directory can't be walked never gets past
+        // checkDecompressionBudget to reach this (Invariant 2 makes budget-ok imply zipEntries-ok
+        // over the same records), and routing pins the second — ooxmlKind only answers 'docx' for an
+        // archive whose directory NAMES word/document.xml. Costs nothing, and keeps neither of those
+        // proofs load-bearing.
+        const entries = zipEntries(content)
+        if (!entries) throw new Error('docx central directory could not be read for streaming')
+        const part = entries.find((entry) => entry.name === DOCX_MAIN_PART)
+        if (!part) throw new Error(`docx archive has no ${DOCX_MAIN_PART} entry`)
+
+        const reader = await createDocxReader()
+        // Decode ACROSS inflate chunks, not per chunk: a 16 KB boundary lands mid-sequence in any
+        // document with a non-ASCII character, and chunk.toString('utf8') would turn that one
+        // character into two U+FFFD. StringDecoder carries the partial bytes forward. (saxes handles
+        // a surrogate pair split across write() calls itself; this is the layer below that.)
+        const { StringDecoder } = await import('node:string_decoder')
+        const decoder = new StringDecoder('utf8')
+
+        let truncated = false
+        try {
+            for await (const chunk of docxMainPartChunks(part)) {
+                // Both guards here, ahead of the work, at one inflate chunk of granularity. Finer
+                // than the pdf per-page and xlsx per-row checks, and the only place a stop is
+                // possible: saxes has no abort, so the way to stop parsing is to stop feeding it.
+                // Per CHUNK rather than per emitted character, for the same reason the xlsx deadline
+                // sits above its empty-row skip — tens of MB of w:pPr/w:rPr markup produces no text
+                // at all, so a cap-only check would never fire on precisely the cheapest loop to
+                // spin. Breaking a `for await` destroys the inflate stream, so the rest of the
+                // document is never decompressed either.
+                if (Date.now() > deadline || reader.chars() > maxOutputChars) {
+                    truncated = true
+                    break
+                }
+                reader.write(decoder.write(chunk))
+            }
+            // Only a read that ran to the end may assert the document ended cleanly.
+            if (!truncated) reader.end(decoder.end())
+        } catch (error) {
+            // saxes is conformant where mammoth's DOM parser recovered, so a document the old reader
+            // read to the end can stop short here. Text already extracted is still text, and the
+            // contract has a word for "the document continues past this point" — so keep it and say
+            // so. Nothing read means nothing to label: that stays a failure, which a caller can see
+            // and retry. What this deliberately does NOT do is install a saxes error handler and
+            // parse on; measured, that emits close-tag text as content and descends into elements
+            // mammoth drops — silent wrong output, the one outcome this file fails over everywhere else.
+            if (reader.text().trim().length === 0) throw error
+            truncated = true
+        }
+
+        // Emptiness is left to the entry point: an empty document is exactly '\n\n', which trims to ''.
+        return { text: reader.text(), truncated }
     },
 }
 
-// DOC — legacy Word 97–2003. mammoth only reads the modern .docx zip, so the OLE binary needs
+// DOC — legacy Word 97–2003. The .docx reader above is an OOXML zip reader, so the OLE binary needs
 // word-extractor instead.
 const docHandler: Handler = {
     kind: 'doc',
@@ -506,17 +556,32 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
 // declared size is attacker-controlled. So measure it: stream-inflate each entry (peak stays ~one
 // zlib chunk), count REAL bytes, abort once the total crosses the cap. Unmeasurable = fail closed.
 //
-// WHICH READER THIS BINDS — the two formats no longer share one:
+// WHICH READER THIS BINDS — since the .docx handler stopped using mammoth, one answer for both
+// formats: OUR OWN zipEntries walk. Neither handler hands the original bytes to a third-party zip
+// reader any more, so there is no foreign directory choice left to second-guess.
 //
-//   .docx -> mammoth -> jszip reads the CENTRAL DIRECTORY, so measuring it measures what jszip will
-//     inflate. The invariants below pin both walks to the same records; their reasoning is this case.
+//   .docx -> zipEntries locates word/document.xml and the handler inflates exactly that region of
+//     exactly this buffer. Nothing else in the archive is decompressed at read time.
 //
 //   .xlsx -> exceljs -> unzipper dispatches on LOCAL file-header signatures front-to-back
-//     (unzipper/lib/parse.js:51), only skipping PAST directory records — so the invariants do not
-//     bind it, and a local entry the directory omits would still be inflated unmeasured.
-//     reorderForStreaming binds it instead: it re-emits one local header per measured entry and
-//     nothing else, so both walks see the same set by construction. Hence the xlsx handler FAILS
-//     when the rewrite can't be produced; the original bytes would drop the budget on the floor.
+//     (unzipper/lib/parse.js:51), only skipping PAST directory records — so a central-directory
+//     measurement would not bind it at all. reorderForStreaming binds it instead: it re-emits one
+//     local header per measured entry and nothing else, so both walks see the same set by
+//     construction. Hence the xlsx handler FAILS when the rewrite can't be produced; the original
+//     bytes would drop the budget on the floor.
+//
+// So the two invariants below no longer exist to keep a foreign reader honest. Invariant 2 has
+// instead become the proof that this measurement and zipEntries can never disagree — now
+// load-bearing for BOTH formats. Invariant 1 is a structural check that no longer prevents anything.
+// See each.
+//
+// STALE, AND KNOWN TO BE: this measures EVERY entry, while the .docx handler now inflates one. On
+// real documents word/document.xml is 2–28% of the archive (a Word template measured 66 KB of 3.1 MB),
+// so a document with ≥50 MB of compressible non-document parts — EMF/WMF vector art, embedded OLE
+// objects — is declined over bytes that would never be read. Narrow: ordinary media is PNG/JPEG,
+// already compressed, so 50 MB of it needs >10 MB of archive and MAX_INPUT_BYTES turns it away
+// first. Left alone deliberately — loosening a zip-bomb gate is a permissiveness change that belongs
+// with the input caps, not smuggled in behind a parser swap.
 
 const EOCD_MAGIC = Buffer.from([0x50, 0x4b, 0x05, 0x06]) // End-of-Central-Directory
 const CD_SIG = 0x02014b50 // Central-Directory file header
@@ -555,11 +620,12 @@ const inflateCounting = (comp: Buffer, runningTotal: number, cap: number): Promi
         inflate.end(comp)
     })
 
-// Pick the EOCD the way jszip (inside mammoth, and so the .docx reader) does: the LAST signature in
-// the buffer, no comment-length check. Matching its choice is the point — measuring a different
-// directory than the parser reads is a bomb-bypass. An invariant here would diverge: jszip
-// follows a second EOCD planted after the real one, so rejecting that leaves the parser inflating a
-// directory we never measured. Bonus: last-match doesn't false-skip zips with bytes after the EOCD.
+// The LAST signature in the buffer, no comment-length check. Chosen originally to match jszip, which
+// read .docx through mammoth: measuring a different directory than the parser reads is a bomb-bypass,
+// and jszip follows a second EOCD planted after the real one. jszip is out of the read path now, so
+// the choice is purely internal — this function is shared by BOTH walks (zipEntries and the budget),
+// so any deterministic pick is self-consistent. Kept as last-match because it still has to agree with
+// unzipper on the .xlsx path, and because it doesn't false-skip zips with bytes after the EOCD.
 const findEocd = (buf: Buffer): number => {
     const eocd = buf.lastIndexOf(EOCD_MAGIC)
     return eocd >= 0 && eocd + 22 <= buf.length ? eocd : -1 // need room for the 22-byte fixed record
@@ -580,10 +646,12 @@ interface ZipEntry {
 // two callers do with that differs, because they ask for different things:
 //   ooxmlKind  — identification, so it degrades to a raw byte scan.
 //   reorderForStreaming — the entry set unzipper will be given, so it refuses and its caller fails.
+//   docxHandler — the entry it will inflate, so it refuses and the handler fails.
 //
-// That second caller makes this walk load-bearing for the .xlsx zip-bomb guard, not merely a lenient
-// identifier: the archive it emits is what makes the budget's measurement bind (see DECOMPRESSION
-// BUDGET). Still deliberately NOT merged with checkDecompressionBudget — that one is the measurement
+// Those last two make this walk load-bearing for the zip-bomb guard on BOTH formats, not merely a
+// lenient identifier: on .xlsx the archive it emits is what makes the budget's measurement bind, and
+// on .docx it is what picks the one region the handler decompresses (see DECOMPRESSION BUDGET).
+// Still deliberately NOT merged with checkDecompressionBudget — that one is the measurement
 // itself, and its two invariants must reject archives this one accepts. Merging would force a single
 // contract onto both. What keeps the split safe is the one-way relation pinned at Invariant 2: this
 // walk can never be the more permissive of the two.
@@ -623,10 +691,10 @@ const zipEntries = (buf: Buffer): ZipEntry[] | undefined => {
 const zipEntryNames = (buf: Buffer): string[] | undefined => zipEntries(buf)?.map((entry) => entry.name)
 
 // Measure a zip's ACTUAL decompressed size, capped, from each entry's real (structural, not
-// self-declared) compressed region. The two invariants below pin us to the records jszip will read
-// — the .docx path; the .xlsx path is bound differently, see the section header. Both assert the
-// FILE is self-consistent rather than mirroring jszip, so neither rots if it changes. Every real
-// archive satisfies them (73 measured, 0 failures).
+// self-declared) compressed region. The two invariants below were written to pin us to the records
+// jszip would read on the old .docx path; jszip is gone, and what they now do is stated at each.
+// Both assert the FILE is self-consistent rather than mirroring any particular reader, which is why
+// neither rotted when the reader changed. Every real archive satisfies them (73 measured, 0 failures).
 const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<DecompressionCheck> => {
     const eocd = findEocd(buf)
     if (eocd < 0) return corrupt('malformed zip: no end-of-central-directory record')
@@ -640,9 +708,13 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
         return declined('zip declares a ZIP64 / out-of-range size')
 
     // Invariant 1: the directory must END exactly where the EOCD begins.
-    // jszip rebases every offset by a positive `eocdPos - (cdOffset + cdSize)` gap — its support for
-    // data prepended ahead of the archive. A nonzero gap aims the two readers at two different
-    // directories, and a bomb planted at the rebased one is one we never measure.
+    // Written when .docx went through jszip, which rebases every offset by a positive
+    // `eocdPos - (cdOffset + cdSize)` gap — its support for data prepended ahead of the archive — so
+    // a nonzero gap aimed the two readers at two different directories and a bomb planted at the
+    // rebased one went unmeasured. Nothing rebases now: zipEntries reads cdOffset raw, exactly as
+    // this does, so a gap can no longer split the walks. Demoted from a bypass guard to a structural
+    // check, and kept because it costs nothing and fails such a file HERE with an accurate message
+    // rather than a few lines down on a local header that doesn't match.
     // Deliberate: that gap is also how a self-extracting archive legitimately carries its stub, so
     // this calls real files malformed. Accepted — an email attachment has no business being one.
     if (cdOffset + cdSize !== eocd)
@@ -682,14 +754,16 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
         p += 46 + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
     }
     // Invariant 2: walking exactly `entries` records must land exactly on the EOCD.
-    // Invariant 1 isn't enough. jszip ignores the declared count, reading headers until the signature
-    // stops matching, and doesn't error when its tally disagrees — so an archive can declare one
-    // entry, store two, and size the directory honestly, hiding a record from this counted walk.
-    // Landing on the EOCD proves none hides: the next bytes are the EOCD signature, so jszip's
-    // signature-driven loop stops exactly where this one did, on the same records.
-    // Doubles as the reason zipEntries can never be the weaker of the two walks: the one bail it has
-    // that this function lacks — a name length running past the buffer — pushes `p` past the EOCD,
-    // which lands here.
+    // This one GAINED a job. Its original reason was jszip, which ignores the declared count and
+    // reads headers until the signature stops matching: an archive could declare one entry, store
+    // two, size the directory honestly, and hide a record from this counted walk. jszip is out of the
+    // read path entirely now — but zipEntries is IN it, for both formats, and this is what pins the
+    // two walks together. They read the same count from the same findEocd and advance by the same
+    // expression, so they visit the same records; zipEntries has exactly ONE bail this function lacks
+    // — a name length running past the buffer — and that bail pushes `p` past the EOCD, which lands
+    // here. That is the whole proof that budget-ok implies zipEntries-ok over the same set. The .docx
+    // handler inflates one of those entries and the .xlsx preflight re-emits all of them; neither can
+    // reach bytes this function did not measure.
     if (p !== eocd)
         return corrupt('malformed zip: central directory holds more records than it declares')
     return { ok: true }
@@ -827,6 +901,297 @@ const reorderForStreaming = (buf: Buffer): { content: Buffer; worksheets: number
         content: Buffer.concat([...locals, directory, end]),
         worksheets: complete.filter((entry) => WORKSHEET_ENTRY.test(entry.name)).length,
     }
+}
+
+/////////////////////////////////////////////////////////////
+// DOCX STREAMING READER (WordprocessingML -> raw text)
+//
+// Reads word/document.xml straight out of the archive with a SAX parser, so the largest live object
+// is one inflate chunk plus the text kept so far — never a DOM. mammoth, which this replaces, built
+// an xmldom tree AND a document model on top of it, then let the central cap throw almost all of it
+// away. Measured through dist/ at a 1024 MB heap on a 45 MB document.xml inside a 3.65 MB archive —
+// every gate cleared, nothing skipped:
+//
+//                       mammoth                     this
+//     concurrency 1     812 ms /  607 MB            68 ms / 175 MB
+//     concurrency 2    1552 ms /  970 MB            59 ms / 164 MB
+//     concurrency 4    3512 ms / 1217 MB            58 ms / 168 MB
+//
+// mammoth built 43,420,044 characters every time and kept 250,000 — 0.6%. Its peak tracks the
+// document and multiplies by concurrency; this one is flat, because the cap now stops the READ
+// rather than trimming the result. The sharpest case isn't even the big archive: a 0.41 MB
+// attachment holding one 43 MB w:t peaked mammoth at 1270 MB, versus 199 MB here.
+//
+// Same failure mode as the .xlsx reader, one format over, and reachable from half a megabyte.
+//
+// THE OUTPUT CONTRACT is mammoth's extractRawText, reproduced deliberately rather than invented
+// (raw-text.js is 13 lines): w:t text verbatim, w:tab -> '\t', a paragraph's children then TWO
+// newlines, everything else its children only. Nothing is trimmed, so a document ends with '\n\n'.
+//
+// THE SHAPE is a WHITELIST, mirroring body-reader.js:46-57 — an element mammoth has no handler for
+// has its ENTIRE SUBTREE dropped rather than recursed into, and bare text outside a w:t is dropped
+// too. So the tables below are what we KEEP; anything absent disappears with its children. That is
+// the load-bearing decision: "emit every w:t, newline on </w:p>" over-extracts on any document with
+// a text box or a field. It also DELETES work rather than adding it —
+//   - mammoth's 20-entry ignore list (w:pPr, w:rPr, w:sectPr, w:proofErr, w:tblGrid, ...) has no
+//     counterpart here. It exists only to suppress a warning; for raw text "deliberately ignored"
+//     and "unrecognised" produce the identical empty result, and the default already IS that result.
+//   - every emit-nothing leaf mammoth spells out (w:br, w:cr, w:fldChar, w:instrText,
+//     w:footnoteReference, w:bookmarkStart) is likewise just the default.
+//   - w:sdt keeping only w:sdtContent, and mc:AlternateContent keeping only mc:Fallback, fall out
+//     for free: w:sdtPr and mc:Choice simply aren't on the list.
+//
+// Fidelity is pinned by tests/docx-fidelity.test.ts against mammoth itself over a real Word corpus.
+// The deliberate divergences are listed at DOCX_CONTAINERS.
+
+const DOCX_MAIN_PART = 'word/document.xml'
+
+// Namespace URI -> the prefix mammoth's element names carry (office-xml-reader.js:10-36). Matching a
+// literal `w:` prefix instead would be a shippable bug three times over: the ISO-strict format binds
+// w to a different URI (mammoth's own corpus carries strict-format.docx), a producer may bind
+// wordprocessingml as the DEFAULT namespace — giving <document>/<body>/<p> with no prefix at all —
+// and a producer may pick any prefix it likes. Only these four URIs are ever matched; mammoth's
+// other eleven mappings feed its HTML converter and its ignore list, neither of which survives here.
+const OOXML_PREFIXES: Record<string, string> = {
+    'http://schemas.openxmlformats.org/wordprocessingml/2006/main': 'w', // transitional
+    'http://purl.oclc.org/ooxml/wordprocessingml/main': 'w', // ISO strict
+    'http://schemas.openxmlformats.org/markup-compatibility/2006': 'mc',
+    'urn:schemas-microsoft-com:vml': 'v',
+}
+
+// Pre-bound so an undeclared prefix doesn't end the parse. saxes is stricter than the DOM parser
+// this replaces and fails with `unbound namespace prefix` where xmldom shrugs, and real producers do
+// emit stray o:/w10:/wne:/wps: markup without declaring it. Binding them up front costs nothing —
+// the elements are dropped either way, only the throw is avoided — and it converts the likeliest
+// strictness regression into a non-event. Verified: an in-document xmlns still shadows these, so a
+// strict-format file resolves to the strict URI and routes correctly.
+const OOXML_ASSUMED_PREFIXES: Record<string, string> = {
+    w: 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
+    mc: 'http://schemas.openxmlformats.org/markup-compatibility/2006',
+    v: 'urn:schemas-microsoft-com:vml',
+    o: 'urn:schemas-microsoft-com:office:office',
+    w10: 'urn:schemas-microsoft-com:office:word',
+    r: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+    wp: 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
+    a: 'http://schemas.openxmlformats.org/drawingml/2006/main',
+    pic: 'http://schemas.openxmlformats.org/drawingml/2006/picture',
+    wps: 'http://schemas.microsoft.com/office/word/2010/wordprocessingShape',
+    w14: 'http://schemas.microsoft.com/office/word/2010/wordml',
+}
+
+// Recurse into these; emit nothing of their own. Absent from the list = subtree dropped.
+const DOCX_CONTAINERS = new Set([
+    'w:document',
+    'w:body',
+    'w:r',
+    'w:hyperlink',
+    'w:ins',
+    'w:smartTag',
+    'w:tbl',
+    'w:tr',
+    'w:tc',
+    'w:sdt', // w:sdtPr isn't here, which is the whole of mammoth's firstOrEmpty("w:sdtContent")
+    'w:sdtContent',
+    'mc:AlternateContent',
+    'mc:Fallback', // likewise mc:Choice: dropped by omission
+    'w:object',
+    'w:drawing',
+    'w:txbxContent',
+    'v:group',
+    'v:rect',
+    'v:roundrect',
+    'v:shape',
+    'v:textbox',
+])
+// Deliberately NOT here, each matching mammoth:
+//   wp:inline / wp:anchor — mammoth's readDrawingElement digs for a:blip images and never reads
+//     arbitrary children, so the DrawingML text-box path (wps:txbx) yields nothing. Text boxes reach
+//     us through the VML fallback above, which is the branch mc:Fallback selects anyway.
+//   v:imagedata, v:shapetype, v:shadow — images and shape defs; no text either way.
+//   w:fldSimple, w:delText, w:ruby — mammoth DROPS these with their children. w:delText is right
+//     (deleted text does not belong in an extract); w:fldSimple and w:ruby are real text loss in
+//     mammoth, replicated on purpose so this change stays a pure port. Recovering them is one array
+//     entry each, deliberately left to its own change once the corpus says how often they matter.
+//
+// Deviations from mammoth, all four in tests/docx-fidelity.test.ts's ACCEPTED_DIVERGENCES if they
+// ever show up on a real document: a w:sdt carrying wordml:checkbox has its first text character
+// REPLACED by a checkbox node in mammoth (we keep the character — strictly better, and costs nothing
+// here); w:sym needs mammoth's dingbat-to-unicode table to map (we drop it, and it is the only
+// element that would make this reader read an attribute at all); a w:t holding a comment or a nested
+// element makes mammoth's text() throw "Not implemented" (we extract); and the main part is read at
+// its conventional path rather than resolved through _rels/.rels, which routing already requires.
+
+// Emit a literal, then drop any children — mammoth's handlers for these ignore children entirely.
+const DOCX_LITERALS: Record<string, string> = {
+    'w:tab': '\t',
+    'w:noBreakHyphen': '\u2011',
+    'w:softHyphen': '\u00ad',
+}
+
+// xmldom normalised these to '\n' before mammoth ever saw the markup (dom-parser.js:34-38). saxes
+// does the XML-standard \r\n and \r itself — correctly, across chunk boundaries — but leaves NEL and
+// LINE SEPARATOR alone. Both are single characters, so matching xmldom on the way out needs no
+// cross-chunk state, unlike normalising the raw markup would.
+const XML_EXTRA_SEPARATORS = /[\u0085\u2028]/g
+
+// The two <w:del> markers that change what an ANCESTOR emits, so they have to be spotted even though
+// they sit inside an already-dropped w:pPr / w:trPr subtree. ECMA-376 17.13.5.15 (deleted paragraph
+// mark: the mark is gone, so the paragraph merges into the next one) and 17.13.5.12 (deleted table
+// row: the whole row goes).
+const PARAGRAPH_DELETED = ['w:p', 'w:pPr', 'w:rPr', 'w:del']
+const ROW_DELETED = ['w:tr', 'w:trPr', 'w:del']
+
+const endsWith = (stack: string[], path: string[]): boolean =>
+    path.every((name, i) => stack[stack.length - path.length + i] === name)
+
+// A paragraph's own text, and the text hoisted out of any w:pict inside it. mammoth returns a
+// (value, extra) pair from every element it reads: w:pict moves its whole result into `extra`
+// (body-reader.js:439 .toExtra()), extras bubble up through every container, and only w:p reinserts
+// them — as a SIBLING AFTER the paragraph (:296 .insertExtra()). So VML text-box text lands after
+// the paragraph's '\n\n' rather than glued into the middle of it, and an extra that never reaches a
+// w:p is silently lost. Two string fields per open w:p / w:pict reproduce all of that.
+interface DocxFrame {
+    value: string
+    extra: string
+}
+
+interface DocxReader {
+    write: (chunk: string) => void // one decoded slice of document.xml; THROWS on malformed XML
+    chars: () => number // characters emitted so far — what the handler's cap check reads
+    end: (tail: string) => void // flush, close, and run the end-of-document checks
+    text: () => string // the text, complete or partial
+}
+
+const createDocxReader = async (): Promise<DocxReader> => {
+    // Lazy like every other parser here: a Lambda that only ever sees text never loads saxes.
+    const { SaxesParser } = await import('saxes')
+
+    const stack: string[] = [] // qualified names of every open element, innermost last
+    const frames: DocxFrame[] = [{ value: '', extra: '' }] // index 0 is the document; extras reaching it are lost
+    const deleted: boolean[] = [false] // one flag per open w:p; index 0 pairs with the root frame
+    let top = frames[frames.length - 1]
+    let skip = -1 // stack index where the dropped subtree began, or -1 when we're reading
+    let rowDeleted = false // a w:trPr said its row is deleted; act on it once that w:trPr closes
+    let sawBody = false
+    let chars = 0
+
+    const emit = (text: string): void => {
+        top.value += text
+        chars += text.length
+    }
+
+    const parser = new SaxesParser({ xmlns: true, additionalNamespaces: OOXML_ASSUMED_PREFIXES })
+
+    parser.on('opentag', (tag) => {
+        // A direct port of mammoth's convertName (xml/reader.js:53-66): mapped URI -> `w:t`,
+        // unmapped -> `{uri}local`, no namespace -> the bare local name. Only the first form can
+        // match a table, so the other two exist to guarantee a miss — but they keep the stack
+        // readable in a debugger, and they are what makes an unmapped namespace fail closed.
+        const uri = tag.uri ?? ''
+        const prefix = OOXML_PREFIXES[uri]
+        const name = uri === '' ? tag.local : prefix === undefined ? `{${uri}}${tag.local}` : `${prefix}:${tag.local}`
+        stack.push(name)
+
+        if (skip >= 0) {
+            // Inside a dropped subtree nothing is emitted, and only the two ancestor-affecting
+            // markers are still looked for. The `skip ===` tests prove the marker really sits in the
+            // properties element of a LIVE w:p / w:tr — i.e. that the drop began at that w:pPr /
+            // w:trPr — rather than somewhere deeper in unrelated debris.
+            if (name === 'w:del') {
+                if (skip === stack.length - 3 && endsWith(stack, PARAGRAPH_DELETED)) deleted[deleted.length - 1] = true
+                else if (skip === stack.length - 2 && endsWith(stack, ROW_DELETED)) rowDeleted = true
+            }
+            return
+        }
+
+        // w:t is the ONE text-bearing element; the text handler recognizes it off the stack top, so
+        // it needs no flag of its own. Deliberately before the container test, so its children —
+        // illegal anyway — fall through to the drop below exactly as they do in mammoth.
+        if (name === 'w:t') return
+
+        if (name === 'w:p' || name === 'w:pict') {
+            top = { value: '', extra: '' }
+            frames.push(top)
+            if (name === 'w:p') deleted.push(false)
+            return
+        }
+        if (DOCX_CONTAINERS.has(name)) {
+            if (name === 'w:body') sawBody = true
+            return
+        }
+        const literal = DOCX_LITERALS[name]
+        if (literal !== undefined) emit(literal)
+        // The whitelist default: this element and everything under it is gone.
+        skip = stack.length - 1
+    })
+
+    parser.on('text', (text) => {
+        if (skip < 0 && stack[stack.length - 1] === 'w:t') emit(text.replace(XML_EXTRA_SEPARATORS, '\n'))
+    })
+
+    parser.on('closetag', () => {
+        const name = stack.pop()
+
+        if (skip >= 0) {
+            if (stack.length !== skip) return // still inside the dropped subtree
+            skip = -1
+            // A deleted row's properties have just closed; drop the rest of the row with them.
+            if (rowDeleted && name === 'w:trPr') {
+                rowDeleted = false
+                skip = stack.length - 1
+            }
+            return
+        }
+
+        if (name !== 'w:p' && name !== 'w:pict') return
+        const frame = top
+        frames.pop()
+        top = frames[frames.length - 1]
+        if (name === 'w:pict') {
+            // Hoist: the picture's own text becomes the parent's `extra`, behind any extra it
+            // already carried. It reaches the output only if some ancestor w:p reinserts it.
+            top.extra += frame.extra + frame.value
+        } else if (deleted.pop()) {
+            // The paragraph mark was deleted, so there is no paragraph break here: this text runs
+            // straight into the next paragraph. mammoth re-reads the stashed children in the next
+            // paragraph's context and lands on the same string; suppressing the tail is the
+            // streaming form of that, and is equivalent because this reader is context-free.
+            top.value += frame.value
+            top.extra += frame.extra
+        } else {
+            top.value += `${frame.value}\n\n${frame.extra}`
+            chars += 2
+        }
+    })
+
+    return {
+        write: (chunk) => void parser.write(chunk),
+        chars: () => chars,
+        end: (tail) => {
+            parser.write(tail).close() // close() is the well-formedness check: it throws on an unclosed element
+            // mammoth throws "Could not find the body element: are you sure this is a docx file?"
+            // here — for a foreign root AND for a w:document with no w:body, both verified. Keeping
+            // it means a zip whose main part is not WordprocessingML stays a labeled failure instead
+            // of becoming an 'extracted' with no text.
+            if (!sawBody) throw new Error('docx main part has no w:body element')
+        },
+        // Frames above the root are only still open on the truncated path; concatenating every
+        // frame's `value` in order is exactly the partial text in document order, so a document that
+        // is one enormous paragraph still returns what was read instead of ''. On the complete path
+        // there is only the root frame and this is just frames[0].value. Pending `extra` is dropped
+        // either way — mammoth's own behaviour for an extra that never reaches a w:p.
+        text: () => frames.reduce((text, frame) => text + frame.value, ''),
+    }
+}
+
+// One shape for both storage methods, so the handler's loop has a single form. Method 0 is its own
+// single chunk (bounded by MAX_INPUT_BYTES, and no real producer stores document.xml); method 8
+// yields a chunk at a time under backpressure, which is what keeps peak memory flat.
+const docxMainPartChunks = (part: ZipEntry): AsyncIterable<Buffer> | Iterable<Buffer> => {
+    if (part.method === 0) return [part.data]
+    const inflate = zlib.createInflateRaw()
+    inflate.end(part.data) // pushes the compressed bytes; the readable side inflates only on demand
+    return inflate
 }
 
 /////////////////////////////////////////////////////////////
@@ -1035,8 +1400,8 @@ export const extractAttachment = async (
         return { status: 'skipped', reason: type ? `unsupported type ${type}` : 'unrecognized attachment' }
     }
 
-    // Zip bombs: measure the real decompressed size before exceljs/mammoth touch the bytes. The
-    // preflight also decides which refusal this is — over budget skips, malformed fails.
+    // Zip bombs: measure the real decompressed size before either OOXML handler inflates anything.
+    // The preflight also decides which refusal this is — over budget skips, malformed fails.
     // (pdf/doc/text aren't zips.)
     if (kind === 'docx' || kind === 'xlsx') {
         const check = await checkDecompressionBudget(input.content, MAX_UNCOMPRESSED_BYTES)
@@ -1060,9 +1425,10 @@ export const extractAttachment = async (
         )
         // Central cap, so a pathological document can't dump megabytes into S3 and the search index.
         // Handlers that build incrementally overshoot by one unit, so for them this is the final
-        // precise trim; docx and html return a full string, so for those it's POST-materialization —
-        // peak memory follows the whole document, and hard containment is the host memory limit
-        // (see README). Don't split a surrogate pair at the boundary: a lone half serializes as U+FFFD.
+        // precise trim; html alone still returns a full string, so for that one it's
+        // POST-materialization — peak memory follows the whole document, and hard containment is the
+        // host memory limit (see README). Don't split a surrogate pair at the boundary: a lone half
+        // serializes as U+FFFD.
         const overCap = output.text.length > maxOutputChars
         const capEnd =
             overCap && output.text.charCodeAt(maxOutputChars - 1) >= 0xd800 && output.text.charCodeAt(maxOutputChars - 1) <= 0xdbff
