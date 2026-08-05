@@ -57,7 +57,7 @@ const result = await extractAttachment({
 // result.truncated === false
 ```
 
-The heavy parsers (`unpdf`, `mammoth`, `exceljs`, …) are lazy-loaded per handler, so importing
+The heavy parsers (`unpdf`, `exceljs`, `saxes`, …) are lazy-loaded per handler, so importing
 `extractAttachment` costs nothing until you actually call it on a matching attachment. It's also
 available on its own subpath — `import { extractAttachment } from 'agentextract/attachment'` — if
 you want to reach it without touching the body-extraction entry point.
@@ -90,15 +90,41 @@ guards reduce blast radius; they are **not** a sandbox.
   or ZIP64 metadata is treated as over-budget (fail-closed), not trusted.
 - **Output** — extracted text is capped at `MAX_OUTPUT_CHARS` (250k), or lower via `maxOutputChars`.
   Cutting sets `truncated` on the result, so a partial extraction is never mistaken for a complete
-  one. The PDF and `.xlsx` handlers apply the cap **incrementally** as they build — and stop reading
-  the document once they reach it — so neither ever materializes in full. The `.docx` (mammoth) and
-  HTML (html-to-text) handlers return a complete string that is then trimmed, so for those the cap is
+  one. The PDF, `.docx` and `.xlsx` handlers apply the cap **incrementally** as they build — and stop
+  reading the document once they reach it — so none of them ever materializes in full. Only the HTML
+  handler (html-to-text) returns a complete string that is then trimmed, so for that one the cap is
   **post-materialization** and peak memory follows the whole document.
 - **Timeout** — `HANDLER_TIMEOUT_MS` (10 s) stops *awaiting* a slow async parse. It cannot cancel
   synchronous CPU already running inside a parser, so handlers that yield between units of work (PDF
-  per page, `.xlsx` per row) also check the deadline themselves and stop; the others cannot.
+  per page, `.docx` per inflate chunk, `.xlsx` per row) also check the deadline themselves and return
+  what they have with `truncated` set. The HTML, `.doc` and text handlers cannot.
 - **PDF** — page count and accumulated output are bounded (`MAX_PDF_PAGES`, `MAX_OUTPUT_CHARS`), but
   pdf.js's internal per-page decompression is **not** bounded in-library (no hook exists).
+- **`.docx`** — `word/document.xml` is located in the archive's central directory, inflated on its
+  own, and read with a streaming SAX parser (`saxes`) rather than loaded into a DOM. Peak memory
+  therefore tracks one inflate chunk plus the text kept so far, independent of document size.
+  Measured at a 1024 MB heap on a 45 MB `document.xml` inside a 3.65 MB archive, against the previous
+  DOM-based reader:
+
+  | concurrency | before | after |
+  |---|---|---|
+  | 1 | 812 ms / 607 MB | **68 ms / 175 MB** |
+  | 2 | 1552 ms / 970 MB | **59 ms / 164 MB** |
+  | 4 | 3512 ms / 1217 MB | **58 ms / 168 MB** |
+
+  The old reader built 43.4M characters and kept 250k. The sharpest case is not the large archive: a
+  0.41 MB attachment holding one 43 MB `<w:t>` peaked the old reader at 1270 MB, against 199 MB here.
+  Two residual bounds, stated rather than glossed: peak is not independent of *input* size (the API
+  takes a `Buffer`), and `saxes` buffers one text node whole, so a single enormous run still costs
+  about twice its own size. Malformed XML is also stricter than before — a document the old reader
+  silently half-read now comes back either `truncated` or `failed`.
+- **`.docx` scope** — text comes from `word/document.xml` only. **Footnote, endnote and comment
+  bodies are not extracted** (they are separate zip parts), and neither are headers or footers.
+  **Table structure is not preserved**: each cell's paragraphs are emitted in reading order with the
+  same blank-line separator as body paragraphs, so a 2×2 table is indistinguishable from four
+  consecutive paragraphs. List bullets and numbers are dropped; the item text remains. All of this
+  matches the previous reader exactly — it is a documented limit, not a regression — but a consumer
+  reading an invoice or a contract should know the column a figure sat in is gone.
 - **`.xlsx`** — read row-by-row through `exceljs`'s streaming reader rather than loaded whole, so
   peak memory tracks the shared-string table plus one row instead of a live object per cell
   (measured: 294 MB → 171 MB, and 3.7x faster, on a 5 MB / 38 MB-uncompressed workbook). It is not
