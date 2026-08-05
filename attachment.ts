@@ -959,24 +959,31 @@ const OOXML_PREFIXES: Record<string, string> = {
     'urn:schemas-microsoft-com:vml': 'v',
 }
 
-// Pre-bound so an undeclared prefix doesn't end the parse. saxes is stricter than the DOM parser
-// this replaces and fails with `unbound namespace prefix` where xmldom shrugs, and real producers do
-// emit stray o:/w10:/wne:/wps: markup without declaring it. Binding them up front costs nothing —
-// the elements are dropped either way, only the throw is avoided — and it converts the likeliest
-// strictness regression into a non-event. Verified: an in-document xmlns still shadows these, so a
-// strict-format file resolves to the strict URI and routes correctly.
+// Any prefix that reaches saxes undeclared resolves HERE, and this URI is deliberately absent from
+// OOXML_PREFIXES — so the element names `{urn:agentextract:unbound}local`, misses the whitelist, and
+// its subtree is dropped. Which is precisely what mammoth does with an unmapped namespace
+// (xml/reader.js:53-66 emits the same `{uri}local` shape, and no handler matches it).
+//
+// It exists because saxes fails the whole parse on an unbound prefix — for ATTRIBUTES too
+// (saxes.js:1920-1925) — where xmldom shrugged. That is not a rare shape: Word 2013 and later stamp
+// w15:paraId on EVERY w:p, and w16cid:durableId alongside it, so a document that carries those
+// without their xmlns (a fragment assembled by a templating tool, a repaired file) used to lose
+// everything after its first paragraph. An allowlist cannot close that — there is always another
+// prefix — so this resolves the open class instead, and the map below shrinks to the only entries
+// that do something an allowlist has to do.
+const UNBOUND_NAMESPACE = 'urn:agentextract:unbound'
+
+// The three prefixes where GUESSING is better than dropping, because these are the only URIs
+// OOXML_PREFIXES maps: an undeclared `w:` resolved to the sentinel above would take the whole
+// document body with it. Every other prefix a real document leaves undeclared — o:, w10:, wne:, r:,
+// wp:, a:, pic:, wps:, w14: — resolves to a URI this reader does not map either way, so guessing it
+// and sentinelling it are the same outcome, and the sentinel needs no maintenance.
+// An in-document xmlns still shadows these (saxes.resolve checks scope first, then this map, then
+// the sentinel), so a strict-format file resolves to the strict URI and routes correctly.
 const OOXML_ASSUMED_PREFIXES: Record<string, string> = {
     w: 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
     mc: 'http://schemas.openxmlformats.org/markup-compatibility/2006',
     v: 'urn:schemas-microsoft-com:vml',
-    o: 'urn:schemas-microsoft-com:office:office',
-    w10: 'urn:schemas-microsoft-com:office:word',
-    r: 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
-    wp: 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
-    a: 'http://schemas.openxmlformats.org/drawingml/2006/main',
-    pic: 'http://schemas.openxmlformats.org/drawingml/2006/picture',
-    wps: 'http://schemas.microsoft.com/office/word/2010/wordprocessingShape',
-    w14: 'http://schemas.microsoft.com/office/word/2010/wordml',
 }
 
 // Recurse into these; emit nothing of their own. Absent from the list = subtree dropped.
@@ -1080,7 +1087,14 @@ const createDocxReader = async (): Promise<DocxReader> => {
         chars += text.length
     }
 
-    const parser = new SaxesParser({ xmlns: true, additionalNamespaces: OOXML_ASSUMED_PREFIXES })
+    const parser = new SaxesParser({
+        xmlns: true,
+        additionalNamespaces: OOXML_ASSUMED_PREFIXES,
+        // Consulted only after scope and the map above (saxes.js:1845-1862), so this catches exactly
+        // the prefixes nothing else claimed, and turns "unbound prefix" from a fatal parse error into
+        // an unmapped namespace — which this reader already knows how to drop.
+        resolvePrefix: () => UNBOUND_NAMESPACE,
+    })
 
     parser.on('opentag', (tag) => {
         // A direct port of mammoth's convertName (xml/reader.js:53-66): mapped URI -> `w:t`,

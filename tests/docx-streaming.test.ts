@@ -273,6 +273,62 @@ describe('docx — leaf and character contract', () => {
     })
 })
 
+// Undeclared namespace prefixes. saxes fails the whole parse on one — for ATTRIBUTES as well as
+// elements — where the DOM parser this replaced shrugged. Under the error policy that turns into
+// `extracted` + `truncated`, i.e. everything after the offending element is silently gone. These are
+// not exotic: Word 2013 and later stamp w15:paraId on EVERY w:p, with w16cid:durableId beside it, so
+// a document carrying those without their xmlns loses everything after its first paragraph.
+//
+// An allowlist of known prefixes cannot close that — there is always another prefix, and the first
+// version of this reader proved the point by naming wne: in a comment while omitting it from the
+// map. resolvePrefix closes the open class instead: anything unclaimed resolves to a sentinel URI
+// that OOXML_PREFIXES does not map, which is exactly the shape mammoth gives an unmapped namespace.
+describe('docx — an undeclared prefix must not end the parse', () => {
+    const withAttr = (attr: string) =>
+        `${text('before')}<w:p ${attr}><w:r><w:t>middle</w:t></w:r></w:p>${text('after')}`
+
+    // Attributes, which is the common case and the one that reads as impossible until you hit it:
+    // the element is perfectly well-formed WordprocessingML and only its attribute is unbound.
+    it.each([
+        ['w15:paraId', 'w15:paraId="12AB34CD"'],
+        ['w16cid:durableId', 'w16cid:durableId="99"'],
+        ['a prefix no allowlist would think to carry', 'zz:whatever="1"'],
+    ])('reads the whole document despite an undeclared %s attribute', async (_name, attr) => {
+        const r = await extract(withAttr(attr))
+        expect(r.extraction).toBe('before\n\nmiddle\n\nafter\n\n')
+        expect(r.truncated).toBe(false)
+    })
+
+    // Elements, where the prefix being unmapped must still mean "drop this subtree" — the fix must
+    // not turn an unknown namespace into a recursed-into container.
+    it('drops an undeclared-prefix element with its children, and keeps reading after it', async () => {
+        const r = await extract(`${text('before')}<zz:wrap>${text('hidden')}</zz:wrap>${text('after')}`)
+        expect(r.extraction).toBe('before\n\nafter\n\n')
+        expect(r.truncated).toBe(false)
+    })
+
+    // Why the assumed-prefix map still has to exist alongside the sentinel: `w` is one of the three
+    // prefixes OOXML_PREFIXES actually maps, so resolving an undeclared one to the sentinel would
+    // drop the entire document body. mammoth throws outright on this document; we recover it.
+    it('still recovers a document that does not declare w: at all', async () => {
+        const content = await docxFrom(
+            `<?xml version="1.0"?><w:document><w:body>${text('recovered')}</w:body></w:document>`
+        )
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        expect(r.extraction).toBe('recovered\n\n')
+    })
+
+    // ...and the assumed map must never win over a real declaration, or a strict-format document
+    // would be read against the transitional URI.
+    it('lets an in-document xmlns shadow the assumed prefix', async () => {
+        const content = await docxFrom(
+            `<?xml version="1.0"?><w:document xmlns:w="http://purl.oclc.org/ooxml/wordprocessingml/main"><w:body>${text('strict')}</w:body></w:document>`
+        )
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        expect(r.extraction).toBe('strict\n\n')
+    })
+})
+
 describe('docx — the cap and the deadline stop the read', () => {
     // Long enough to cross the default cap, with a marker last so "did it stop reading" is
     // observable from outside rather than inferred from a length.
