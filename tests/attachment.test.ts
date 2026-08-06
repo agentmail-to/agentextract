@@ -1976,6 +1976,192 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
             else expect(r.reason).toMatch(/yielded \d+ of 3 worksheets/)
         }
     })
+
+    // MEMBERSHIP is the archive's, not the workbook's. The workbook still declares three sheets here
+    // — only the relationship placing one of them is gone — so dropping that part would DELETE its
+    // text, and invisibly: the backstop compares `seen` against the resolved list, so removing a
+    // sheet from both sides keeps them equal and it never fires. This is the same hazard the
+    // lost-worksheet backstop exists for, reached from the other end.
+    it('keeps a declared sheet whose relationship cannot be resolved', async () => {
+        const brokenRel = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', xml.replace(/<Relationship[^>]*sheet2\.xml"[^>]*\/>/, ''))
+        })
+
+        const r = await extractAttachment({ content: brokenRel, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        // Named S1/S3 where the workbook could say so, and the unplaceable one kept under the
+        // fallback name — it loses its tab position, which is unknowable, but never its rows.
+        expect(headers(r.extraction)).toHaveLength(3)
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // Targets are URI references, so this spelling is legal and names sheet2.xml. Undecoded it
+    // resolves to nothing, which before the membership fix silently deleted the sheet.
+    it('resolves a percent-encoded rel Target', async () => {
+        const encoded = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', xml.replace('worksheets/sheet2.xml', 'worksheets/sheet%32.xml'))
+        })
+
+        const r = await extractAttachment({ content: encoded, contentType: XLSX_TYPE })
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+        expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
+    })
+})
+
+// The rebuild vs the decompression budget --------------------------------------
+// The budget measures each central-directory record once, then reorderForStreaming decides what
+// unzipper actually gets. That only binds if the rebuild can never write a measured entry more than
+// once — and zip permits duplicate entry names, so resolving layout through a name lookup collapsed
+// every reference onto the first entry carrying that name and re-emitted its bytes per reference.
+// Measured at 21x on a 111 KB input: 1.5 MB budgeted, 31.5 MB rebuilt. Scaled inside the existing
+// gates that is a 5 MB attachment forcing a 0.8 GB allocation, which is an OOM the API side cannot
+// contain — not a JS throw, so its per-attachment catch never sees it.
+
+describe('attachment — the rebuild cannot amplify what the budget measured', () => {
+    const CRC_TABLE = (() => {
+        const table: number[] = []
+        for (let n = 0; n < 256; n++) {
+            let c = n
+            for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+            table[n] = c >>> 0
+        }
+        return table
+    })()
+    const crc32 = (buf: Buffer) => {
+        let c = 0xffffffff
+        for (const byte of buf) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8)
+        return (c ^ 0xffffffff) >>> 0
+    }
+
+    // Hand-built, because JSZip dedupes by name and duplicate names are the whole point.
+    const buildZip = (files: { name: string; data: Buffer }[]) => {
+        const locals: Buffer[] = []
+        const centrals: Buffer[] = []
+        let offset = 0
+        for (const file of files) {
+            const name = Buffer.from(file.name, 'latin1')
+            const deflated = zlib.deflateRawSync(file.data)
+            const local = Buffer.alloc(30)
+            local.writeUInt32LE(0x04034b50, 0)
+            local.writeUInt16LE(20, 4)
+            local.writeUInt16LE(8, 8)
+            local.writeUInt32LE(crc32(file.data), 14)
+            local.writeUInt32LE(deflated.length, 18)
+            local.writeUInt32LE(file.data.length, 22)
+            local.writeUInt16LE(name.length, 26)
+            locals.push(local, name, deflated)
+            const central = Buffer.alloc(46)
+            central.writeUInt32LE(0x02014b50, 0)
+            central.writeUInt16LE(20, 4)
+            central.writeUInt16LE(20, 6)
+            central.writeUInt16LE(8, 10)
+            central.writeUInt32LE(crc32(file.data), 16)
+            central.writeUInt32LE(deflated.length, 20)
+            central.writeUInt32LE(file.data.length, 24)
+            central.writeUInt16LE(name.length, 28)
+            central.writeUInt32LE(offset, 42)
+            centrals.push(central, name)
+            offset += 30 + name.length + deflated.length
+        }
+        const directory = Buffer.concat(centrals)
+        const end = Buffer.alloc(22)
+        end.writeUInt32LE(0x06054b50, 0)
+        end.writeUInt16LE(files.length, 8)
+        end.writeUInt16LE(files.length, 10)
+        end.writeUInt32LE(directory.length, 12)
+        end.writeUInt32LE(offset, 16)
+        return Buffer.concat([...locals, directory, end])
+    }
+
+    // What checkDecompressionBudget counts: every central-directory record's uncompressed size, once.
+    const budgetMeasures = (buf: Buffer) => {
+        const eocd = buf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]))
+        let p = buf.readUInt32LE(eocd + 16)
+        let total = 0
+        for (let i = buf.readUInt16LE(eocd + 10); i > 0; i--) {
+            total += buf.readUInt32LE(p + 24)
+            p += 46 + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
+        }
+        return total
+    }
+
+    // What unzipper would actually expand: every LOCAL record of the rebuilt archive.
+    const rebuildInflatesTo = (buf: Buffer) => {
+        let p = 0
+        let total = 0
+        while (p + 30 <= buf.length && buf.readUInt32LE(p) === 0x04034b50) {
+            const method = buf.readUInt16LE(p + 8)
+            const compSize = buf.readUInt32LE(p + 18)
+            const start = p + 30 + buf.readUInt16LE(p + 26) + buf.readUInt16LE(p + 28)
+            total += method === 0 ? compSize : zlib.inflateRawSync(buf.subarray(start, start + compSize)).length
+            p = start + compSize
+        }
+        return total
+    }
+
+    it('writes each measured entry at most once, even when many entries share a name', async () => {
+        const DUPLICATES = 20
+        const rows = Array.from(
+            { length: 20_000 },
+            (_, r) => `<row r="${r + 1}"><c t="inlineStr"><is><t>padding cell ${r}</t></is></c></row>`
+        ).join('')
+        const sheetXml = (body: string) =>
+            Buffer.from(
+                `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${body}</worksheet>`,
+                'latin1'
+            )
+        // One heavy entry and 20 trivial ones, ALL named xl/worksheets/sheet1.xml. No rels part, so
+        // resolution takes the archive fallback — the path that used to map all 21 onto the heavy one.
+        const content = buildZip([
+            { name: '[Content_Types].xml', data: Buffer.from('<Types/>', 'latin1') },
+            {
+                name: 'xl/workbook.xml',
+                data: Buffer.from('<workbook><sheets><sheet name="A" sheetId="1" r:id="rId1"/></sheets></workbook>', 'latin1'),
+            },
+            { name: 'xl/worksheets/sheet1.xml', data: sheetXml(`<sheetData>${rows}</sheetData>`) },
+            ...Array.from({ length: DUPLICATES }, () => ({
+                name: 'xl/worksheets/sheet1.xml',
+                data: sheetXml('<sheetData/>'),
+            })),
+        ])
+
+        // Capture the bytes the handler hands the reader. Asserting on the extraction instead would
+        // measure the wrong thing — the amplification is in the archive, before a cap can apply.
+        let rebuilt = Buffer.alloc(0)
+        vi.resetModules()
+        vi.doMock('exceljs', () => ({
+            default: {
+                stream: {
+                    xlsx: {
+                        WorkbookReader: class {
+                            stream: NodeJS.ReadableStream
+                            constructor(stream: NodeJS.ReadableStream) {
+                                this.stream = stream
+                            }
+                            async *[Symbol.asyncIterator]() {
+                                const chunks: Buffer[] = []
+                                for await (const chunk of this.stream) chunks.push(chunk as Buffer)
+                                rebuilt = Buffer.concat(chunks)
+                            }
+                        },
+                    },
+                },
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            await extract({ content, contentType: XLSX_TYPE })
+        } finally {
+            vi.doUnmock('exceljs')
+            vi.resetModules()
+        }
+
+        // The one entry the rebuild adds that no central record describes is the injected empty
+        // shared-string table — a fixed literal of ours, not anything the input controls.
+        expect(rebuildInflatesTo(rebuilt)).toBeLessThanOrEqual(budgetMeasures(content) + 200)
+    })
 })
 
 // Post-cap emptiness, CRC pin, and the lost-worksheet backstop --------------------------

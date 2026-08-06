@@ -536,12 +536,21 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
 //   .xlsx -> exceljs -> unzipper dispatches on LOCAL file-header signatures front-to-back
 //     (unzipper/lib/parse.js:51), only skipping PAST directory records — so the invariants do not
 //     bind it, and a local entry the directory omits would still be inflated unmeasured.
-//     reorderForStreaming binds it instead: every local header it writes comes from a MEASURED
-//     central-directory record and it writes no others, so what unzipper walks is a subset of what
-//     was measured. (A subset, not an equality, since the rebuild also drops orphan worksheet parts
-//     — see SHEET IDENTITY. Dropping only ever removes bytes from the reader's reach, so the bound
-//     holds the same way.) Hence the xlsx handler FAILS when the rewrite can't be produced; the
-//     original bytes would drop the budget on the floor.
+//     reorderForStreaming binds it instead. What it writes is bounded in BOTH directions, and only
+//     stating the first is how a 21x amplification once read as impossible from this comment:
+//       - NO MORE. Every local header it writes comes from a MEASURED central-directory record, and
+//         each such record is written AT MOST ONCE. Sheet layout carries resolved ZipEntry objects
+//         rather than looking parts up by name — the load-bearing half, because a zip name is not a
+//         key: 21 entries all named xl/worksheets/sheet1.xml once collapsed onto the first of them
+//         and re-emitted its bytes 21 times, turning a measured 1.5 MB into 31 MB.
+//       - NO FEWER IS FINE. Some measured records are deliberately not written at all (orphan
+//         worksheet parts — see SHEET IDENTITY). Dropping only removes bytes from the reader's
+//         reach, so it cannot loosen the bound.
+//       - ONE EXCEPTION, ours. The injected empty xl/sharedStrings.xml matches no central record. It
+//         is a fixed 153-byte literal in this file, not anything the input controls.
+//     So what unzipper can inflate is at most what was measured, plus those 153 bytes. Hence the
+//     xlsx handler FAILS when the rewrite can't be produced; the original bytes would drop the
+//     budget on the floor.
 
 const EOCD_MAGIC = Buffer.from([0x50, 0x4b, 0x05, 0x06]) // End-of-Central-Directory
 const CD_SIG = 0x02014b50 // Central-Directory file header
@@ -823,15 +832,31 @@ const EXCELJS_WORKSHEET_DISPATCH = /xl\/worksheets\/sheet\d+[.]xml/
 // Reading the two parts here puts the authority where the format puts it and makes
 // reorderForStreaming the single place that decides — which is also what lets the reader be named
 // positionally, and what keeps the lost-worksheet backstop counting something real.
+//
+// The workbook is the ORDERING and NAMING authority only. MEMBERSHIP stays the archive's: see the
+// tail of workbookWorksheets for why handing it that third job silently deletes text.
 
 const WORKBOOK_PART = 'xl/workbook.xml'
 const WORKBOOK_RELS_PART = 'xl/_rels/workbook.xml.rels'
 
 // One worksheet as the workbook describes it: the archive entry holding it, and its tab name.
+//
+// The ENTRY, deliberately, and not its name. Zip permits duplicate entry names, so a name is not a
+// key: resolving layout through a name -> entry lookup mapped every reference to the FIRST entry
+// carrying that name and re-emitted its bytes once per reference. An archive of 21 entries all named
+// xl/worksheets/sheet1.xml turned a measured 1.5 MB into a 31 MB rebuild that way — bytes the
+// decompression budget counted once and unzipper would then inflate 21 times. Carrying the entry
+// makes that unrepresentable rather than merely guarded against.
 interface WorkbookSheet {
-    part: string
+    entry: ZipEntry
     name: string
 }
+
+const worksheetEntries = (entries: ZipEntry[]): ZipEntry[] => entries.filter((entry) => WORKSHEET_PART.test(entry.name))
+
+// A worksheet part the workbook does not name. sheetN.xml's own number is the most stable label
+// available, and is what the reader's own fallback produced for these.
+const partFallbackName = (part: string): string => `Sheet${/(\d+)\.xml$/.exec(part)?.[1] ?? ''}`
 
 // Inflate one entry whole. Only ever called on the two parts above, both of which exceljs inflates
 // again itself, so this adds no memory class the read did not already have — and both sit inside the
@@ -854,13 +879,16 @@ const localName = (name: string): string => name.slice(name.indexOf(':') + 1)
 const parseWorkbookParts = async (workbookXml: string, relsXml: string) => {
     const { SaxesParser } = await import('saxes')
 
-    const declared: { name: string; rId: string }[] = []
+    // EVERY <sheet> is recorded, including one missing its name or its r:id. Those cannot be
+    // resolved, but the caller has to know the workbook DECLARED something it could not place —
+    // dropping them here would make an unresolvable sheet indistinguishable from an orphan part.
+    const declared: { name: string; rId?: string }[] = []
     const workbook = new SaxesParser()
     workbook.on('opentag', (tag) => {
         if (localName(tag.name) !== 'sheet') return
         // Only a prefix is stripped, so the sibling `sheetId` attribute cannot match this.
         const rId = Object.entries(tag.attributes).find(([key]) => localName(key) === 'id')?.[1]
-        if (tag.attributes.name && rId) declared.push({ name: tag.attributes.name, rId })
+        declared.push({ name: tag.attributes.name ?? '', rId })
     })
     workbook.write(workbookXml).close()
 
@@ -883,8 +911,17 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string) => {
 const resolveRelTarget = (target: string): string | undefined => {
     const trimmed = target.trim()
     if (trimmed === '') return undefined
+    // OPC targets are URI references, so any character in one may legally be percent-encoded —
+    // "worksheets/sheet%32.xml" names sheet2.xml. Decoding is what matches those to the entry rather
+    // than missing it. A malformed escape throws; that target is simply unresolvable.
+    let decoded: string
+    try {
+        decoded = decodeURIComponent(trimmed)
+    } catch {
+        return undefined
+    }
     const path: string[] = []
-    for (const segment of (trimmed.startsWith('/') ? trimmed.slice(1) : `xl/${trimmed}`).split('/')) {
+    for (const segment of (decoded.startsWith('/') ? decoded.slice(1) : `xl/${decoded}`).split('/')) {
         if (segment === '' || segment === '.') continue
         if (segment === '..') {
             if (path.pop() === undefined) return undefined
@@ -915,31 +952,54 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
         return undefined // malformed — exceljs's own parse of the same bytes fails too
     }
 
-    const present = new Set(entries.map((entry) => entry.name))
+    const worksheets = worksheetEntries(entries)
+    const byPart = new Map<string, ZipEntry>()
+    for (const entry of worksheets) if (!byPart.has(entry.name)) byPart.set(entry.name, entry)
+
     const claimed = new Set<string>()
-    const sheets: WorkbookSheet[] = []
+    const ordered: WorkbookSheet[] = []
+    // Declarations we could not place at all. Distinct from a declaration we placed OUTSIDE the
+    // worksheets, which is a positive answer and costs nothing.
+    let unplaced = 0
     for (const { name, rId } of parsed.declared) {
-        const target = parsed.targets.get(rId)
+        const target = rId === undefined ? undefined : parsed.targets.get(rId)
         const part = target === undefined ? undefined : resolveRelTarget(target)
-        // <sheets> also names chartsheets and dialogsheets, which have no xl/worksheets part — the
-        // reason the count used to be taken off the archive instead. Filtering them keeps that
-        // property while moving the authority: a chartsheet is not a worksheet the reader can yield.
-        // A <sheet> naming a part the archive lacks is likewise nothing anyone could emit.
-        if (part === undefined || !WORKSHEET_PART.test(part) || !present.has(part) || claimed.has(part)) continue
+        if (part === undefined || name === '') {
+            unplaced += 1 // no relationship, an unreadable Target, or nothing to call it
+            continue
+        }
+        // Resolved, just not to a worksheet: <sheets> also lists chartsheets and dialogsheets, which
+        // have no xl/worksheets part. Counting those would make a correct read look like a lossy one.
+        if (!WORKSHEET_PART.test(part)) continue
+        if (claimed.has(part)) continue
+        const entry = byPart.get(part)
+        if (!entry) {
+            unplaced += 1 // declares a worksheet this archive does not hold
+            continue
+        }
         claimed.add(part)
-        sheets.push({ part, name })
+        ordered.push({ entry, name })
     }
-    // Zero is a legitimate answer for a chartsheet-only workbook, but it is indistinguishable from a
-    // workbook.xml we failed to understand — and the fallback gives the same empty result for both.
-    return sheets.length > 0 ? sheets : undefined
+
+    // MEMBERSHIP is the workbook's only while the workbook accounted for everything it declared.
+    //
+    // An unclaimed worksheet part is normally an ORPHAN — no <sheet> references it, load() ignored
+    // it, and the rebuild drops it (that is the point). But if any declaration went unplaced, an
+    // unclaimed part may BE that sheet, and the two are no longer distinguishable from here.
+    // Dropping then DELETES the sheet's text — invisibly, because the backstop compares `seen`
+    // against this list's own length, so both sides move together and it can never fire. That is
+    // silent partial output, the one outcome this file fails over. So when anything went unplaced,
+    // every unclaimed part ships after the sheets we did name: it loses its tab position, which is
+    // unknowable, but never its text.
+    const leftover = unplaced > 0 ? worksheets.filter((entry) => !claimed.has(entry.name)) : []
+    return [...ordered, ...leftover.map((entry) => ({ entry, name: partFallbackName(entry.name) }))]
 }
 
 // The fallback, which is what main did for every workbook: the archive's own worksheet parts, in
-// entry order, named positionally.
+// entry order, named after their part number. Distinct ENTRIES, so entries sharing a name stay
+// distinct here rather than collapsing onto whichever came first.
 const archiveWorksheets = (entries: ZipEntry[]): WorkbookSheet[] =>
-    entries
-        .filter((entry) => WORKSHEET_PART.test(entry.name))
-        .map((entry, index) => ({ part: entry.name, name: `Sheet${index + 1}` }))
+    worksheetEntries(entries).map((entry) => ({ entry, name: partFallbackName(entry.name) }))
 
 /////////////////////////////////////////////////////////////
 
@@ -980,8 +1040,6 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     }
 
     const sheets = (await workbookWorksheets(entries)) ?? archiveWorksheets(entries)
-    const byName = new Map<string, ZipEntry>()
-    for (const entry of complete) if (!byName.has(entry.name)) byName.set(entry.name, entry)
 
     const leadingRank = XLSX_LEADING_ENTRIES.length
     const rank = (name: string) => {
@@ -993,11 +1051,11 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     const ordered = [
         // Every flag the reader's worksheet branch tests, set before a worksheet is reached.
         ...complete.filter((entry) => rank(entry.name) < leadingRank).sort((a, b) => rank(a.name) - rank(b.name)),
-        // Tab order. Both resolvers only name parts they found in this archive, so nothing is dropped.
-        ...sheets.flatMap((sheet) => {
-            const entry = byName.get(sheet.part)
-            return entry ? [entry] : []
-        }),
+        // Tab order. The resolved ENTRIES, carried, never re-looked-up by name — a name is not a key
+        // in a zip, and a lookup here is what re-emitted one entry's bytes once per duplicate name.
+        // Both resolvers draw from this archive's own worksheet entries and each returns any given
+        // entry at most once, so this writes each of them exactly once.
+        ...sheets.map((sheet) => sheet.entry),
         // Everything else — minus every remaining part the reader would dispatch as a worksheet.
         // Orphan sheetN.xml parts no <sheet> references die here, which is both what stops them being
         // emitted as sheets of their own and what makes the Nth emission exactly sheets[N - 1].
