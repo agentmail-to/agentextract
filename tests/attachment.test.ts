@@ -2026,13 +2026,26 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
     })
 
-    // Resolving OUTSIDE xl/worksheets is normal — chartsheets live there — but only when the archive
-    // holds the part. These two spellings resolve to nothing, so treating them as a chartsheet left
-    // the declaration uncounted, the real part unclaimed, and its rows dropped as an orphan's.
-    // The last two resolve to a part that EXISTS, which is why "does the archive hold it?" was the
-    // wrong question — neither holds this sheet's rows, and the part that does goes unclaimed.
+    // OPC compares part URIs ASCII-case-insensitively, so this Target legally names the entry stored
+    // as xl/worksheets/sheet2.xml. Matching case-sensitively left it unresolvable: the rows survived
+    // through the rescue, but under a fallback name and at the end, so the sheet lost its identity.
+    it('resolves a Target that differs from the stored entry only in case', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', xml.replace('worksheets/sheet2.xml', 'Worksheets/sheet2.xml'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        // Name and tab position both, not merely the rows — that is what case-sensitivity cost.
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+        expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
+    })
+
+    // Resolving OUTSIDE xl/worksheets is normal — chartsheets live there — but the declaration has to
+    // be accountable. The first resolves to nothing; the last two resolve to a part that EXISTS,
+    // which is why "does the archive hold it?" was the wrong question on its own — neither holds this
+    // sheet's rows, and the part that does goes unclaimed.
     it.each([
-        ['mis-cased, which OPC compares case-insensitively', 'Worksheets/sheet2.xml', undefined],
         ['absolute without the xl/ prefix', '/worksheets/sheet2.xml', undefined],
         ['a real part that is not a sheet', 'styles.xml', undefined],
         ['a stray backup beside the real part', 'worksheets/sheet2.xml.bak', 'xl/worksheets/sheet2.xml.bak'],
@@ -2088,6 +2101,55 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
 
         const r = await extractAttachment({ content, contentType: XLSX_TYPE })
         for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // The mirror of the test above, and the reason neither signal is trusted alone: here the TYPE
+    // says chartsheet while the target still points at the worksheet part holding the rows. Trusting
+    // the type by itself accepted the declaration as accounted-for and dropped that part as an orphan.
+    it('treats a non-worksheet type contradicted by its target as unplaced', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file(
+                'xl/_rels/workbook.xml.rels',
+                rels.replace(
+                    /(<Relationship[^>]*)Type="[^"]*\/worksheet"([^>]*Target="worksheets\/sheet2\.xml")/,
+                    '$1Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet"$2'
+                )
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // ISO/IEC 29500 Strict is a legal .xlsx — Excel offers it as "Strict Open XML Workbook" — and
+    // re-homes the same vocabulary under purl.oclc.org. Recognizing only Transitional matched no
+    // <sheet> at all, so a Strict workbook silently lost its tab order and names to the archive's.
+    it('reads sheet identity from an ISO Strict workbook', async () => {
+        const strict = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            zip.file(
+                'xl/workbook.xml',
+                xml
+                    .replace(/<sheets>(.*?)<\/sheets>/, (_, inner: string) => {
+                        const elements = inner.match(/<sheet\b[^>]*\/>/g) ?? []
+                        return `<sheets>${elements.reverse().join('')}</sheets>`
+                    })
+                    .replace(
+                        'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+                        'http://purl.oclc.org/ooxml/spreadsheetml/main'
+                    )
+                    .replace(
+                        'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+                        'http://purl.oclc.org/ooxml/officeDocument/relationships'
+                    )
+            )
+        })
+
+        const r = await extractAttachment({ content: strict, contentType: XLSX_TYPE })
+        // Reversed tab order, under the workbook's own names — the archive fallback would give
+        // Sheet1, Sheet2, Sheet3 in file order, which is what this used to return.
+        expect(headers(r.extraction)).toEqual(['=== S3 ===', '=== S2 ===', '=== S1 ==='])
     })
 
     // Element identity is (namespace, local name) plus position. Matching bare local names let a
@@ -2479,10 +2541,17 @@ describe('attachment — xlsx lost-worksheet backstop', () => {
 // decompressed total of zero, so it reaches the rewrite instead of a gate in front of it.
 
 describe('attachment — xlsx archive rewrite limits', () => {
-    const zipWithEntryCount = (count: number): Buffer => {
+    // `dropped` names that many entries so the rewrite's third group discards them: the unanchored
+    // regex exceljs dispatches on matches these, the anchored WORKSHEET_PART does not, so they are
+    // neither laid out nor kept. That is what makes the pre-drop and post-drop counts differ.
+    const zipWithEntryCount = (count: number, dropped = 0): Buffer => {
         // One entry must be xl/workbook.xml so the archive routes as .xlsx; the rest are filler.
         const names = Array.from({ length: count }, (_, i) =>
-            i === 0 ? 'xl/workbook.xml' : `p/${i.toString(36).padStart(5, '0')}`
+            i === 0
+                ? 'xl/workbook.xml'
+                : i <= dropped
+                  ? `xl/worksheets/sheet${i}.xml.bak`
+                  : `p/${i.toString(36).padStart(5, '0')}`
         )
         const locals: Buffer[] = []
         const centrals: Buffer[] = []
@@ -2545,6 +2614,18 @@ describe('attachment — xlsx archive rewrite limits', () => {
             // 65533 + 1 = 65534, a legal count. Same shape, same ~5.6 MB, one fewer entry: without
             // this the test above would also pass if the rewrite simply gave up on large archives.
             const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2), contentType: XLSX_TYPE })
+            expect(r.status).toBe('extracted')
+        },
+        BOUNDARY_TIMEOUT_MS
+    )
+
+    // The count that matters is the one the EOCD is written from, which is post-drop. Checking the
+    // pre-drop count refused archives whose actual rewrite lands comfortably under the sentinel —
+    // the same 65535 as the first test, minus two entries the third group discards.
+    it(
+        'counts the entries it will write, not the ones it was given',
+        async () => {
+            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 1, 2), contentType: XLSX_TYPE })
             expect(r.status).toBe('extracted')
         },
         BOUNDARY_TIMEOUT_MS

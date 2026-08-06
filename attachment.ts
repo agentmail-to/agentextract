@@ -907,9 +907,23 @@ const inflateEntry = (entry: ZipEntry): Promise<Buffer | undefined> => {
 // The cost is that saxes with xmlns on treats an UNDECLARED prefix as fatal. That is contained: the
 // caller catches the throw and degrades to archiveWorksheets, the same answer it already gives for a
 // workbook it cannot read, and exceljs's own parse of those bytes fails too.
-const SPREADSHEETML_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+// Both OOXML flavours. ECMA-376 Transitional is what Excel writes by default; ISO/IEC 29500 Strict
+// re-homes the same vocabulary under purl.oclc.org, and "Excel Workbook (Strict Open XML)" is a
+// documented save-as target — so a Strict workbook is a legal .xlsx, not a curiosity. Recognizing
+// only Transitional cost it nothing but its identity: no <sheet> matched, so tab order and names
+// fell back to the archive's. The Open XML SDK maps the two the same way when reading.
+const SPREADSHEETML_NS = new Set([
+    'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+    'http://purl.oclc.org/ooxml/spreadsheetml/main',
+])
+const OFFICE_RELS_NS = new Set([
+    'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+    'http://purl.oclc.org/ooxml/officeDocument/relationships',
+])
+// The .rels grammar is OPC (29500-2), which Strict does not re-home — the flavours differ in the
+// part markup, not in the package. Relationship TYPE values do move, which NON_WORKSHEET_REL matches
+// on its suffix rather than its origin so both spellings land the same.
 const PACKAGE_RELS_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
-const OFFICE_RELS_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 
 // One relationship as the workbook points at it. The TYPE is carried, not just the target: a Target
 // is a string the producer chose, so classifying a declaration by the shape of its path let a
@@ -935,11 +949,11 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string) => {
     workbook.on('opentag', (tag) => {
         const parent = open[open.length - 1]
         open.push({ uri: tag.uri, local: tag.local })
-        if (tag.uri !== SPREADSHEETML_NS || tag.local !== 'sheet') return
-        if (parent?.uri !== SPREADSHEETML_NS || parent.local !== 'sheets') return
+        if (!SPREADSHEETML_NS.has(tag.uri) || tag.local !== 'sheet') return
+        if (parent === undefined || !SPREADSHEETML_NS.has(parent.uri) || parent.local !== 'sheets') return
         // r:id is namespace-qualified; `name` and the sibling `sheetId` are not, so neither can be
         // mistaken for it however the producer bound its prefixes.
-        const rId = Object.values(tag.attributes).find((a) => a.uri === OFFICE_RELS_NS && a.local === 'id')?.value
+        const rId = Object.values(tag.attributes).find((a) => OFFICE_RELS_NS.has(a.uri) && a.local === 'id')?.value
         declared.push({ name: tag.attributes.name?.value ?? '', rId })
     })
     workbook.on('closetag', () => void open.pop())
@@ -1006,6 +1020,12 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
         return undefined // malformed — exceljs's own parse of the same bytes fails too
     }
 
+    // OPC compares part URIs ASCII-case-insensitively, so a legal Target="Worksheets/sheet2.xml"
+    // names the entry stored as xl/worksheets/sheet2.xml. Only the producer's TARGET is folded: the
+    // archive side stays case-sensitive because exceljs's own dispatch regex is, so an entry whose
+    // stored name differs in case is one the reader will never yield and we must not lay out as
+    // though it would. WORKSHEET_PART is all-lowercase, so every key below already is.
+    const present = new Set(entries.map((entry) => entry.name.toLowerCase()))
     const worksheets = worksheetEntries(entries)
     const byPart = new Map<string, ZipEntry>()
     for (const entry of worksheets) if (!byPart.has(entry.name)) byPart.set(entry.name, entry)
@@ -1026,18 +1046,24 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
             unplaced += 1 // no relationship, an external one, or nothing to call it
             continue
         }
+        const part = resolveRelTarget(rel.target)?.toLowerCase()
         // A chartsheet or dialogsheet is a real declaration with no xl/worksheets part for the reader
         // to yield, so it is accounted for and must NOT count as unplaced — otherwise every workbook
         // holding one flips into the rescue below and resurrects genuine orphans.
         //
-        // Decided on the relationship TYPE, never on the target's path. The path is a string the
-        // producer chose: classifying by it let a worksheet relationship aimed at a planted
-        // xl/chartsheets/sheet1.xml read as a chart sheet, leaving the worksheet part that held the
-        // rows unclaimed for the orphan rule to drop. Type is what the format states the target IS.
-        if (NON_WORKSHEET_REL.test(rel.type)) continue
+        // Type and target have to AGREE. Neither alone is enough, and each was tried: classifying by
+        // the target's path let a worksheet relationship aimed at a planted xl/chartsheets/sheet1.xml
+        // pass as a chart sheet, and then trusting the type alone let a chartsheet-typed relationship
+        // still pointing at worksheets/sheet2.xml pass while that part held the rows. Both left the
+        // real worksheet unclaimed for the orphan rule to drop. So: the type says non-worksheet, and
+        // the target must resolve to a part this archive actually holds that is not a worksheet.
+        // Anything else is a contradiction we cannot resolve, which is what `unplaced` is for.
+        if (NON_WORKSHEET_REL.test(rel.type)) {
+            if (part === undefined || !present.has(part) || WORKSHEET_PART.test(part)) unplaced += 1
+            continue
+        }
         // Anything else is expected to be a worksheet, whatever its declared type — an unknown or
         // absent type resolves here too, and unplaced is the safe answer for it.
-        const part = resolveRelTarget(rel.target)
         if (part === undefined || !WORKSHEET_PART.test(part)) {
             unplaced += 1
             continue
@@ -1110,14 +1136,6 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
               },
           ]
 
-    // The EOCD's entry count is 16-bit, where 0xffff means "ZIP64, the real count is elsewhere".
-    // zipEntries refuses an archive already declaring it, but the injection above can carry a
-    // 65534-entry archive onto it, writing a sentinel where a count belongs. Reachable inside
-    // MAX_INPUT_BYTES: ~76 bytes of headers per entry, so 65534 fit in ~5 MB.
-    if (complete.length >= 0xffff) {
-        return { ok: false, reason: `xlsx would rewrite to ${complete.length} entries, at the 0xffff count sentinel` }
-    }
-
     const sheets = (await workbookWorksheets(entries)) ?? archiveWorksheets(entries)
 
     const leadingRank = XLSX_LEADING_ENTRIES.length
@@ -1142,6 +1160,18 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
             (entry) => rank(entry.name) === leadingRank && !EXCELJS_WORKSHEET_DISPATCH.test(entry.name)
         ),
     ]
+
+    // The EOCD's entry count is 16-bit, where 0xffff means "ZIP64, the real count is elsewhere".
+    // zipEntries refuses an archive already declaring it, but the injection above can carry a
+    // 65534-entry archive onto it, writing a sentinel where a count belongs. Reachable inside
+    // MAX_INPUT_BYTES: ~76 bytes of headers per entry, so 65534 fit in ~5 MB.
+    //
+    // Counted on `ordered`, which is what the EOCD below is actually written from. Counting `complete`
+    // instead refused archives whose rewrite lands well under the sentinel, since the third group
+    // drops entries — the count that mattered was never the one being checked.
+    if (ordered.length >= 0xffff) {
+        return { ok: false, reason: `xlsx would rewrite to ${ordered.length} entries, at the 0xffff count sentinel` }
+    }
 
     const locals: Buffer[] = []
     const centrals: Buffer[] = []

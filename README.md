@@ -127,11 +127,13 @@ guards reduce blast radius; they are **not** a sandbox.
   though — a part is an orphan only when the workbook placed every sheet it declared and none of them
   claimed this part's name. If any declaration could not be placed, or the part shares its name with
   one that was, it ships under a fallback name having lost only its tab position. What a declaration
-  points at is read from the relationship's *type* rather than the shape of its target path, since
-  the path is a string the producing application chose. A workbook whose sheet list cannot be read at
-  all — one from which not a single declaration parses, or whose workbook part is too large to read
-  whole — falls back to the archive's own parts, in entry order, named `Sheet1`, `Sheet2`, …. The
-  rule throughout is that a sheet may lose its position or its name, never its rows.
+  points at must be agreed on by the relationship's *type* and its target: neither is trusted alone,
+  since the target's path is a string the producing application chose and a type contradicted by its
+  target is not a resolution. Both OOXML flavours are recognized, Transitional and ISO Strict, and
+  targets are matched case-insensitively as OPC requires. A workbook whose sheet list cannot be read
+  at all — one from which not a single declaration parses, or whose workbook part is too large to
+  read whole — falls back to the archive's own parts, in entry order, named `Sheet1`, `Sheet2`, ….
+  The rule throughout is that a sheet may lose its position or its name, never its rows.
 
 ## What it does that off-the-shelf engines don't
 
