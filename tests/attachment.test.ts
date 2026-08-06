@@ -2008,6 +2008,41 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
         expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
     })
+
+    // The three shapes below are all one mistake: reading "we could not account for this" as "there
+    // was nothing there". Each returned a clean `extracted` while deleting rows.
+
+    // A <sheets> yielding no declaration at all is a workbook we did not understand, not a workbook
+    // with no sheets. Honoring the empty answer drops every worksheet part — the whole document,
+    // reported as success with no text whatsoever.
+    it('falls back to the archive when the workbook declares no sheets at all', async () => {
+        const noDeclarations = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            zip.file('xl/workbook.xml', xml.replace(/<sheets>.*?<\/sheets>/, '<sheets/>'))
+        })
+
+        const r = await extractAttachment({ content: noDeclarations, contentType: XLSX_TYPE })
+        expect(headers(r.extraction)).toHaveLength(3)
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // Resolving OUTSIDE xl/worksheets is normal — chartsheets live there — but only when the archive
+    // holds the part. These two spellings resolve to nothing, so treating them as a chartsheet left
+    // the declaration uncounted, the real part unclaimed, and its rows dropped as an orphan's.
+    it.each([
+        ['mis-cased, which OPC compares case-insensitively', 'Worksheets/sheet2.xml'],
+        ['absolute without the xl/ prefix', '/worksheets/sheet2.xml'],
+    ])('keeps a declared sheet whose Target is %s', async (_label, target) => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', xml.replace('worksheets/sheet2.xml', target))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(headers(r.extraction)).toHaveLength(3)
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
 })
 
 // The rebuild vs the decompression budget --------------------------------------
@@ -2161,6 +2196,48 @@ describe('attachment — the rebuild cannot amplify what the budget measured', (
         // The one entry the rebuild adds that no central record describes is the injected empty
         // shared-string table — a fixed literal of ours, not anything the input controls.
         expect(rebuildInflatesTo(rebuilt)).toBeLessThanOrEqual(budgetMeasures(content) + 200)
+    })
+
+    // The same "a name is not a key" mistake, on the other side of the ledger: layout stopped
+    // duplicating entries, but the rescue that saves unplaced ones still excluded them BY NAME, so
+    // the entry nobody laid out was thrown away with the one that was. Here rather than beside the
+    // other sheet-identity tests because only this block can build an archive JSZip refuses to.
+    it('rescues an entry sharing a claimed name rather than excluding it by name', async () => {
+        const sheet = (v: string) =>
+            Buffer.from(
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+                    `<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>${v}</t></is></c></row></sheetData></worksheet>`,
+                'latin1'
+            )
+        // Alpha resolves to sheet1.xml; Beta's r:id matches no relationship, so it goes unplaced and
+        // the rescue engages. Two DISTINCT entries share that name, and only one is ever laid out.
+        const content = buildZip([
+            { name: '[Content_Types].xml', data: Buffer.from('<Types/>', 'latin1') },
+            {
+                name: 'xl/workbook.xml',
+                data: Buffer.from(
+                    '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+                        '<sheet name="Alpha" sheetId="1" r:id="rId1"/><sheet name="Beta" sheetId="2" r:id="rIdMISSING"/>' +
+                        '</sheets></workbook>',
+                    'latin1'
+                ),
+            },
+            {
+                name: 'xl/_rels/workbook.xml.rels',
+                data: Buffer.from(
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+                        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+                        '</Relationships>',
+                    'latin1'
+                ),
+            },
+            { name: 'xl/worksheets/sheet1.xml', data: sheet('AAA-claimed') },
+            { name: 'xl/worksheets/sheet1.xml', data: sheet('BBB-the-victim') },
+        ])
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.extraction).toContain('AAA-claimed')
+        expect(r.extraction).toContain('BBB-the-victim')
     })
 })
 

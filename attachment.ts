@@ -952,11 +952,17 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
         return undefined // malformed — exceljs's own parse of the same bytes fails too
     }
 
+    const present = new Set(entries.map((entry) => entry.name))
     const worksheets = worksheetEntries(entries)
     const byPart = new Map<string, ZipEntry>()
     for (const entry of worksheets) if (!byPart.has(entry.name)) byPart.set(entry.name, entry)
 
-    const claimed = new Set<string>()
+    // Two sets, because a zip name is not a key here either. `claimedNames` answers "did any
+    // declaration reference this part?", which is what makes an entry an ORPHAN. `placed` answers
+    // "did we lay this entry out?", which is what makes it redundant. The second of two entries
+    // sharing a claimed name is neither: referenced, never placed, and not an orphan.
+    const claimedNames = new Set<string>()
+    const placed = new Set<ZipEntry>()
     const ordered: WorkbookSheet[] = []
     // Declarations we could not place at all. Distinct from a declaration we placed OUTSIDE the
     // worksheets, which is a positive answer and costs nothing.
@@ -969,30 +975,45 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
             continue
         }
         // Resolved, just not to a worksheet: <sheets> also lists chartsheets and dialogsheets, which
-        // have no xl/worksheets part. Counting those would make a correct read look like a lossy one.
-        if (!WORKSHEET_PART.test(part)) continue
-        if (claimed.has(part)) continue
+        // have no xl/worksheets part. Counting those would make a correct read look like a lossy one
+        // — but only when the archive HOLDS what we resolved to. A Target matching no entry at all
+        // resolved to nothing, and this sheet's rows may be sitting in a worksheet part the orphan
+        // rule below is about to drop. Reached by a mis-cased Target (OPC part names compare
+        // case-insensitively) or one written absolute without the xl/ prefix.
+        if (!WORKSHEET_PART.test(part)) {
+            if (!present.has(part)) unplaced += 1
+            continue
+        }
+        claimedNames.add(part)
         const entry = byPart.get(part)
         if (!entry) {
             unplaced += 1 // declares a worksheet this archive does not hold
             continue
         }
-        claimed.add(part)
+        if (placed.has(entry)) continue // a second <sheet> on one part: another tab name, no new rows
+        placed.add(entry)
         ordered.push({ entry, name })
     }
 
     // MEMBERSHIP is the workbook's only while the workbook accounted for everything it declared.
     //
-    // An unclaimed worksheet part is normally an ORPHAN — no <sheet> references it, load() ignored
-    // it, and the rebuild drops it (that is the point). But if any declaration went unplaced, an
-    // unclaimed part may BE that sheet, and the two are no longer distinguishable from here.
-    // Dropping then DELETES the sheet's text — invisibly, because the backstop compares `seen`
-    // against this list's own length, so both sides move together and it can never fire. That is
-    // silent partial output, the one outcome this file fails over. So when anything went unplaced,
-    // every unclaimed part ships after the sheets we did name: it loses its tab position, which is
-    // unknowable, but never its text.
-    const leftover = unplaced > 0 ? worksheets.filter((entry) => !claimed.has(entry.name)) : []
-    return [...ordered, ...leftover.map((entry) => ({ entry, name: partFallbackName(entry.name) }))]
+    // An unplaced worksheet part is normally an ORPHAN — no <sheet> references it, load() ignored it,
+    // and the rebuild drops it (that is the point). Two shapes are NOT orphans and must ship, because
+    // dropping either deletes text invisibly: the second of two entries sharing a claimed name, and
+    // — once ANY declaration went unplaced — every remaining part, since orphan and victim stop being
+    // distinguishable from here. Invisibly, because the backstop compares `seen` against this list's
+    // own length: both sides move together and it can never fire. That is silent partial output, the
+    // one outcome this file fails over. A rescued part loses its tab position, which is unknowable,
+    // never its rows.
+    const rescued = worksheets.filter((entry) => !placed.has(entry) && (unplaced > 0 || claimedNames.has(entry.name)))
+    // Zero worksheets is a real answer for a chartsheet-only workbook — but only from a workbook that
+    // told us something. A <sheets> we could not read one declaration out of is not that answer, and
+    // honoring it as one drops every worksheet part the archive holds: the whole document, silently,
+    // as an `extracted` with no text. undefined hands the question to archiveWorksheets instead,
+    // which is what main did for every workbook.
+    return parsed.declared.length > 0
+        ? [...ordered, ...rescued.map((entry) => ({ entry, name: partFallbackName(entry.name) }))]
+        : undefined
 }
 
 // The fallback, which is what main did for every workbook: the archive's own worksheet parts, in

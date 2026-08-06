@@ -123,11 +123,13 @@ guards reduce blast radius; they are **not** a sandbox.
   order (which a dragged tab changes without moving any `sheetN.xml`), named as the workbook names
   them (`exceljs` matches relationship targets against a single spelling and silently fails to name a
   sheet whose target is written as an absolute package path), and worksheet parts the workbook does
-  not reference are dropped rather than emitted as sheets of their own. Membership stays the
-  archive's, though: dropping happens only when every declared sheet was placed, so a `<sheet>` whose
-  relationship cannot be resolved keeps its text (under a fallback name, having lost its tab
-  position) rather than disappearing. A workbook whose sheet list cannot be read at all falls back to
-  the archive's own parts, in entry order, named `Sheet1`, `Sheet2`, ….
+  not reference are dropped rather than emitted as sheets of their own. Dropping is the narrow case,
+  though — a part is an orphan only when the workbook placed every sheet it declared and none of them
+  claimed this part's name. If any declaration could not be placed, or the part shares its name with
+  one that was, it ships under a fallback name having lost only its tab position. A workbook whose
+  sheet list cannot be read at all — including one from which not a single declaration parses — falls
+  back to the archive's own parts, in entry order, named `Sheet1`, `Sheet2`, …. The rule throughout
+  is that a sheet may lose its position or its name, never its rows.
 
 ## What it does that off-the-shelf engines don't
 
