@@ -732,8 +732,14 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
 // worksheet keeps it off that branch. Entry bytes are copied still-compressed, so nothing is
 // inflated or recompressed and peak stays ~2x the (already capped) compressed size.
 //
-// Verified: 300 reads across 6 workbooks, byte-identical to workbook.xlsx.load(), zero drops and
-// zero throws — against 0/50 clean on the worst of them before the reorder.
+// Verified: 300 reads across 6 workbooks, zero drops and zero throws — against 0/50 clean on the
+// worst of them before the reorder. Cell values, dates, number formats, booleans, formula results,
+// rich text and unicode all match workbook.xlsx.load(). Two shapes deliberately do NOT, both pinned
+// by tests: load() proxied a merged cell's master value into every slave, so a horizontal merge
+// repeated the label once per column and a vertical one emitted trailing rows carrying nothing else,
+// and an error-valued formula stringified to "[object Object]". Streaming emits the merge once and
+// the error cell as empty. Better output for a search index either way, but merged workbooks do
+// change row and column shape against main, so it is stated rather than filed under "identical".
 
 // Ordered first, so every flag the worksheet branch tests is set before a worksheet is reached.
 // xl/workbook.xml is not one of those flags but leads anyway: it sets this.model, whose absence is

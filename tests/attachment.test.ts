@@ -1830,6 +1830,44 @@ describe('attachment — xlsx streaming determinism', () => {
         }
     })
 
+    // The two shapes where streaming deliberately does NOT reproduce workbook.xlsx.load(). Pinned so
+    // they stay deliberate: both are improvements for a search index, but both change what a merged
+    // workbook's rows and columns look like against main, and an unpinned improvement is
+    // indistinguishable from an accident.
+    it('emits a merged cell once instead of proxying it into every slave cell', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Merged')
+        sheet.getCell('A1').value = 'TITLE'
+        sheet.mergeCells('A1:C1') // horizontal
+        sheet.getCell('A2').value = 'a'
+        sheet.getCell('B2').value = 'b'
+        sheet.getCell('C2').value = 'c'
+        sheet.getCell('A3').value = 'SIDE'
+        sheet.mergeCells('A3:A5') // vertical
+        sheet.getCell('B3').value = 'x'
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        // load() gave "TITLE\tTITLE\tTITLE" and two trailing "SIDE" rows carrying nothing else.
+        expect(r.extraction).toBe('=== Merged ===\nTITLE\na\tb\tc\nSIDE\tx')
+    })
+
+    it('emits an error-valued formula as empty rather than stringifying the value object', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Err')
+        sheet.getCell('A1').value = { formula: '1/0', result: { error: '#DIV/0!' } } as never
+        sheet.getCell('B1').value = 'ok'
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.extraction).toBe('=== Err ===\n\tok') // load() put "[object Object]" in that cell
+        expect(r.extraction).not.toContain('[object Object]')
+    })
+
     // The reorder rewrites the archive before the parser sees it, so it must not disturb the values.
     it('preserves cell values, formula results and sheet names through the reorder', async () => {
         const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
