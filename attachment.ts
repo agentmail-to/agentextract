@@ -536,13 +536,12 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
 //   .xlsx -> exceljs -> unzipper dispatches on LOCAL file-header signatures front-to-back
 //     (unzipper/lib/parse.js:51), only skipping PAST directory records — so the invariants do not
 //     bind it, and a local entry the directory omits would still be inflated unmeasured.
-//     reorderForStreaming binds it instead. What it writes is bounded in BOTH directions, and only
-//     stating the first is how a 21x amplification once read as impossible from this comment:
+//     reorderForStreaming binds it instead. What it writes must be bounded in BOTH directions —
+//     stating only the first once let a 21x amplification read as impossible from here:
 //       - NO MORE. Every local header it writes comes from a MEASURED central-directory record, and
-//         each such record is written AT MOST ONCE. Sheet layout carries resolved ZipEntry objects
-//         rather than looking parts up by name — the load-bearing half, because a zip name is not a
-//         key: 21 entries all named xl/worksheets/sheet1.xml once collapsed onto the first of them
-//         and re-emitted its bytes 21 times, turning a measured 1.5 MB into 31 MB.
+//         each record is written AT MOST ONCE. Sheet layout carries resolved ZipEntry objects rather
+//         than looking parts up by name, because a zip name is not a key: entries sharing one name
+//         collapse onto whichever came first, and re-emit its bytes once per reference.
 //       - NO FEWER IS FINE. Some measured records are deliberately not written at all (orphan
 //         worksheet parts — see SHEET IDENTITY). Dropping only removes bytes from the reader's
 //         reach, so it cannot loosen the bound.
@@ -849,12 +848,9 @@ const NON_WORKSHEET_REL = /\/relationships\/(chartsheet|dialogsheet)$/
 
 // One worksheet as the workbook describes it: the archive entry holding it, and its tab name.
 //
-// The ENTRY, deliberately, and not its name. Zip permits duplicate entry names, so a name is not a
-// key: resolving layout through a name -> entry lookup mapped every reference to the FIRST entry
-// carrying that name and re-emitted its bytes once per reference. An archive of 21 entries all named
-// xl/worksheets/sheet1.xml turned a measured 1.5 MB into a 31 MB rebuild that way — bytes the
-// decompression budget counted once and unzipper would then inflate 21 times. Carrying the entry
-// makes that unrepresentable rather than merely guarded against.
+// The ENTRY, deliberately, and not its name: zip permits duplicate entry names, so a name is not a
+// key, and carrying the entry makes re-emitting one record several times unrepresentable rather than
+// merely guarded against. That is the "NO MORE" half of the bound — see DECOMPRESSION BUDGET.
 interface WorkbookSheet {
     entry: ZipEntry
     name: string
@@ -1039,11 +1035,11 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
     const ordered: WorkbookSheet[] = []
     // Declarations we could not place at all. Distinct from a declaration we placed OUTSIDE the
     // worksheets, which is a positive answer and costs nothing.
-    let unplaced = 0
+    let hasUnplaced = false
     for (const { name, rId } of parsed.declared) {
         const rel = rId === undefined ? undefined : parsed.targets.get(rId)
         if (rel === undefined || name === '') {
-            unplaced += 1 // no relationship, an external one, or nothing to call it
+            hasUnplaced = true // no relationship, an external one, or nothing to call it
             continue
         }
         const part = resolveRelTarget(rel.target)?.toLowerCase()
@@ -1051,31 +1047,29 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
         // to yield, so it is accounted for and must NOT count as unplaced — otherwise every workbook
         // holding one flips into the rescue below and resurrects genuine orphans.
         //
-        // Type and target have to name the SAME KIND. Every looser rule has been wrong in the same
-        // direction: the target's path alone let a worksheet relationship aimed at a planted
-        // xl/chartsheets/sheet1.xml pass as a chart sheet; the type alone let a chartsheet-typed
-        // relationship still pointing at worksheets/sheet2.xml pass; "resolves to some part that is
-        // not a worksheet" let a chartsheet-typed relationship pointing at xl/styles.xml pass. Each
-        // one left the real worksheet unclaimed for the orphan rule to drop.
+        // Type and target must name the SAME KIND. Neither signal alone is sound: both the type and
+        // the target path are producer-controlled, so either can be made to contradict the other,
+        // and every contradiction accepted here leaves the real worksheet unclaimed for the orphan
+        // rule to drop. The regression tests hold one fixture per way they can disagree.
         //
         // A path convention is load-bearing here where it could not be for the worksheet case,
         // because the asymmetry inverted: a chart sheet stored somewhere unconventional now reads as
         // unplaced, which costs a rescued orphan in the output. Guessing the other way costs rows.
         const otherKind = NON_WORKSHEET_REL.exec(rel.type)?.[1]
         if (otherKind !== undefined) {
-            if (part === undefined || !present.has(part) || !part.startsWith(`xl/${otherKind}s/`)) unplaced += 1
+            if (part === undefined || !present.has(part) || !part.startsWith(`xl/${otherKind}s/`)) hasUnplaced = true
             continue
         }
         // Anything else is expected to be a worksheet, whatever its declared type — an unknown or
         // absent type resolves here too, and unplaced is the safe answer for it.
         if (part === undefined || !WORKSHEET_PART.test(part)) {
-            unplaced += 1
+            hasUnplaced = true
             continue
         }
         claimedNames.add(part)
         const entry = byPart.get(part)
         if (!entry) {
-            unplaced += 1 // declares a worksheet this archive does not hold
+            hasUnplaced = true // declares a worksheet this archive does not hold
             continue
         }
         if (placed.has(entry)) continue // a second <sheet> on one part: another tab name, no new rows
@@ -1093,7 +1087,7 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
     // own length: both sides move together and it can never fire. That is silent partial output, the
     // one outcome this file fails over. A rescued part loses its tab position, which is unknowable,
     // never its rows.
-    const rescued = worksheets.filter((entry) => !placed.has(entry) && (unplaced > 0 || claimedNames.has(entry.name)))
+    const rescued = worksheets.filter((entry) => !placed.has(entry) && (hasUnplaced || claimedNames.has(entry.name)))
     // Zero worksheets is a real answer for a chartsheet-only workbook — but only from a workbook that
     // told us something. A <sheets> we could not read one declaration out of is not that answer, and
     // honoring it as one drops every worksheet part the archive holds: the whole document, silently,

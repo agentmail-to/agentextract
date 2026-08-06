@@ -1777,17 +1777,19 @@ describe('attachment — extract options', () => {
 // proves nothing at a partial failure rate. Before the reorder the multi-sheet case dropped a sheet
 // or threw on most reads; the no-shared-strings case dropped sheets on 35 of 50.
 
-describe('attachment — xlsx streaming determinism', () => {
-    // exceljs's own writer emits xl/workbook.xml LAST, which is the layout that used to throw.
-    const workbookWith = async (sheets: number, rows: number) => {
-        const workbook = new ExcelJS.Workbook()
-        for (let s = 1; s <= sheets; s++) {
-            const sheet = workbook.addWorksheet(`S${s}`)
-            for (let r = 1; r <= rows; r++) sheet.addRow([`s${s}r${r}`, r])
-        }
-        return Buffer.from(await workbook.xlsx.writeBuffer())
+// Shared by the determinism block and the sheet-identity block below, which assert on the same
+// naming convention (S1.., s1r1..) and must not drift apart. exceljs's own writer emits
+// xl/workbook.xml LAST, which is the layout that used to throw.
+const workbookWith = async (sheets: number, rows: number) => {
+    const workbook = new ExcelJS.Workbook()
+    for (let s = 1; s <= sheets; s++) {
+        const sheet = workbook.addWorksheet(`S${s}`)
+        for (let r = 1; r <= rows; r++) sheet.addRow([`s${s}r${r}`, r])
     }
+    return Buffer.from(await workbook.xlsx.writeBuffer())
+}
 
+describe('attachment — xlsx streaming determinism', () => {
     const READS = 12 // enough to catch a partial-rate race; the workbooks are tiny
 
     it('returns every worksheet, on every read', async () => {
@@ -1890,15 +1892,6 @@ describe('attachment — xlsx streaming determinism', () => {
 // real workbook afterwards, which is how all three shapes reach us in the wild anyway.
 
 describe('attachment — xlsx sheet identity comes from the workbook', () => {
-    const workbookWith = async (sheets: number, rows: number) => {
-        const workbook = new ExcelJS.Workbook()
-        for (let s = 1; s <= sheets; s++) {
-            const sheet = workbook.addWorksheet(`S${s}`)
-            for (let r = 1; r <= rows; r++) sheet.addRow([`s${s}r${r}`, r])
-        }
-        return Buffer.from(await workbook.xlsx.writeBuffer())
-    }
-
     const rebuild = async (content: Buffer, edit: (zip: JSZip) => Promise<void>): Promise<Buffer> => {
         const zip = await JSZip.loadAsync(content)
         await edit(zip)
@@ -2218,21 +2211,6 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
 // contain — not a JS throw, so its per-attachment catch never sees it.
 
 describe('attachment — the rebuild cannot amplify what the budget measured', () => {
-    const CRC_TABLE = (() => {
-        const table: number[] = []
-        for (let n = 0; n < 256; n++) {
-            let c = n
-            for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
-            table[n] = c >>> 0
-        }
-        return table
-    })()
-    const crc32 = (buf: Buffer) => {
-        let c = 0xffffffff
-        for (const byte of buf) c = CRC_TABLE[(c ^ byte) & 0xff] ^ (c >>> 8)
-        return (c ^ 0xffffffff) >>> 0
-    }
-
     // Hand-built, because JSZip dedupes by name and duplicate names are the whole point.
     const buildZip = (files: { name: string; data: Buffer }[]) => {
         const locals: Buffer[] = []
@@ -2245,7 +2223,7 @@ describe('attachment — the rebuild cannot amplify what the budget measured', (
             local.writeUInt32LE(0x04034b50, 0)
             local.writeUInt16LE(20, 4)
             local.writeUInt16LE(8, 8)
-            local.writeUInt32LE(crc32(file.data), 14)
+            local.writeUInt32LE(zlib.crc32(file.data), 14)
             local.writeUInt32LE(deflated.length, 18)
             local.writeUInt32LE(file.data.length, 22)
             local.writeUInt16LE(name.length, 26)
@@ -2255,7 +2233,7 @@ describe('attachment — the rebuild cannot amplify what the budget measured', (
             central.writeUInt16LE(20, 4)
             central.writeUInt16LE(20, 6)
             central.writeUInt16LE(8, 10)
-            central.writeUInt32LE(crc32(file.data), 16)
+            central.writeUInt32LE(zlib.crc32(file.data), 16)
             central.writeUInt32LE(deflated.length, 20)
             central.writeUInt32LE(file.data.length, 24)
             central.writeUInt16LE(name.length, 28)
