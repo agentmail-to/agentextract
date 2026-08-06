@@ -1803,6 +1803,10 @@ describe('attachment — xlsx streaming determinism', () => {
         }
     })
 
+    // The ORDINARY case, where tab order and file order agree — so this pins that the reorder does
+    // not scramble a normal workbook, and nothing more. It cannot see where the two authorities
+    // disagree, because exceljs's writer never emits a workbook in which they do: that is what the
+    // sheet-identity block below builds by hand.
     it('keeps worksheets in workbook order', async () => {
         const r = await extractAttachment({ content: await workbookWith(4, 3), contentType: XLSX_TYPE })
         const headers = r.extraction!.match(/^=== .* ===$/gm)
@@ -1834,6 +1838,101 @@ describe('attachment — xlsx streaming determinism', () => {
         expect(r.extraction).toContain('West\t4200')
         expect(r.extraction).toContain('Total\t7300') // formula RESULT survived
         expect(r.extraction).not.toContain('SUM(')
+    })
+})
+
+// Sheet identity --------------------------------------------------------------
+// Order, names and membership come from xl/workbook.xml + its rels, not from the archive. Every
+// fixture here needs the two to DISAGREE, and exceljs's writer never produces that — it emits
+// <sheets> in file order with relative rel targets — so each is built by editing the parts of a
+// real workbook afterwards, which is how all three shapes reach us in the wild anyway.
+
+describe('attachment — xlsx sheet identity comes from the workbook', () => {
+    const workbookWith = async (sheets: number, rows: number) => {
+        const workbook = new ExcelJS.Workbook()
+        for (let s = 1; s <= sheets; s++) {
+            const sheet = workbook.addWorksheet(`S${s}`)
+            for (let r = 1; r <= rows; r++) sheet.addRow([`s${s}r${r}`, r])
+        }
+        return Buffer.from(await workbook.xlsx.writeBuffer())
+    }
+
+    const rebuild = async (content: Buffer, edit: (zip: JSZip) => Promise<void>): Promise<Buffer> => {
+        const zip = await JSZip.loadAsync(content)
+        await edit(zip)
+        return zip.generateAsync({ type: 'nodebuffer' })
+    }
+
+    const part = (zip: JSZip, name: string) => zip.file(name)!.async('string')
+    const headers = (extraction?: string) => extraction?.match(/^=== .* ===$/gm)
+
+    // Dragging a tab in Excel reorders <sheets> and leaves the sheetN.xml parts exactly where they
+    // were. load() followed <sheets>; reading entry order does not.
+    it('emits sheets in tab order when it disagrees with archive order', async () => {
+        const dragged = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            zip.file(
+                'xl/workbook.xml',
+                xml.replace(/<sheets>(.*?)<\/sheets>/, (_, inner: string) => {
+                    const elements = inner.match(/<sheet\b[^>]*\/>/g) ?? []
+                    return `<sheets>${elements.reverse().join('')}</sheets>`
+                })
+            )
+        })
+
+        const r = await extractAttachment({ content: dragged, contentType: XLSX_TYPE })
+        expect(headers(r.extraction)).toEqual(['=== S3 ===', '=== S2 ===', '=== S1 ==='])
+        // The ROWS have to move with the header — reordering names alone would mislabel every sheet.
+        expect(r.extraction).toMatch(/=== S3 ===\ns3r1/)
+        expect(r.extraction).toMatch(/=== S1 ===\ns1r1/)
+    })
+
+    // A legal absolute Target. exceljs compares rel.Target to the single string
+    // `worksheets/sheetN.xml`, so this spelling matches nothing and every sheet lost its name.
+    it('resolves an absolute rel Target rather than falling back to positional names', async () => {
+        const absolute = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/_rels/workbook.xml.rels')
+            const absolutized = xml.replace(/Target="(worksheets\/sheet\d+\.xml)"/g, 'Target="/xl/$1"')
+            zip.file('xl/_rels/workbook.xml.rels', absolutized)
+        })
+
+        const r = await extractAttachment({ content: absolute, contentType: XLSX_TYPE })
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+        expect(r.extraction).not.toMatch(/=== Sheet\d+ ===/) // the old fallback naming
+    })
+
+    // A worksheet part no <sheet> references — a stale part left by an editing tool. The archive
+    // holds it, the workbook does not, and load() ignored it; entry-order dispatch emitted it as a
+    // sheet of its own with content duplicated from wherever it was copied.
+    it('drops a worksheet part the workbook does not reference', async () => {
+        const withOrphan = await rebuild(await workbookWith(2, 2), async (zip) => {
+            zip.file('xl/worksheets/sheet7.xml', await part(zip, 'xl/worksheets/sheet1.xml'))
+        })
+
+        const r = await extractAttachment({ content: withOrphan, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted') // the orphan must not trip the lost-worksheet backstop
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ==='])
+        expect(r.extraction!.match(/s1r1/g)).toHaveLength(1) // emitted once, not duplicated
+    })
+
+    // The fallback path, for an archive whose workbook cannot be read. Without the rels part exceljs
+    // never sets this.workbookRels, so every sheet takes the spool branch the reorder exists to avoid
+    // and whether they all arrive is the upstream race — measured here as 1 of 3, byte-identical
+    // before and after this change, because resolution simply falls back to the archive's own parts.
+    // So the assertion is the CONTRACT rather than a sheet count: a complete workbook or a labeled
+    // failure, never a partial one dressed up as 'extracted'. Repeated, because it is a race.
+    it('never reports a partial workbook when the rels part is missing', async () => {
+        const noRels = await rebuild(await workbookWith(3, 2), async (zip) => {
+            zip.remove('xl/_rels/workbook.xml.rels')
+        })
+
+        for (let i = 0; i < 12; i++) {
+            const r = await extractAttachment({ content: noRels, contentType: XLSX_TYPE })
+            // Either outcome is sound; a third — 'extracted' with sheets missing — is the one this
+            // forbids, and it is what the lost-worksheet backstop is counting `resolved` to catch.
+            if (r.status === 'extracted') expect(headers(r.extraction)).toHaveLength(3)
+            else expect(r.reason).toMatch(/yielded \d+ of 3 worksheets/)
+        }
     })
 })
 
@@ -2032,11 +2131,15 @@ describe('attachment — xlsx archive rewrite limits', () => {
         return Buffer.concat([...locals, directory, end])
     }
 
+    // The reason is asserted, not just the status: this archive's directory read perfectly well — we
+    // declined to REWRITE it — and reporting that as "could not be read" sent an investigation at the
+    // wrong half of the preflight. Two distinct causes must not collapse into one message.
     it('refuses an archive whose rewrite would land on the 0xffff entry-count sentinel', async () => {
         // 65534 real entries + the injected shared-string part = 65535 = 0xffff.
         const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 1), contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/central directory could not be read/)
+        expect(r.reason).toMatch(/0xffff count sentinel/)
+        expect(r.reason).not.toMatch(/central directory could not be read/)
     })
 
     it('accepts one entry below that boundary, so the refusal is the sentinel and not the size', async () => {

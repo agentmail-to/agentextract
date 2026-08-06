@@ -338,11 +338,13 @@ const xlsxHandler: Handler = {
         // before any cap can apply — a 4 MB in-cap .xlsx peaked at hundreds of MB and OOMed a 1024 MB
         // worker. Peak now follows the shared-string table, not the cell graph. See
         // reorderForStreaming: without it this reader drops worksheets.
-        const rewritten = reorderForStreaming(content)
+        const rewritten = await reorderForStreaming(content)
         // Fail closed: the budget measured the central directory, but unzipper inflates what its
         // LOCAL-header walk finds, so the budget binds this path only through the rewritten archive.
-        if (!rewritten) throw new Error('xlsx central directory could not be read for streaming')
-        const { content: ordered, worksheets: expected } = rewritten
+        if (!rewritten.ok) throw new Error(rewritten.reason)
+        // The workbook's worksheets, in tab order — see SHEET IDENTITY. Both the names below and the
+        // backstop's count read off this rather than off the archive or the reader.
+        const { content: ordered, sheets: resolved } = rewritten
         const reader = new ExcelJS.stream.xlsx.WorkbookReader(Readable.from(ordered), {
             worksheets: 'emit',
             sharedStrings: 'cache', // the only mode that resolves t="s" cells to their text
@@ -386,11 +388,13 @@ const xlsxHandler: Handler = {
                 }
                 if (truncated) break
             }
-            // Cast for the TYPE, not the value: the .d.ts omits `name`, but the constructor always
-            // sets it (worksheet-reader.js:21) and _parseWorksheet overwrites it from the model
-            // (workbook-reader.js:306). The fallback is unreachable at 4.4.0, kept because this
-            // library has already moved undocumented behaviour under us twice.
-            const name = (worksheet as unknown as { name?: string }).name ?? `Sheet${sheets.length + 1}`
+            // Positional, and sound because the rebuild laid out exactly `resolved` and nothing else
+            // this reader dispatches as a worksheet, in this order. Reading worksheet.name instead is
+            // what produced "Sheet1" for a legal absolute rel Target: exceljs matches rel.Target
+            // against one exact spelling (workbook-reader.js:302) and gives up on every other, and
+            // its .d.ts does not admit the field either way. The fallback is unreachable — an
+            // out-of-range index means the reader emitted a part we never wrote.
+            const name = resolved[seen - 1]?.name ?? `Sheet${seen}`
             if (rows.length > 0) sheets.push(`=== ${name} ===\n${rows.join('\n')}`)
             // Safe to abandon mid-archive: the reorder keeps every worksheet on the inline path,
             // which spools nothing, so no temp files are stranded (#2147).
@@ -402,8 +406,12 @@ const xlsxHandler: Handler = {
         // spreadsheet reported as 'extracted' — a caller can retry a failure but cannot tell a
         // truncated document from a complete one. Gated on !truncated: a deliberate stop leaves
         // sheets unread by design.
-        if (!truncated && seen < expected) {
-            throw new Error(`xlsx reader yielded ${seen} of ${expected} worksheets`)
+        //
+        // `!==`, not `<`: over-yielding is now just as wrong, because it means the reader dispatched
+        // a worksheet the rebuild did not lay out — which would have silently shifted every name
+        // above. Unreachable by construction, and cheap enough not to leave that proof load-bearing.
+        if (!truncated && seen !== resolved.length) {
+            throw new Error(`xlsx reader yielded ${seen} of ${resolved.length} worksheets`)
         }
 
         return { text: sheets.join('\n\n'), truncated }
@@ -525,9 +533,12 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
 //   .xlsx -> exceljs -> unzipper dispatches on LOCAL file-header signatures front-to-back
 //     (unzipper/lib/parse.js:51), only skipping PAST directory records — so the invariants do not
 //     bind it, and a local entry the directory omits would still be inflated unmeasured.
-//     reorderForStreaming binds it instead: it re-emits one local header per measured entry and
-//     nothing else, so both walks see the same set by construction. Hence the xlsx handler FAILS
-//     when the rewrite can't be produced; the original bytes would drop the budget on the floor.
+//     reorderForStreaming binds it instead: every local header it writes comes from a MEASURED
+//     central-directory record and it writes no others, so what unzipper walks is a subset of what
+//     was measured. (A subset, not an equality, since the rebuild also drops orphan worksheet parts
+//     — see SHEET IDENTITY. Dropping only ever removes bytes from the reader's reach, so the bound
+//     holds the same way.) Hence the xlsx handler FAILS when the rewrite can't be produced; the
+//     original bytes would drop the budget on the floor.
 
 const EOCD_MAGIC = Buffer.from([0x50, 0x4b, 0x05, 0x06]) // End-of-Central-Directory
 const CD_SIG = 0x02014b50 // Central-Directory file header
@@ -725,12 +736,13 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
 // zero throws — against 0/50 clean on the worst of them before the reorder.
 
 // Ordered first, so every flag the worksheet branch tests is set before a worksheet is reached.
-// xl/workbook.xml is not one of those flags but leads anyway: it sets this.model, dereferenced by
-// the same function for the sheet NAME, and the source of the 'sheets' throw when missing.
+// xl/workbook.xml is not one of those flags but leads anyway: it sets this.model, whose absence is
+// the 'sheets' TypeError above. Sheet NAMES no longer come from it — we resolve those ourselves, so
+// the reader's own copy is only what keeps it from throwing.
 const XLSX_LEADING_ENTRIES = [
     '[Content_Types].xml',
     '_rels/.rels',
-    'xl/workbook.xml', // -> this.model  (sheet names; the 'sheets' TypeError without it)
+    'xl/workbook.xml', // -> this.model  (the 'sheets' TypeError without it)
     'xl/_rels/workbook.xml.rels', // -> this.workbookRels
     'xl/sharedStrings.xml', // -> this.sharedStrings
     'xl/styles.xml', // -> this.styles      (number formats)
@@ -754,20 +766,165 @@ const CENTRAL_HEADER_BYTES = 46
 const EOCD_BYTES = 22
 const ZIP_VERSION = 20 // 2.0 — the floor for deflate, which is all we re-emit
 
-// One xl/worksheets/sheetN.xml per worksheet the reader should yield. Counted from the archive, not
-// xl/workbook.xml's <sheet> list: that list also names chartsheets, which have no worksheet part and
-// would make a correct read look like it had lost one.
-const WORKSHEET_ENTRY = /^xl\/worksheets\/sheet\d+\.xml$/
+// One xl/worksheets/sheetN.xml per worksheet, anchored.
+const WORKSHEET_PART = /^xl\/worksheets\/sheet\d+\.xml$/
 
-// Rebuild with XLSX_LEADING_ENTRIES first, everything else after in its original order, reporting
-// the worksheet count so the caller can verify it got them all. Returns undefined when the directory
-// can't be walked, and the caller MUST fail rather than fall back to the original bytes (see
-// DECOMPRESSION BUDGET). No known archive reaches this — every bail below is also a budget
-// rejection, and the lone divergence (a name length overrunning the buffer) is caught by Invariant
-// 2 — so failing closed only keeps that from being load-bearing.
-const reorderForStreaming = (buf: Buffer): { content: Buffer; worksheets: number } | undefined => {
+// What EXCELJS treats as a worksheet: the same shape, UNANCHORED (workbook-reader.js:311). So it
+// dispatches xl/worksheets/sheet1.xml.bak, or a copy nested under any prefix, where WORKSHEET_PART
+// does not. That divergence was harmless while names came off the reader — it only ever made the
+// backstop's expected count a subset of what was emitted, which cannot false-fire. It is not
+// harmless now that names are positional, since one unresolved emission shifts every later one. The
+// rebuild drops everything this matches that is not a resolved part, making emitted === laid out.
+const EXCELJS_WORKSHEET_DISPATCH = /xl\/worksheets\/sheet\d+[.]xml/
+
+/////////////////////////////////////////////////////////////
+// SHEET IDENTITY
+//
+// Which worksheets exist, in what order, under what names — resolved from the WORKBOOK, not from the
+// archive. exceljs takes all three from zip layout: it emits in entry order, and it names a sheet by
+// matching rel.Target against one exact spelling (workbook-reader.js:302,
+// `worksheets/sheet${n}.xml`), so a legal absolute Target ("/xl/worksheets/sheet1.xml") resolves to
+// no name at all. workbook.xlsx.load() went through xl/workbook.xml's <sheets> list and the rels
+// instead, which is why streaming diverged from it three ways at once: a workbook whose tabs had been
+// dragged came back in file order, absolute targets came back as "Sheet1, Sheet2, ...", and orphan
+// sheetN.xml parts that no <sheet> references were emitted as sheets of their own.
+//
+// Reading the two parts here puts the authority where the format puts it and makes
+// reorderForStreaming the single place that decides — which is also what lets the reader be named
+// positionally, and what keeps the lost-worksheet backstop counting something real.
+
+const WORKBOOK_PART = 'xl/workbook.xml'
+const WORKBOOK_RELS_PART = 'xl/_rels/workbook.xml.rels'
+
+// One worksheet as the workbook describes it: the archive entry holding it, and its tab name.
+interface WorkbookSheet {
+    part: string
+    name: string
+}
+
+// Inflate one entry whole. Only ever called on the two parts above, both of which exceljs inflates
+// again itself, so this adds no memory class the read did not already have — and both sit inside the
+// decompression budget that already ran. undefined = unreadable, which the caller treats as "the
+// workbook did not tell us" rather than as an error.
+const inflateEntry = (entry: ZipEntry): Promise<Buffer | undefined> => {
+    if (entry.method === 0) return Promise.resolve(entry.data) // stored: output === input
+    if (entry.method !== 8) return Promise.resolve(undefined) // the budget already refuses these
+    return new Promise((resolve) => zlib.inflateRaw(entry.data, (error, out) => resolve(error ? undefined : out)))
+}
+
+// Strip a namespace PREFIX, nothing else. Both parts below are matched on local name: a producer may
+// bind the relationship prefix to something other than `r` or default the spreadsheetml namespace,
+// and there is exactly one element name to find in each — so real namespace processing would buy
+// nothing here and would make an undeclared prefix fatal, which saxes only enforces with xmlns on.
+const localName = (name: string): string => name.slice(name.indexOf(':') + 1)
+
+// <sheets> is tab order (ECMA-376 12.3.2); each <sheet> carries its name and an r:id into the rels.
+// A parse and not a scan, because sheet names carry XML entities and either quote style.
+const parseWorkbookParts = async (workbookXml: string, relsXml: string) => {
+    const { SaxesParser } = await import('saxes')
+
+    const declared: { name: string; rId: string }[] = []
+    const workbook = new SaxesParser()
+    workbook.on('opentag', (tag) => {
+        if (localName(tag.name) !== 'sheet') return
+        // Only a prefix is stripped, so the sibling `sheetId` attribute cannot match this.
+        const rId = Object.entries(tag.attributes).find(([key]) => localName(key) === 'id')?.[1]
+        if (tag.attributes.name && rId) declared.push({ name: tag.attributes.name, rId })
+    })
+    workbook.write(workbookXml).close()
+
+    const targets = new Map<string, string>()
+    const rels = new SaxesParser()
+    rels.on('opentag', (tag) => {
+        if (localName(tag.name) !== 'Relationship') return
+        const { Id, Target, TargetMode } = tag.attributes
+        // An external target points outside the package, so it is never an entry we hold.
+        if (Id && Target && TargetMode !== 'External') targets.set(Id, Target)
+    })
+    rels.write(relsXml).close()
+
+    return { declared, targets }
+}
+
+// A Target is relative to the rels part's base — xl/ — but may legally be an absolute package path
+// or climb out with '..'. exceljs compares the raw string against one form and misses every other;
+// this maps all of them onto the archive's entry name. undefined = it escapes the package.
+const resolveRelTarget = (target: string): string | undefined => {
+    const trimmed = target.trim()
+    if (trimmed === '') return undefined
+    const path: string[] = []
+    for (const segment of (trimmed.startsWith('/') ? trimmed.slice(1) : `xl/${trimmed}`).split('/')) {
+        if (segment === '' || segment === '.') continue
+        if (segment === '..') {
+            if (path.pop() === undefined) return undefined
+            continue
+        }
+        path.push(segment)
+    }
+    return path.length > 0 ? path.join('/') : undefined
+}
+
+// The workbook's own worksheets, in tab order. undefined when it cannot say — a missing or unreadable
+// workbook.xml / rels part. Deliberately not an error: the streaming reader degrades on exactly that
+// input (it never sets this.workbookRels, so every sheet takes the spool path) yet still reads to
+// completion, so failing here would turn a workbook that works today into a `failed`. archiveWorksheets
+// is the fallback, and it is what main did for every workbook.
+const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] | undefined> => {
+    const workbookEntry = entries.find((entry) => entry.name === WORKBOOK_PART)
+    const relsEntry = entries.find((entry) => entry.name === WORKBOOK_RELS_PART)
+    if (!workbookEntry || !relsEntry) return undefined
+
+    const [workbookXml, relsXml] = await Promise.all([inflateEntry(workbookEntry), inflateEntry(relsEntry)])
+    if (!workbookXml || !relsXml) return undefined
+
+    let parsed: Awaited<ReturnType<typeof parseWorkbookParts>>
+    try {
+        parsed = await parseWorkbookParts(workbookXml.toString('utf8'), relsXml.toString('utf8'))
+    } catch {
+        return undefined // malformed — exceljs's own parse of the same bytes fails too
+    }
+
+    const present = new Set(entries.map((entry) => entry.name))
+    const claimed = new Set<string>()
+    const sheets: WorkbookSheet[] = []
+    for (const { name, rId } of parsed.declared) {
+        const target = parsed.targets.get(rId)
+        const part = target === undefined ? undefined : resolveRelTarget(target)
+        // <sheets> also names chartsheets and dialogsheets, which have no xl/worksheets part — the
+        // reason the count used to be taken off the archive instead. Filtering them keeps that
+        // property while moving the authority: a chartsheet is not a worksheet the reader can yield.
+        // A <sheet> naming a part the archive lacks is likewise nothing anyone could emit.
+        if (part === undefined || !WORKSHEET_PART.test(part) || !present.has(part) || claimed.has(part)) continue
+        claimed.add(part)
+        sheets.push({ part, name })
+    }
+    // Zero is a legitimate answer for a chartsheet-only workbook, but it is indistinguishable from a
+    // workbook.xml we failed to understand — and the fallback gives the same empty result for both.
+    return sheets.length > 0 ? sheets : undefined
+}
+
+// The fallback, which is what main did for every workbook: the archive's own worksheet parts, in
+// entry order, named positionally.
+const archiveWorksheets = (entries: ZipEntry[]): WorkbookSheet[] =>
+    entries
+        .filter((entry) => WORKSHEET_PART.test(entry.name))
+        .map((entry, index) => ({ part: entry.name, name: `Sheet${index + 1}` }))
+
+/////////////////////////////////////////////////////////////
+
+// Rebuild with XLSX_LEADING_ENTRIES first, then the resolved worksheets in TAB order, then everything
+// else in its original order — minus any further part this reader would dispatch as a worksheet.
+// Reports the sheets it laid out so the caller can name and count them positionally. Refuses rather
+// than falling back to the original bytes (see DECOMPRESSION BUDGET), and says WHICH refusal: a
+// directory we could not read and a rewrite we declined to produce are different facts, and only the
+// first is unreachable — the entry-count bail below has a test driving it.
+type Reorder = { ok: true; content: Buffer; sheets: WorkbookSheet[] } | { ok: false; reason: string }
+
+const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     const entries = zipEntries(buf)
-    if (!entries) return undefined
+    // Unreachable: every zipEntries bail is also a budget rejection except a name length overrunning
+    // the buffer, which Invariant 2 catches. Failing closed keeps that from being load-bearing.
+    if (!entries) return { ok: false, reason: 'xlsx central directory could not be read for streaming' }
 
     const complete = entries.some((entry) => entry.name === 'xl/sharedStrings.xml')
         ? entries
@@ -787,15 +944,36 @@ const reorderForStreaming = (buf: Buffer): { content: Buffer; worksheets: number
     // zipEntries refuses an archive already declaring it, but the injection above can carry a
     // 65534-entry archive onto it, writing a sentinel where a count belongs. Reachable inside
     // MAX_INPUT_BYTES: ~76 bytes of headers per entry, so 65534 fit in ~5 MB.
-    if (complete.length >= 0xffff) return undefined
+    if (complete.length >= 0xffff) {
+        return { ok: false, reason: `xlsx would rewrite to ${complete.length} entries, at the 0xffff count sentinel` }
+    }
 
+    const sheets = (await workbookWorksheets(entries)) ?? archiveWorksheets(entries)
+    const byName = new Map<string, ZipEntry>()
+    for (const entry of complete) if (!byName.has(entry.name)) byName.set(entry.name, entry)
+
+    const leadingRank = XLSX_LEADING_ENTRIES.length
     const rank = (name: string) => {
         const index = XLSX_LEADING_ENTRIES.indexOf(name)
-        return index === -1 ? XLSX_LEADING_ENTRIES.length : index
+        return index === -1 ? leadingRank : index
     }
-    // Stable by construction: equal ranks keep their original relative order, so worksheets stay in
-    // sheet1, sheet2, ... order and the output's sheet sequence is unchanged.
-    const ordered = [...complete].sort((a, b) => rank(a.name) - rank(b.name))
+    // Three groups rather than one sort, because the middle is ordered by the WORKBOOK and the last
+    // DROPS entries rather than placing them.
+    const ordered = [
+        // Every flag the reader's worksheet branch tests, set before a worksheet is reached.
+        ...complete.filter((entry) => rank(entry.name) < leadingRank).sort((a, b) => rank(a.name) - rank(b.name)),
+        // Tab order. Both resolvers only name parts they found in this archive, so nothing is dropped.
+        ...sheets.flatMap((sheet) => {
+            const entry = byName.get(sheet.part)
+            return entry ? [entry] : []
+        }),
+        // Everything else — minus every remaining part the reader would dispatch as a worksheet.
+        // Orphan sheetN.xml parts no <sheet> references die here, which is both what stops them being
+        // emitted as sheets of their own and what makes the Nth emission exactly sheets[N - 1].
+        ...complete.filter(
+            (entry) => rank(entry.name) === leadingRank && !EXCELJS_WORKSHEET_DISPATCH.test(entry.name)
+        ),
+    ]
 
     const locals: Buffer[] = []
     const centrals: Buffer[] = []
@@ -834,10 +1012,7 @@ const reorderForStreaming = (buf: Buffer): { content: Buffer; worksheets: number
     end.writeUInt16LE(ordered.length, 10)
     end.writeUInt32LE(directory.length, 12)
     end.writeUInt32LE(offset, 16)
-    return {
-        content: Buffer.concat([...locals, directory, end]),
-        worksheets: complete.filter((entry) => WORKSHEET_ENTRY.test(entry.name)).length,
-    }
+    return { ok: true, content: Buffer.concat([...locals, directory, end]), sheets }
 }
 
 /////////////////////////////////////////////////////////////

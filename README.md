@@ -114,10 +114,17 @@ guards reduce blast radius; they are **not** a sandbox.
   budget binding on this format: the streaming reader walks local file headers, not the central
   directory the budget measured, and only the rebuilt copy is guaranteed to carry exactly the
   measured entries — so an archive that cannot be rebuilt is `failed`, never streamed as it arrived.
-  Behind that, a workbook read to completion that yields fewer worksheets than the archive holds
+  Behind that, a workbook read to completion that yields fewer worksheets than the workbook declares
   returns `failed` rather than a partial workbook reported as `extracted` — silent partial output is
   the one outcome worth failing over, since a caller can retry a failure but cannot tell a truncated
   document from a complete one.
+- **`.xlsx` sheet identity** — which sheets exist, in what order, and under what names comes from
+  `xl/workbook.xml` and its relationships, not from the archive's layout. Sheets are emitted in tab
+  order (which a dragged tab changes without moving any `sheetN.xml`), named as the workbook names
+  them (`exceljs` matches relationship targets against a single spelling and silently fails to name a
+  sheet whose target is written as an absolute package path), and worksheet parts the workbook does
+  not reference are dropped rather than emitted as sheets of their own. A workbook whose sheet list
+  cannot be read falls back to the archive's own parts, in entry order, named `Sheet1`, `Sheet2`, ….
 
 ## What it does that off-the-shelf engines don't
 
