@@ -1214,10 +1214,13 @@ const errorMessage = (error: unknown): string => (error instanceof Error ? error
 /////////////////////////////////////////////////////////////
 // ENTRY POINT — every step in order, each risky one inside its own safety net.
 
-// A caller's cap may only tighten: absent or non-finite falls back to the ceiling, negative clamps
-// to 0, fractional floors (a cap is a whole number of chars).
+// A caller's cap may only tighten: absent or NaN falls back to the ceiling, negative clamps to 0,
+// fractional floors (a cap is a whole number of chars). The infinities go through the clamp rather
+// than the fallback, so the function is monotonic across its whole domain — -Infinity used to mean
+// "no cap at all" while -5 meant 0, which is a seam nothing benefits from. Both routes are safe
+// either way: this can only ever tighten.
 const resolveCap = (requested?: number): number =>
-    requested === undefined || !Number.isFinite(requested)
+    requested === undefined || Number.isNaN(requested)
         ? MAX_OUTPUT_CHARS
         : Math.min(MAX_OUTPUT_CHARS, Math.max(0, Math.floor(requested)))
 

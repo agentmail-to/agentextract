@@ -1703,15 +1703,19 @@ describe('attachment — extract options', () => {
         expect(r.extraction).toHaveLength(MAX_OUTPUT_CHARS)
     })
 
-    it('ignores a non-finite or negative cap rather than producing an empty extraction', async () => {
+    it('ignores an unusable or negative cap rather than producing an empty extraction', async () => {
         for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
             const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: bad })
             expect(r.extraction).toHaveLength(MAX_OUTPUT_CHARS)
         }
-        // Negative clamps to 0 — a cap of "no text at all" is coherent, so it is honoured, not ignored.
-        const zero = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: -5 })
-        expect(zero.extraction).toBeUndefined() // '' collapses to omitted, per the contract
-        expect(zero.status).toBe('extracted')
+        // Negative clamps to 0 — a cap of "no text at all" is coherent, so it is honoured, not
+        // ignored. -Infinity is the same request, so it must land the same place: it used to take
+        // the non-finite fallback and come back as the full 250k, the one non-monotonic seam here.
+        for (const none of [-5, Number.NEGATIVE_INFINITY]) {
+            const zero = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: none })
+            expect(zero.extraction).toBeUndefined() // '' collapses to omitted, per the contract
+            expect(zero.status).toBe('extracted')
+        }
     })
 
     it('floors a fractional cap', async () => {
