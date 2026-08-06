@@ -2122,6 +2122,25 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
     })
 
+    // And the third way the pair can disagree: the type names a chart sheet, the target resolves to a
+    // real part, and that part is neither a worksheet nor a chart sheet. "Not a worksheet" was too
+    // weak a test — the kinds have to match, or the sheet that does hold the rows goes unclaimed.
+    it('treats a non-worksheet type pointing at an unrelated part as unplaced', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file(
+                'xl/_rels/workbook.xml.rels',
+                rels.replace(
+                    /(<Relationship[^>]*)Type="[^"]*\/worksheet"([^>]*)Target="worksheets\/sheet2\.xml"/,
+                    '$1Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet"$2Target="styles.xml"'
+                )
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
     // ISO/IEC 29500 Strict is a legal .xlsx — Excel offers it as "Strict Open XML Workbook" — and
     // re-homes the same vocabulary under purl.oclc.org. Recognizing only Transitional matched no
     // <sheet> at all, so a Strict workbook silently lost its tab order and names to the archive's.

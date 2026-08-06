@@ -1051,15 +1051,19 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
         // to yield, so it is accounted for and must NOT count as unplaced — otherwise every workbook
         // holding one flips into the rescue below and resurrects genuine orphans.
         //
-        // Type and target have to AGREE. Neither alone is enough, and each was tried: classifying by
-        // the target's path let a worksheet relationship aimed at a planted xl/chartsheets/sheet1.xml
-        // pass as a chart sheet, and then trusting the type alone let a chartsheet-typed relationship
-        // still pointing at worksheets/sheet2.xml pass while that part held the rows. Both left the
-        // real worksheet unclaimed for the orphan rule to drop. So: the type says non-worksheet, and
-        // the target must resolve to a part this archive actually holds that is not a worksheet.
-        // Anything else is a contradiction we cannot resolve, which is what `unplaced` is for.
-        if (NON_WORKSHEET_REL.test(rel.type)) {
-            if (part === undefined || !present.has(part) || WORKSHEET_PART.test(part)) unplaced += 1
+        // Type and target have to name the SAME KIND. Every looser rule has been wrong in the same
+        // direction: the target's path alone let a worksheet relationship aimed at a planted
+        // xl/chartsheets/sheet1.xml pass as a chart sheet; the type alone let a chartsheet-typed
+        // relationship still pointing at worksheets/sheet2.xml pass; "resolves to some part that is
+        // not a worksheet" let a chartsheet-typed relationship pointing at xl/styles.xml pass. Each
+        // one left the real worksheet unclaimed for the orphan rule to drop.
+        //
+        // A path convention is load-bearing here where it could not be for the worksheet case,
+        // because the asymmetry inverted: a chart sheet stored somewhere unconventional now reads as
+        // unplaced, which costs a rescued orphan in the output. Guessing the other way costs rows.
+        const otherKind = NON_WORKSHEET_REL.exec(rel.type)?.[1]
+        if (otherKind !== undefined) {
+            if (part === undefined || !present.has(part) || !part.startsWith(`xl/${otherKind}s/`)) unplaced += 1
             continue
         }
         // Anything else is expected to be a worksheet, whatever its declared type — an unknown or
