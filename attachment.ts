@@ -838,13 +838,24 @@ const EXCELJS_WORKSHEET_DISPATCH = /xl\/worksheets\/sheet\d+[.]xml/
 const WORKBOOK_PART = 'xl/workbook.xml'
 const WORKBOOK_RELS_PART = 'xl/_rels/workbook.xml.rels'
 
-// The relationship types naming a sheet that has NO xl/worksheets part, so a declaration carrying
-// one is accounted for rather than lost. Matched on the type, which the format defines, and never on
-// the target's path, which the producer writes: a path whitelist is walked into by pointing a
-// worksheet relationship at a planted xl/chartsheets/sheet1.xml. Anchored at the end so a type
-// merely ending in these words cannot pass. Macrosheets are deliberately absent — treating one as
-// unplaced costs a rescued orphan in the output, treating it as accounted-for could cost rows.
-const NON_WORKSHEET_REL = /\/relationships\/(chartsheet|dialogsheet)$/
+// The relationship types naming a sheet that has NO xl/worksheets part, mapped to the part family
+// each one must live in, in both flavours: Transitional (schemas.openxmlformats.org) and Strict
+// (purl.oclc.org). A declaration carrying one is accounted for rather than counted lost.
+//
+// EXACT URIs, not a suffix match. A relationship type is an identifier the format defines, so
+// anything else bearing the same tail is a stranger: https://invalid.example/relationships/chartsheet
+// passed a tail match and, with a planted xl/chartsheets/fake.xml to point at, took a real sheet's
+// place. Membership of this map is the whole authority — an unrecognized type is expected to be a
+// worksheet, so it reaches the rescue instead of bypassing it.
+//
+// Macrosheets are deliberately absent: treating one as unplaced costs a rescued orphan in the
+// output, treating it as accounted-for could cost rows.
+const NON_WORKSHEET_REL = new Map([
+    ['http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet', 'chartsheets'],
+    ['http://schemas.openxmlformats.org/officeDocument/2006/relationships/dialogsheet', 'dialogsheets'],
+    ['http://purl.oclc.org/ooxml/officeDocument/relationships/chartsheet', 'chartsheets'],
+    ['http://purl.oclc.org/ooxml/officeDocument/relationships/dialogsheet', 'dialogsheets'],
+])
 
 // One worksheet as the workbook describes it: the archive entry holding it, and its tab name.
 //
@@ -917,8 +928,8 @@ const OFFICE_RELS_NS = new Set([
     'http://purl.oclc.org/ooxml/officeDocument/relationships',
 ])
 // The .rels grammar is OPC (29500-2), which Strict does not re-home — the flavours differ in the
-// part markup, not in the package. Relationship TYPE values do move, which NON_WORKSHEET_REL matches
-// on its suffix rather than its origin so both spellings land the same.
+// part markup, not in the package. Relationship TYPE values do move, so NON_WORKSHEET_REL lists both
+// spellings of each one explicitly.
 const PACKAGE_RELS_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
 
 // One relationship as the workbook points at it. The TYPE is carried, not just the target: a Target
@@ -1055,9 +1066,9 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
         // A path convention is load-bearing here where it could not be for the worksheet case,
         // because the asymmetry inverted: a chart sheet stored somewhere unconventional now reads as
         // unplaced, which costs a rescued orphan in the output. Guessing the other way costs rows.
-        const otherKind = NON_WORKSHEET_REL.exec(rel.type)?.[1]
-        if (otherKind !== undefined) {
-            if (part === undefined || !present.has(part) || !part.startsWith(`xl/${otherKind}s/`)) hasUnplaced = true
+        const otherFamily = NON_WORKSHEET_REL.get(rel.type)
+        if (otherFamily !== undefined) {
+            if (part === undefined || !present.has(part) || !part.startsWith(`xl/${otherFamily}/`)) hasUnplaced = true
             continue
         }
         // Anything else is expected to be a worksheet, whatever its declared type — an unknown or
