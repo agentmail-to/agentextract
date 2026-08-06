@@ -2169,23 +2169,37 @@ describe('attachment — xlsx archive rewrite limits', () => {
         return Buffer.concat([...locals, directory, end])
     }
 
+    // Both boundary tests carry an explicit timeout. These fixtures are ~5.6 MB with 65k entries by
+    // construction — the size IS the test — and the accepting one ran at 3660ms against vitest's
+    // 5000ms default in a full-suite run, close enough that it failed on a loaded machine and passed
+    // on rerun. A cheaper fixture is not available without giving up what the pair proves.
+    const BOUNDARY_TIMEOUT_MS = 30_000
+
     // The reason is asserted, not just the status: this archive's directory read perfectly well — we
     // declined to REWRITE it — and reporting that as "could not be read" sent an investigation at the
     // wrong half of the preflight. Two distinct causes must not collapse into one message.
-    it('refuses an archive whose rewrite would land on the 0xffff entry-count sentinel', async () => {
-        // 65534 real entries + the injected shared-string part = 65535 = 0xffff.
-        const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 1), contentType: XLSX_TYPE })
-        expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/0xffff count sentinel/)
-        expect(r.reason).not.toMatch(/central directory could not be read/)
-    })
+    it(
+        'refuses an archive whose rewrite would land on the 0xffff entry-count sentinel',
+        async () => {
+            // 65534 real entries + the injected shared-string part = 65535 = 0xffff.
+            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 1), contentType: XLSX_TYPE })
+            expect(r.status).toBe('failed')
+            expect(r.reason).toMatch(/0xffff count sentinel/)
+            expect(r.reason).not.toMatch(/central directory could not be read/)
+        },
+        BOUNDARY_TIMEOUT_MS
+    )
 
-    it('accepts one entry below that boundary, so the refusal is the sentinel and not the size', async () => {
-        // 65533 + 1 = 65534, a legal count. Same shape, same ~5.6 MB, one fewer entry: without this
-        // the test above would also pass if the rewrite simply gave up on large archives.
-        const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2), contentType: XLSX_TYPE })
-        expect(r.status).toBe('extracted')
-    })
+    it(
+        'accepts one entry below that boundary, so the refusal is the sentinel and not the size',
+        async () => {
+            // 65533 + 1 = 65534, a legal count. Same shape, same ~5.6 MB, one fewer entry: without
+            // this the test above would also pass if the rewrite simply gave up on large archives.
+            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2), contentType: XLSX_TYPE })
+            expect(r.status).toBe('extracted')
+        },
+        BOUNDARY_TIMEOUT_MS
+    )
 })
 
 // PDF truncation signals ------------------------------------------------------
