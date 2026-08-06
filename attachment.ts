@@ -839,6 +839,14 @@ const EXCELJS_WORKSHEET_DISPATCH = /xl\/worksheets\/sheet\d+[.]xml/
 const WORKBOOK_PART = 'xl/workbook.xml'
 const WORKBOOK_RELS_PART = 'xl/_rels/workbook.xml.rels'
 
+// The relationship types naming a sheet that has NO xl/worksheets part, so a declaration carrying
+// one is accounted for rather than lost. Matched on the type, which the format defines, and never on
+// the target's path, which the producer writes: a path whitelist is walked into by pointing a
+// worksheet relationship at a planted xl/chartsheets/sheet1.xml. Anchored at the end so a type
+// merely ending in these words cannot pass. Macrosheets are deliberately absent — treating one as
+// unplaced costs a rescued orphan in the output, treating it as accounted-for could cost rows.
+const NON_WORKSHEET_REL = /\/relationships\/(chartsheet|dialogsheet)$/
+
 // One worksheet as the workbook describes it: the archive entry holding it, and its tab name.
 //
 // The ENTRY, deliberately, and not its name. Zip permits duplicate entry names, so a name is not a
@@ -858,21 +866,59 @@ const worksheetEntries = (entries: ZipEntry[]): ZipEntry[] => entries.filter((en
 // available, and is what the reader's own fallback produced for these.
 const partFallbackName = (part: string): string => `Sheet${/(\d+)\.xml$/.exec(part)?.[1] ?? ''}`
 
-// Inflate one entry whole. Only ever called on the two parts above, both of which exceljs inflates
-// again itself, so this adds no memory class the read did not already have — and both sit inside the
-// decompression budget that already ran. undefined = unreadable, which the caller treats as "the
-// workbook did not tell us" rather than as an error.
+// A ceiling on the two metadata parts, which is NOT the decompression budget. The budget bounds the
+// whole archive at 50 MB, and letting one part spend all of it here costs ~2x that in peak: the
+// Buffer, then the UTF-16 string the parse needs. Measured on a 46 KB attachment whose workbook.xml
+// inflates to 42 MB — heap +89 MB and RSS 319 MB, against +49 MB and 205 MB before this resolver
+// existed, on the path whose whole point was holding 24 concurrent parses inside 662 MB.
+//
+// exceljs is no argument for spending it: it streams both parts through saxes
+// (workbook-reader.js:157-166 `parseStream(iterateStream(entry))`) and never holds either whole, so
+// this is a memory class the read did not previously have, not one it already paid.
+//
+// 4 MB because a real workbook.xml is kilobytes — thousands of sheets plus their defined names still
+// land far under it — so the cap can only be reached by a part padded to reach it. Over the cap is
+// treated as unreadable, which degrades to archiveWorksheets rather than failing.
+const MAX_METADATA_BYTES = 4 * 1024 * 1024
+
+// Inflate one entry, bounded. Only ever called on the two parts above. undefined = unreadable or
+// over the cap, which the caller treats as "the workbook did not tell us" rather than as an error.
 const inflateEntry = (entry: ZipEntry): Promise<Buffer | undefined> => {
-    if (entry.method === 0) return Promise.resolve(entry.data) // stored: output === input
+    // Stored: output === input, and the subarray is a view on bytes already resident.
+    if (entry.method === 0) {
+        return Promise.resolve(entry.data.length <= MAX_METADATA_BYTES ? entry.data : undefined)
+    }
     if (entry.method !== 8) return Promise.resolve(undefined) // the budget already refuses these
-    return new Promise((resolve) => zlib.inflateRaw(entry.data, (error, out) => resolve(error ? undefined : out)))
+    // maxOutputLength, not a post-hoc length check: it errors on the chunk that would cross the cap,
+    // so the allocation never happens. uncompSize is self-declared and cannot be the guard.
+    return new Promise((resolve) =>
+        zlib.inflateRaw(entry.data, { maxOutputLength: MAX_METADATA_BYTES }, (error, out) =>
+            resolve(error ? undefined : out)
+        )
+    )
 }
 
-// Strip a namespace PREFIX, nothing else. Both parts below are matched on local name: a producer may
-// bind the relationship prefix to something other than `r` or default the spreadsheetml namespace,
-// and there is exactly one element name to find in each — so real namespace processing would buy
-// nothing here and would make an undeclared prefix fatal, which saxes only enforces with xmlns on.
-const localName = (name: string): string => name.slice(name.indexOf(':') + 1)
+// Namespace-aware, because a local name alone is not an identity. Matching `sheet` anywhere accepted
+// a foreign <foo:sheet> planted in an <extLst> extension block: it claimed the real sheet's part
+// first, so the sheet came back under the attacker's name and in the attacker's tab position, and
+// the genuine declaration was skipped as already claimed. Element identity is (namespace, local
+// name), and the parent has to be <sheets> — the only place ECMA-376 12.3.2 puts a tab declaration.
+//
+// The cost is that saxes with xmlns on treats an UNDECLARED prefix as fatal. That is contained: the
+// caller catches the throw and degrades to archiveWorksheets, the same answer it already gives for a
+// workbook it cannot read, and exceljs's own parse of those bytes fails too.
+const SPREADSHEETML_NS = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
+const PACKAGE_RELS_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
+const OFFICE_RELS_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+// One relationship as the workbook points at it. The TYPE is carried, not just the target: a Target
+// is a string the producer chose, so classifying a declaration by the shape of its path let a
+// worksheet relationship aimed at xl/chartsheets/anything read as a legitimate chart sheet — and the
+// worksheet part that really held those rows was then dropped as an orphan.
+interface WorkbookRel {
+    target: string
+    type: string
+}
 
 // <sheets> is tab order (ECMA-376 12.3.2); each <sheet> carries its name and an r:id into the rels.
 // A parse and not a scan, because sheet names carry XML entities and either quote style.
@@ -883,22 +929,30 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string) => {
     // resolved, but the caller has to know the workbook DECLARED something it could not place —
     // dropping them here would make an unresolvable sheet indistinguishable from an orphan part.
     const declared: { name: string; rId?: string }[] = []
-    const workbook = new SaxesParser()
+    const workbook = new SaxesParser<{ xmlns: true }>({ xmlns: true })
+    // Parent tracking, so <sheet> counts only as a child of <sheets>.
+    const open: { uri: string; local: string }[] = []
     workbook.on('opentag', (tag) => {
-        if (localName(tag.name) !== 'sheet') return
-        // Only a prefix is stripped, so the sibling `sheetId` attribute cannot match this.
-        const rId = Object.entries(tag.attributes).find(([key]) => localName(key) === 'id')?.[1]
-        declared.push({ name: tag.attributes.name ?? '', rId })
+        const parent = open[open.length - 1]
+        open.push({ uri: tag.uri, local: tag.local })
+        if (tag.uri !== SPREADSHEETML_NS || tag.local !== 'sheet') return
+        if (parent?.uri !== SPREADSHEETML_NS || parent.local !== 'sheets') return
+        // r:id is namespace-qualified; `name` and the sibling `sheetId` are not, so neither can be
+        // mistaken for it however the producer bound its prefixes.
+        const rId = Object.values(tag.attributes).find((a) => a.uri === OFFICE_RELS_NS && a.local === 'id')?.value
+        declared.push({ name: tag.attributes.name?.value ?? '', rId })
     })
+    workbook.on('closetag', () => void open.pop())
     workbook.write(workbookXml).close()
 
-    const targets = new Map<string, string>()
-    const rels = new SaxesParser()
+    const targets = new Map<string, WorkbookRel>()
+    const rels = new SaxesParser<{ xmlns: true }>({ xmlns: true })
     rels.on('opentag', (tag) => {
-        if (localName(tag.name) !== 'Relationship') return
-        const { Id, Target, TargetMode } = tag.attributes
+        if (tag.uri !== PACKAGE_RELS_NS || tag.local !== 'Relationship') return
+        const value = (name: string) => tag.attributes[name]?.value
+        const [Id, Target, Type, TargetMode] = [value('Id'), value('Target'), value('Type'), value('TargetMode')]
         // An external target points outside the package, so it is never an entry we hold.
-        if (Id && Target && TargetMode !== 'External') targets.set(Id, Target)
+        if (Id && Target && TargetMode !== 'External') targets.set(Id, { target: Target, type: Type ?? '' })
     })
     rels.write(relsXml).close()
 
@@ -952,7 +1006,6 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
         return undefined // malformed — exceljs's own parse of the same bytes fails too
     }
 
-    const present = new Set(entries.map((entry) => entry.name))
     const worksheets = worksheetEntries(entries)
     const byPart = new Map<string, ZipEntry>()
     for (const entry of worksheets) if (!byPart.has(entry.name)) byPart.set(entry.name, entry)
@@ -968,20 +1021,25 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
     // worksheets, which is a positive answer and costs nothing.
     let unplaced = 0
     for (const { name, rId } of parsed.declared) {
-        const target = rId === undefined ? undefined : parsed.targets.get(rId)
-        const part = target === undefined ? undefined : resolveRelTarget(target)
-        if (part === undefined || name === '') {
-            unplaced += 1 // no relationship, an unreadable Target, or nothing to call it
+        const rel = rId === undefined ? undefined : parsed.targets.get(rId)
+        if (rel === undefined || name === '') {
+            unplaced += 1 // no relationship, an external one, or nothing to call it
             continue
         }
-        // Resolved, just not to a worksheet: <sheets> also lists chartsheets and dialogsheets, which
-        // have no xl/worksheets part. Counting those would make a correct read look like a lossy one
-        // — but only when the archive HOLDS what we resolved to. A Target matching no entry at all
-        // resolved to nothing, and this sheet's rows may be sitting in a worksheet part the orphan
-        // rule below is about to drop. Reached by a mis-cased Target (OPC part names compare
-        // case-insensitively) or one written absolute without the xl/ prefix.
-        if (!WORKSHEET_PART.test(part)) {
-            if (!present.has(part)) unplaced += 1
+        // A chartsheet or dialogsheet is a real declaration with no xl/worksheets part for the reader
+        // to yield, so it is accounted for and must NOT count as unplaced — otherwise every workbook
+        // holding one flips into the rescue below and resurrects genuine orphans.
+        //
+        // Decided on the relationship TYPE, never on the target's path. The path is a string the
+        // producer chose: classifying by it let a worksheet relationship aimed at a planted
+        // xl/chartsheets/sheet1.xml read as a chart sheet, leaving the worksheet part that held the
+        // rows unclaimed for the orphan rule to drop. Type is what the format states the target IS.
+        if (NON_WORKSHEET_REL.test(rel.type)) continue
+        // Anything else is expected to be a worksheet, whatever its declared type — an unknown or
+        // absent type resolves here too, and unplaced is the safe answer for it.
+        const part = resolveRelTarget(rel.target)
+        if (part === undefined || !WORKSHEET_PART.test(part)) {
+            unplaced += 1
             continue
         }
         claimedNames.add(part)

@@ -2029,18 +2029,100 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
     // Resolving OUTSIDE xl/worksheets is normal — chartsheets live there — but only when the archive
     // holds the part. These two spellings resolve to nothing, so treating them as a chartsheet left
     // the declaration uncounted, the real part unclaimed, and its rows dropped as an orphan's.
+    // The last two resolve to a part that EXISTS, which is why "does the archive hold it?" was the
+    // wrong question — neither holds this sheet's rows, and the part that does goes unclaimed.
     it.each([
-        ['mis-cased, which OPC compares case-insensitively', 'Worksheets/sheet2.xml'],
-        ['absolute without the xl/ prefix', '/worksheets/sheet2.xml'],
-    ])('keeps a declared sheet whose Target is %s', async (_label, target) => {
+        ['mis-cased, which OPC compares case-insensitively', 'Worksheets/sheet2.xml', undefined],
+        ['absolute without the xl/ prefix', '/worksheets/sheet2.xml', undefined],
+        ['a real part that is not a sheet', 'styles.xml', undefined],
+        ['a stray backup beside the real part', 'worksheets/sheet2.xml.bak', 'xl/worksheets/sheet2.xml.bak'],
+    ])('keeps a declared sheet whose Target is %s', async (_label, target, plant) => {
         const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            if (plant) zip.file(plant, await part(zip, 'xl/worksheets/sheet2.xml'))
             const xml = await part(zip, 'xl/_rels/workbook.xml.rels')
             zip.file('xl/_rels/workbook.xml.rels', xml.replace('worksheets/sheet2.xml', target))
         })
 
         const r = await extractAttachment({ content, contentType: XLSX_TYPE })
-        expect(headers(r.extraction)).toHaveLength(3)
         for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // The control for the rule above: a chartsheet is a real declaration with no worksheet part, so
+    // it must NOT count as unplaced — otherwise every workbook holding one flips into rescue mode and
+    // resurrects the orphans this change exists to drop. Both halves asserted at once.
+    it('drops an orphan part while a declared chartsheet reads as accounted for', async () => {
+        const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+            zip.file('xl/chartsheets/sheet1.xml', '<chartsheet/>')
+            zip.file('xl/worksheets/sheet9.xml', await part(zip, 'xl/worksheets/sheet1.xml'))
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file(
+                'xl/_rels/workbook.xml.rels',
+                rels.replace(
+                    '</Relationships>',
+                    '<Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/></Relationships>'
+                )
+            )
+            const xml = await part(zip, 'xl/workbook.xml')
+            zip.file('xl/workbook.xml', xml.replace('</sheets>', '<sheet name="Chart" sheetId="2" r:id="rIdChart"/></sheets>'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        // sheet9 is a copy of sheet1's rows, so a resurrected orphan shows up as a second header —
+        // the row text alone could not tell the two apart.
+        expect(headers(r.extraction)).toEqual(['=== S1 ==='])
+    })
+
+    // The control above passes for the wrong reason if "is this a chart sheet?" is answered from the
+    // TARGET's path, which the producer writes. Here the relationship still says Type=worksheet and
+    // only the path is redirected onto a planted chartsheet part: a path whitelist reads it as an
+    // accounted-for chart sheet, and the worksheet part actually holding the rows is dropped.
+    it('classifies a sheet by relationship type, not by the path its target happens to take', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            zip.file('xl/chartsheets/sheet1.xml', '<chartsheet/>')
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file(
+                'xl/_rels/workbook.xml.rels',
+                rels.replace('Target="worksheets/sheet2.xml"', 'Target="chartsheets/sheet1.xml"')
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // Element identity is (namespace, local name) plus position. Matching bare local names let a
+    // foreign <foo:sheet> in an extension block claim a real sheet's part before the genuine
+    // declaration reached it, so the sheet came back under the injected name and tab position.
+    it('ignores a foreign element whose local name is sheet', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            const rId = /<sheet [^>]*name="S2"[^>]*r:id="([^"]+)"/.exec(xml)![1]
+            zip.file(
+                'xl/workbook.xml',
+                xml.replace(
+                    '<sheets>',
+                    `<extLst xmlns:foo="urn:example:foreign"><foo:sheet name="Injected" r:id="${rId}"/></extLst><sheets>`
+                )
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+    })
+
+    // The two metadata parts are read whole, so their size has to be bounded independently of the
+    // 50 MB archive budget — one part spending all of it costs that twice over, as a Buffer and then
+    // as the string the parse needs. Over the cap degrades to the archive's own parts; it never fails.
+    it('falls back to the archive rather than materializing an oversized workbook part', async () => {
+        const padded = await rebuild(await workbookWith(2, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            zip.file('xl/workbook.xml', xml.replace('<sheets>', `<!--${' '.repeat(5 * 1024 * 1024)}--><sheets>`))
+        })
+
+        const r = await extractAttachment({ content: padded, contentType: XLSX_TYPE })
+        // Archive order and fallback names — the workbook's own naming is what we declined to read.
+        expect(headers(r.extraction)).toEqual(['=== Sheet1 ===', '=== Sheet2 ==='])
+        for (let s = 1; s <= 2; s++) expect(r.extraction).toContain(`s${s}r1`)
     })
 
 })

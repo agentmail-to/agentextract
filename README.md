@@ -126,10 +126,12 @@ guards reduce blast radius; they are **not** a sandbox.
   not reference are dropped rather than emitted as sheets of their own. Dropping is the narrow case,
   though — a part is an orphan only when the workbook placed every sheet it declared and none of them
   claimed this part's name. If any declaration could not be placed, or the part shares its name with
-  one that was, it ships under a fallback name having lost only its tab position. A workbook whose
-  sheet list cannot be read at all — including one from which not a single declaration parses — falls
-  back to the archive's own parts, in entry order, named `Sheet1`, `Sheet2`, …. The rule throughout
-  is that a sheet may lose its position or its name, never its rows.
+  one that was, it ships under a fallback name having lost only its tab position. What a declaration
+  points at is read from the relationship's *type* rather than the shape of its target path, since
+  the path is a string the producing application chose. A workbook whose sheet list cannot be read at
+  all — one from which not a single declaration parses, or whose workbook part is too large to read
+  whole — falls back to the archive's own parts, in entry order, named `Sheet1`, `Sheet2`, …. The
+  rule throughout is that a sheet may lose its position or its name, never its rows.
 
 ## What it does that off-the-shelf engines don't
 
