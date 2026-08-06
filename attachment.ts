@@ -361,8 +361,11 @@ const xlsxHandler: Handler = {
             seen++
             const rows: string[] = []
             for await (const batch of worksheet) {
-                // Documented quirk: this yields an ARRAY of rows ("worksheetReader returns an array
-                // of rows ... for performance reasons"); older exceljs yielded one.
+                // 4.4.0 yields ONE Row per iteration (worksheet-reader.js:275 pushes
+                // `{eventType: 'row', value: row}`, and :104-112 yields each `value` through) — the
+                // other way round from how this once read. The normalization stays anyway: exceljs
+                // documents the batched shape, which is why the wrong version of this was believable,
+                // and it costs one predicate to be right under either.
                 const batchRows = (Array.isArray(batch) ? batch : [batch]) as StreamedRow[]
                 for (const row of batchRows) {
                     // ABOVE the empty-row skip: a contentless row is `continue`d, and a sheet of them
