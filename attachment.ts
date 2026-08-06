@@ -600,18 +600,42 @@ interface ZipEntry {
     data: Buffer // the raw stored bytes — deflated unless method is 0
 }
 
-// Walk the central directory. Sees only the PACKAGE's own parts, so an embedded object's internal
-// paths can't fool root detection. Returns undefined when the directory can't be walked; what the
-// two callers do with that differs, because they ask for different things:
-//   ooxmlKind  — identification, so it degrades to a raw byte scan.
-//   reorderForStreaming — the entry set unzipper will be given, so it refuses and its caller fails.
+// Walk the central directory for entry NAMES. Sees only the PACKAGE's own parts, so an embedded
+// object's internal paths can't fool root detection — which is the whole reason ooxmlKind prefers
+// this to a raw byte scan.
 //
-// That second caller makes this walk load-bearing for the .xlsx zip-bomb guard, not merely a lenient
-// identifier: the archive it emits is what makes the budget's measurement bind (see DECOMPRESSION
-// BUDGET). Still deliberately NOT merged with checkDecompressionBudget — that one is the measurement
-// itself, and its two invariants must reject archives this one accepts. Merging would force a single
-// contract onto both. What keeps the split safe is the one-way relation pinned at Invariant 2: this
-// walk can never be the more permissive of the two.
+// Deliberately more lenient than zipEntries below, and split from it for exactly that reason: naming
+// an entry needs no local header, no compressed region and no ZIP64 size fields, so every extra bail
+// zipEntries takes for the REWRITE would here only push identification back onto the byte scan this
+// exists to beat. Nothing is inflated on the strength of this answer, so leniency costs nothing.
+const zipEntryNames = (buf: Buffer): string[] | undefined => {
+    const eocd = findEocd(buf)
+    if (eocd < 0) return undefined
+    const count = buf.readUInt16LE(eocd + 10)
+    if (count === 0xffff) return undefined // ZIP64 entry count — not chased here
+    const names: string[] = []
+    let p = buf.readUInt32LE(eocd + 16)
+    for (let i = 0; i < count; i++) {
+        if (p + 46 > buf.length || buf.readUInt32LE(p) !== CD_SIG) return undefined
+        const nameLen = buf.readUInt16LE(p + 28)
+        if (p + 46 + nameLen > buf.length) return undefined
+        names.push(buf.toString('latin1', p + 46, p + 46 + nameLen))
+        p += 46 + nameLen + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
+    }
+    return names
+}
+
+// The same walk, plus everything needed to RE-EMIT each entry: its stored bytes, located through the
+// local header, and the fields a rebuilt header has to carry. Returns undefined when the directory
+// can't be walked — and its one caller, reorderForStreaming, refuses rather than degrading, because
+// the entry set it produces is what unzipper will be given.
+//
+// That makes this walk load-bearing for the .xlsx zip-bomb guard, not merely an identifier: the
+// archive it feeds is what makes the budget's measurement bind (see DECOMPRESSION BUDGET). Still
+// deliberately NOT merged with checkDecompressionBudget — that one is the measurement itself, and
+// its two invariants must reject archives this one accepts. Merging would force a single contract
+// onto both. What keeps the split safe is the one-way relation pinned at Invariant 2: this walk can
+// never be the more permissive of the two.
 const zipEntries = (buf: Buffer): ZipEntry[] | undefined => {
     const eocd = findEocd(buf)
     if (eocd < 0) return undefined
@@ -644,8 +668,6 @@ const zipEntries = (buf: Buffer): ZipEntry[] | undefined => {
     }
     return entries
 }
-
-const zipEntryNames = (buf: Buffer): string[] | undefined => zipEntries(buf)?.map((entry) => entry.name)
 
 // Measure a zip's ACTUAL decompressed size, capped, from each entry's real (structural, not
 // self-declared) compressed region. The two invariants below pin us to the records jszip will read
