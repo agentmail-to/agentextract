@@ -33,6 +33,15 @@ export const MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
 // Guard: stop awaiting a slow handler. Can't cancel synchronous CPU already running inside a parser.
 export const HANDLER_TIMEOUT_MS = 10_000
 
+// How far AHEAD of that timer a handler's own deadline sits. Without the gap the two are the same
+// instant and a handler can never report its own stop: the checks are `Date.now() > deadline`, so the
+// earliest one fires is deadline + 1ms, by which point withTimeout has already rejected — and a
+// partial-but-real extraction comes back as `failed`, discarding exactly the work those checks exist
+// to keep. This buys the turn a handler needs to finish the unit in flight and return. A margin, not
+// a guarantee: one page or row slower than this still loses the race, and `failed` is the right
+// answer when a single unit overruns.
+export const HANDLER_DEADLINE_MARGIN_MS = 1_000
+
 // Sniff the first 8KB to decide whether bytes look like text.
 const SNIFF_BYTES = 8 * 1024
 const SNIFF_TEXT_RATIO = 0.85
@@ -88,7 +97,9 @@ interface HandlerContext {
     charsetHint?: string // from the content-type charset= param
     // Both resolved centrally in extractAttachment; no handler defaults either for itself.
     maxOutputChars: number // the effective cap; handlers that build incrementally stop here
-    deadline: number // Date.now() ceiling; handlers that yield check it between units of work
+    // Date.now() ceiling, sitting a margin INSIDE withTimeout's; handlers that yield check it between
+    // units of work. See HANDLER_DEADLINE_MARGIN_MS for why the two instants must not coincide.
+    deadline: number
 }
 
 interface HandlerOutput {
@@ -1052,9 +1063,11 @@ export const extractAttachment = async (
                 filename: input.filename,
                 charsetHint,
                 maxOutputChars,
-                // The same budget withTimeout races on, as a value a handler can act on: the race
-                // can't cancel work already inside a parser; a handler checking this stops itself.
-                deadline: Date.now() + HANDLER_TIMEOUT_MS,
+                // The same budget withTimeout races on, less a margin, as a value a handler can act
+                // on: the race can't cancel work already inside a parser; a handler checking this
+                // stops itself. The margin is not decoration — it is what lets that stop be
+                // REPORTED. See HANDLER_DEADLINE_MARGIN_MS.
+                deadline: Date.now() + HANDLER_TIMEOUT_MS - HANDLER_DEADLINE_MARGIN_MS,
             }),
             HANDLER_TIMEOUT_MS
         )

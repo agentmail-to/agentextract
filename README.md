@@ -96,7 +96,10 @@ guards reduce blast radius; they are **not** a sandbox.
   **post-materialization** and peak memory follows the whole document.
 - **Timeout** — `HANDLER_TIMEOUT_MS` (10 s) stops *awaiting* a slow async parse. It cannot cancel
   synchronous CPU already running inside a parser, so handlers that yield between units of work (PDF
-  per page, `.xlsx` per row) also check the deadline themselves and stop; the others cannot.
+  per page, `.xlsx` per row) also check the deadline themselves and stop; the others cannot. Their
+  deadline sits `HANDLER_DEADLINE_MARGIN_MS` (1 s) *inside* the timeout, which is the window a handler
+  has to return what it read — so a self-stopped parse comes back `extracted` with `truncated` set
+  rather than being raced to `failed`. A single page or row that overruns the margin still times out.
 - **PDF** — page count and accumulated output are bounded (`MAX_PDF_PAGES`, `MAX_OUTPUT_CHARS`), but
   pdf.js's internal per-page decompression is **not** bounded in-library (no hook exists).
 - **`.xlsx`** — read row-by-row through `exceljs`'s streaming reader rather than loaded whole, so

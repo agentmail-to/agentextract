@@ -979,7 +979,57 @@ describe('attachment — edge cases (regression)', () => {
         }
     })
 
-    // Documented limitation — withTimeout (attachment.ts:781) is not exported, so replicate it
+    // The other side of that race, and the reason HANDLER_DEADLINE_MARGIN_MS exists: a parser slow
+    // enough to pass the handler's deadline but not the timeout must come back as a partial
+    // extraction, NOT as 'failed'. With the two instants equal it never can — handlers stop at
+    // `Date.now() > deadline`, strictly after the moment the timer already fired at — so ten seconds
+    // of successfully read pages are discarded.
+    //
+    // Fake timers are load-bearing here, not a speed trick. The per-handler deadline tests elsewhere
+    // in this file stub Date.now() and leave setTimeout real, which decouples the two clocks and is
+    // exactly why none of them can see this; one synthetic clock driving both is the real
+    // relationship. It also keeps this off the wall clock — a ~9s real-time test is a CI flake
+    // waiting to happen.
+    it('reports a slow yielding handler as truncated, not failed, inside the timeout', async () => {
+        const PAGE_MS = 250
+        const PAGES = 60 // 15s of work — far past the deadline, so the stop is unambiguously its
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => ({
+                numPages: PAGES,
+                // Yields between pages, like the real one: the deadline check sits at the top of the
+                // loop, so the handler can act on it.
+                getPage: (n: number) =>
+                    new Promise((resolve) =>
+                        setTimeout(
+                            () =>
+                                resolve({
+                                    getTextContent: async () => ({ items: [{ str: `page ${n}`, hasEOL: true }] }),
+                                }),
+                            PAGE_MS
+                        )
+                    ),
+            }),
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            vi.useFakeTimers()
+            const pending = extract({ content: buf('%PDF-1.4 slow'), contentType: 'application/pdf' })
+            await vi.advanceTimersByTimeAsync(HANDLER_TIMEOUT_MS + PAGE_MS)
+            const r = await pending
+
+            expect(r.status).toBe('extracted') // 'failed' here is the regression
+            expect(r.truncated).toBe(true)
+            expect(r.extraction).toContain('page 1') // pages read before the stop survive
+            expect(r.extraction).not.toContain(`page ${PAGES}`) // and it really did stop short
+        } finally {
+            vi.useRealTimers()
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
+
+    // Documented limitation — withTimeout is not exported, so replicate it
     // verbatim. Rejecting the wrapper does NOT cancel the underlying handler: its CPU work runs to
     // completion regardless (wasted CPU/memory after we time out). Can't be fixed without a
     // cancellable/off-thread parser.
