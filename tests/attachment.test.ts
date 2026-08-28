@@ -2034,6 +2034,46 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
     })
 
+    // OPC applies the same case-insensitive rule to the stored part URI, while exceljs's streaming
+    // reader dispatches only a lowercase xl/worksheets/sheetN.xml. The in-memory rebuild bridges the
+    // two by canonicalizing its private copy; the source archive is never mutated.
+    it('extracts a worksheet whose stored part name differs only in case', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const sheet = await zip.file('xl/worksheets/sheet2.xml')!.async('nodebuffer')
+            zip.remove('xl/worksheets/sheet2.xml')
+            zip.file('xl/Worksheets/Sheet2.xml', sheet)
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+        expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
+    })
+
+    // OPC relationships, not filenames, identify a worksheet part. The full-model reader follows a
+    // worksheet relationship to a custom path; streaming exceljs does not dispatch that path, so the
+    // rebuild gives only the streamed copy a canonical name and emits the measured entry once.
+    it('extracts a relationship-declared worksheet stored at a custom part path', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const from = 'xl/worksheets/sheet2.xml'
+            const to = 'xl/custom/quarterly-data.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet2.xml', 'custom/quarterly-data.xml'))
+
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file('[Content_Types].xml', types.replace('/xl/worksheets/sheet2.xml', '/xl/custom/quarterly-data.xml'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+        expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
+    })
+
     // Resolving OUTSIDE xl/worksheets is normal — chartsheets live there — but the declaration has to
     // be accountable. The first resolves to nothing; the last two resolve to a part that EXISTS,
     // which is why "does the archive hold it?" was the wrong question on its own — neither holds this
