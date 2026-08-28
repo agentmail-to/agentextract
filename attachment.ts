@@ -42,6 +42,17 @@ export const HANDLER_TIMEOUT_MS = 10_000
 // answer when a single unit overruns.
 export const HANDLER_DEADLINE_MARGIN_MS = 1_000
 
+// saxes resolves namespace prefixes by scanning the open-tag stack, so attacker-controlled nesting
+// makes its xmlns mode quadratic even when the XML is tiny. Real OOXML stays far below this; refusing
+// a deeper tree caps the scan before it can block the event loop past HANDLER_TIMEOUT_MS.
+const MAX_XML_NESTING_DEPTH = 64
+
+const assertXmlDepth = (depth: number): void => {
+    if (depth > MAX_XML_NESTING_DEPTH) {
+        throw new Error(`XML nesting exceeds ${MAX_XML_NESTING_DEPTH} elements`)
+    }
+}
+
 // Sniff the first 8KB to decide whether bytes look like text.
 const SNIFF_BYTES = 8 * 1024
 const SNIFF_TEXT_RATIO = 0.85
@@ -280,8 +291,8 @@ const pdfHandler: Handler = {
                 .join('')
                 .trim()
             if (pageText) {
+                length += pageText.length + (pages.length === 0 ? 0 : 2) // '\n\n' only BETWEEN pages
                 pages.push(pageText)
-                length += pageText.length + 2 // + the '\n\n' page join
                 if (length > maxOutputChars) {
                     truncated = true
                     break // one page of overshoot, trimmed centrally
@@ -408,6 +419,12 @@ const xlsxHandler: Handler = {
         let truncated = false
         let seen = 0
         for await (const worksheet of reader) {
+            // Row-less sheets never enter the inner loop. Check here as well so thousands of them
+            // cannot run to withTimeout and discard text already extracted from earlier sheets.
+            if (Date.now() > deadline) {
+                truncated = true
+                break
+            }
             seen++
             const rows: string[] = []
             for await (const batch of worksheet) {
@@ -860,6 +877,7 @@ const XLSX_LEADING_ENTRIES = [
     'xl/sharedStrings.xml', // -> this.sharedStrings
     'xl/styles.xml', // -> this.styles      (number formats)
 ]
+const XLSX_READER_CONTROL_PARTS = new Set(XLSX_LEADING_ENTRIES.map((name) => name.toLowerCase()))
 
 // A workbook with no strings has no xl/sharedStrings.xml, so this.sharedStrings is never set and
 // ordering alone cannot lift it out of the spool branch (measured: 35 of 50 reads dropped sheets).
@@ -1043,6 +1061,7 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
     // Parent tracking, so <sheet> counts only as a child of <sheets>.
     const open: { uri: string; local: string }[] = []
     workbook.on('opentag', (tag) => {
+        assertXmlDepth(open.length + 1)
         const parent = open[open.length - 1]
         open.push({ uri: tag.uri, local: tag.local })
         if (!SPREADSHEETML_NS.has(tag.uri) || tag.local !== 'sheet') return
@@ -1057,13 +1076,16 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
 
     const targets = new Map<string, WorkbookRel>()
     const rels = new SaxesParser<{ xmlns: true }>({ xmlns: true })
+    let relsDepth = 0
     rels.on('opentag', (tag) => {
+        assertXmlDepth(++relsDepth)
         if (tag.uri !== PACKAGE_RELS_NS || tag.local !== 'Relationship') return
         const value = (name: string) => tag.attributes[name]?.value
         const [Id, Target, Type, TargetMode] = [value('Id'), value('Target'), value('Type'), value('TargetMode')]
         // An external target points outside the package, so it is never an entry we hold.
         if (Id && Target && TargetMode !== 'External') targets.set(Id, { target: Target, type: Type ?? '' })
     })
+    rels.on('closetag', () => void relsDepth--)
     rels.write(relsXml).close()
 
     // A non-conventional worksheet path needs two declarations to agree: its relationship type and
@@ -1074,7 +1096,9 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
     if (contentTypesXml !== undefined) {
         const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
         const contentTypes = new SaxesParser<{ xmlns: true }>({ xmlns: true })
+        let contentTypesDepth = 0
         contentTypes.on('opentag', (tag) => {
+            assertXmlDepth(++contentTypesDepth)
             if (tag.uri !== CONTENT_TYPES_NS || tag.local !== 'Override') return
             const partName = tag.attributes.PartName?.value
             const contentType = tag.attributes.ContentType?.value
@@ -1085,6 +1109,7 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
                 // A malformed escape makes this declaration unusable, not the workbook unreadable.
             }
         })
+        contentTypes.on('closetag', () => void contentTypesDepth--)
         contentTypes.write(contentTypesXml).close()
     }
 
@@ -1194,13 +1219,16 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
             continue
         }
         // A conventional worksheet path remains recoverable under a missing/unknown type. Outside
-        // that convention, require the exact worksheet relationship identity before treating an
-        // arbitrary package part as rows; otherwise a hostile target could turn styles.xml into a
-        // worksheet while leaving the real rows to be dropped as an orphan.
+        // that convention, require the exact worksheet relationship identity and content type.
+        // Reader-control parts are never eligible even when both declarations are forged together:
+        // if styles.xml became the resolved sheet, the real sheetN.xml would otherwise be dropped as
+        // an orphan and this same central record would be written twice by the rebuild.
         if (
             part === undefined ||
             (!WORKSHEET_PART.test(part) &&
-                !(WORKSHEET_REL.has(rel.type) && parsed.worksheetParts.has(part)))
+                (!WORKSHEET_REL.has(rel.type) ||
+                    !parsed.worksheetParts.has(part) ||
+                    XLSX_READER_CONTROL_PARTS.has(part)))
         ) {
             hasUnplaced = true
             continue
@@ -1226,8 +1254,17 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
     // own length: both sides move together and it can never fire. That is silent partial output, the
     // one outcome this file fails over. A rescued part loses its tab position, which is unknowable,
     // never its rows.
+    // The two metadata declarations that authorize a custom path live in the same untrusted package.
+    // If one places a sheet outside the conventional path while conventional parts remain, those
+    // parts are no longer provable orphans — a forged relationship + content-type pair could be
+    // pointing at theme XML while the real rows sit in sheetN.xml. Rescue them all. A legitimate
+    // custom sheet may therefore keep a stale conventional orphan, preferring possible duplicate
+    // text over the silent row loss this feature exists to prevent.
+    const placedNonConventional = ordered.some((sheet) => !WORKSHEET_PART.test(sheet.entry.name))
     const rescued = worksheets.filter(
-        (entry) => !placed.has(entry) && (hasUnplaced || claimedNames.has(entry.name.toLowerCase()))
+        (entry) =>
+            !placed.has(entry) &&
+            (hasUnplaced || placedNonConventional || claimedNames.has(entry.name.toLowerCase()))
     )
     // Zero worksheets is a real answer for a chartsheet-only workbook — but only from a workbook that
     // told us something. A <sheets> we could not read one declaration out of is not that answer, and
@@ -1477,13 +1514,15 @@ const DOCX_CONTAINERS = new Set([
 //     mammoth, replicated on purpose so this change stays a pure port. Recovering them is one array
 //     entry each, deliberately left to its own change once the corpus says how often they matter.
 //
-// Deviations from mammoth, all four in tests/docx-fidelity.test.ts's ACCEPTED_DIVERGENCES if they
+// Deviations from mammoth, added to tests/docx-fidelity.test.ts's ACCEPTED_DIVERGENCES if they
 // ever show up on a real document: a w:sdt carrying wordml:checkbox has its first text character
 // REPLACED by a checkbox node in mammoth (we keep the character — strictly better, and costs nothing
 // here); w:sym needs mammoth's dingbat-to-unicode table to map (we drop it, and it is the only
 // element that would make this reader read an attribute at all); a w:t holding a comment or a nested
-// element makes mammoth's text() throw "Not implemented" (we extract); and the main part is read at
-// its conventional path rather than resolved through _rels/.rels, which routing already requires.
+// element makes mammoth's text() throw "Not implemented" (we extract); the main part is read at
+// its conventional path rather than resolved through _rels/.rels, which routing already requires;
+// and a final deleted-mark paragraph is retained here while mammoth drops its stashed text for lack
+// of a following paragraph. That last direction is deliberately availability-preserving.
 
 // Emit a literal, then drop any children — mammoth's handlers for these ignore children entirely.
 const DOCX_LITERALS: Record<string, string> = {
@@ -1562,6 +1601,7 @@ const createDocxReader = async (): Promise<DocxReader> => {
         const prefix = OOXML_PREFIXES[uri]
         const name = uri === '' ? tag.local : prefix === undefined ? `{${uri}}${tag.local}` : `${prefix}:${tag.local}`
         stack.push(name)
+        assertXmlDepth(stack.length)
 
         if (skip >= 0) {
             // Inside a dropped subtree nothing is emitted, and only the two ancestor-affecting
@@ -1624,9 +1664,9 @@ const createDocxReader = async (): Promise<DocxReader> => {
             top.extra += frame.extra + frame.value
         } else if (deleted.pop()) {
             // The paragraph mark was deleted, so there is no paragraph break here: this text runs
-            // straight into the next paragraph. mammoth re-reads the stashed children in the next
-            // paragraph's context and lands on the same string; suppressing the tail is the
-            // streaming form of that, and is equivalent because this reader is context-free.
+            // straight into the next paragraph. Appending now matches mammoth whenever another
+            // paragraph follows. If this is the final paragraph, mammoth drops its stashed text;
+            // this reader keeps it — a documented, availability-preserving divergence.
             top.value += frame.value
             top.extra += frame.extra
         } else {

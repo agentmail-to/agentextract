@@ -88,6 +88,10 @@ guards reduce blast radius; they are **not** a sandbox.
 - **Decompression** — OOXML (`.docx`/`.xlsx`) archives are stream-inflated and **measured**; one that
   actually expands past `MAX_UNCOMPRESSED_BYTES` (50 MB) is skipped before the parser loads. Malformed
   or ZIP64 metadata is treated as over-budget (fail-closed), not trusted.
+- **XML nesting** — OOXML parsing refuses trees deeper than 64 elements. `saxes` namespace resolution
+  scans the open-tag stack, so this converts otherwise-quadratic attacker-controlled nesting into a
+  fixed bound. Real Word and Excel documents stay far below it; unreadable XLSX identity metadata
+  falls back to archive order, while DOCX returns a labeled failure or a truncated prefix.
 - **Output** — extracted text is capped at `MAX_OUTPUT_CHARS` (250k), or lower via `maxOutputChars`.
   Cutting sets `truncated` on the result, so a partial extraction is never mistaken for a complete
   one. The PDF, `.docx` and `.xlsx` handlers apply the cap **incrementally** as they build — and stop

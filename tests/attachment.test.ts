@@ -2050,9 +2050,9 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
     })
 
-    // OPC relationships, not filenames, identify a worksheet part. The full-model reader follows a
-    // worksheet relationship to a custom path; streaming exceljs does not dispatch that path, so the
-    // rebuild gives only the streamed copy a canonical name and emits the measured entry once.
+    // OPC relationships and content types, not filename conventions, identify a worksheet part.
+    // Streaming exceljs does not dispatch a custom path, so the rebuild gives only the streamed copy
+    // a canonical name and emits the measured entry once.
     it('extracts a relationship-declared worksheet stored at a custom part path', async () => {
         const content = await rebuild(await workbookWith(3, 2), async (zip) => {
             const from = 'xl/worksheets/sheet2.xml'
@@ -2072,6 +2072,33 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         expect(r.status).toBe('extracted')
         expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
         expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
+    })
+
+    // Relationship type and content type are declarations from the same untrusted package, not
+    // independent corroboration. Even when both call styles.xml a worksheet, a structural part must
+    // never replace the real sheet or be emitted twice by the rebuilt archive.
+    it.each([
+        ['a reader-control part', 'styles.xml'],
+        ['another non-worksheet XML part', 'theme/theme1.xml'],
+    ])('rescues real rows when forged declarations point a worksheet at %s', async (_label, target) => {
+        const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('Target="worksheets/sheet1.xml"', `Target="${target}"`))
+
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file(
+                '[Content_Types].xml',
+                types.replace(
+                    '</Types>',
+                    `<Override PartName="/xl/${target}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`
+                )
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('s1r1')
+        expect(r.extraction!.match(/s1r1/g)).toHaveLength(1)
     })
 
     // Resolving OUTSIDE xl/worksheets is normal — chartsheets live there — but the declaration has to
@@ -2259,6 +2286,21 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         expect(headers(r.extraction)).toEqual(['=== Sheet1 ===', '=== Sheet2 ==='])
         for (let s = 1; s <= 2; s++) expect(r.extraction).toContain(`s${s}r1`)
     })
+
+    // parseWorkbookParts uses saxes with namespaces enabled, whose prefix resolution scans every
+    // open tag. The depth guard must make this fallback quickly; without it 20k nested elements take
+    // several seconds synchronously and the handler timeout cannot fire while the event loop is held.
+    it('bounds deeply nested workbook metadata before saxes becomes quadratic', async () => {
+        const content = await rebuild(await workbookWith(2, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            const nested = '<extLst>'.repeat(20_000) + '</extLst>'.repeat(20_000)
+            zip.file('xl/workbook.xml', xml.replace('<sheets>', `${nested}<sheets>`))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        for (let s = 1; s <= 2; s++) expect(r.extraction).toContain(`s${s}r1`)
+    }, 2_000)
 
 })
 
@@ -2521,6 +2563,48 @@ describe('attachment — xlsx honours the deadline on contentless rows', () => {
         expect(whole.truncated).toBe(false)
         expect(whole.extraction).toContain('TRAILING-MARKER')
     })
+
+    it('returns earlier sheet text when the deadline expires across row-less sheets', async () => {
+        const content = await workbookWith(2, 1)
+        const row = {
+            eachCell: (_options: unknown, callback: (cell: { text: string }) => void) => callback({ text: 'kept' }),
+        }
+        const worksheet = (rows: unknown[]) => ({
+            async *[Symbol.asyncIterator]() {
+                for (const value of rows) yield value
+            },
+        })
+
+        vi.resetModules()
+        vi.doMock('exceljs', () => ({
+            default: {
+                stream: {
+                    xlsx: {
+                        WorkbookReader: class {
+                            async *[Symbol.asyncIterator]() {
+                                yield worksheet([row])
+                                yield worksheet([]) // never enters the per-row deadline check
+                            }
+                        },
+                    },
+                },
+            },
+        }))
+        const base = Date.now()
+        let calls = 0
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => (++calls < 4 ? base : base + HANDLER_TIMEOUT_MS))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content, contentType: XLSX_TYPE })
+            expect(r.status).toBe('extracted')
+            expect(r.truncated).toBe(true)
+            expect(r.extraction).toContain('kept')
+        } finally {
+            clock.mockRestore()
+            vi.doUnmock('exceljs')
+            vi.resetModules()
+        }
+    })
 })
 
 describe('attachment — xlsx lost-worksheet backstop', () => {
@@ -2710,6 +2794,20 @@ describe('attachment — pdf reports every way it can stop early', () => {
         expect(r.status).toBe('extracted')
         expect(r.truncated).toBe(true)
         expect(r.extraction!.length).toBeLessThanOrEqual(MAX_OUTPUT_CHARS)
+    })
+
+    it('does not count a trailing page separator or flag a complete near-cap PDF', async () => {
+        const pdf = buildPdf([['a complete single-page document near its cap']])
+        const whole = await extractAttachment({ content: pdf, contentType: PDF })
+        const length = whole.extraction!.length
+        const trailer = '\n[truncated]'
+
+        for (const cap of [length, length + 1]) {
+            const r = await extractAttachment({ content: pdf, contentType: PDF }, { maxOutputChars: cap, trailer })
+            expect(r.truncated).toBe(false)
+            expect(r.extraction).toBe(whole.extraction)
+            expect(r.extraction).not.toContain(trailer)
+        }
     })
 
     // Pages past MAX_PDF_PAGES are never read, so their text is missing whether or not the cap was

@@ -176,6 +176,17 @@ describe('docx — the whitelist drops unrecognised subtrees', () => {
         expect(r.extraction).toBe('first half second half\n\n')
     })
 
+    // ACCEPTED DIVERGENCE. mammoth stashes a deleted-mark paragraph for the next paragraph and
+    // drops that text when there is no next one. The streaming reader emits as it goes and keeps the
+    // trailing text. This is the safer direction for attachment extraction, but it is not exact
+    // mammoth fidelity and must stay visible as such.
+    it('keeps a final deleted-mark paragraph that mammoth drops', async () => {
+        const deleted =
+            '<w:p><w:pPr><w:rPr><w:del/></w:rPr></w:pPr><w:r><w:t>TRAILING</w:t></w:r></w:p>'
+        const r = await extract(`${text('before')}${deleted}`)
+        expect(r.extraction).toBe('before\n\nTRAILING')
+    })
+
     // Same marker, one level out: a deleted table row takes the whole row with it.
     it('drops a table row marked deleted, keeping the rows around it', async () => {
         const r = await extract(
@@ -401,6 +412,16 @@ describe('docx — the cap and the deadline stop the read', () => {
         expect(r.truncated).toBe(true)
         expect(r.extraction?.length).toBeLessThanOrEqual(MAX_OUTPUT_CHARS)
         expect(r.extraction?.startsWith('lorem ipsum')).toBe(true)
+    })
+
+    // saxes resolves namespaces by scanning its open-tag stack. Without an explicit depth ceiling,
+    // a tiny deeply nested document turns that into quadratic synchronous CPU and blocks the timer
+    // that is supposed to contain it.
+    it('refuses pathological XML nesting before namespace resolution becomes quadratic', async () => {
+        const nested = '<w:p>'.repeat(100) + '</w:p>'.repeat(100)
+        const r = await extract(nested)
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/XML nesting exceeds 64 elements/)
     })
 })
 
