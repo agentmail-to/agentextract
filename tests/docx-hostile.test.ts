@@ -123,6 +123,15 @@ describe('docx — malformed XML', () => {
         expect(r.status).toBe('failed')
         expect(r.reason).toMatch(/w:body/)
     })
+
+    // The body assertion is semantic, not a parse error. Visible text directly under w:document
+    // must not cause that assertion to be caught and relabeled as an honest truncated prefix.
+    it('fails a bodyless document even when it contains parseable paragraph text', async () => {
+        const r = await extract(`<?xml version="1.0"?><w:document ${W}>${para('outside body')}</w:document>`)
+        expect(r.status).toBe('failed')
+        expect(r.extraction).toBeUndefined()
+        expect(r.reason).toMatch(/w:body/)
+    })
 })
 
 describe('docx — hostile payloads', () => {

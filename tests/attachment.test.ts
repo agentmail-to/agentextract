@@ -376,6 +376,16 @@ describe('attachment — charset-correct decoding', () => {
         expect(r.extraction).toBe('hello world')
     })
 
+    // U+FFFD is also a legitimate code point in explicitly declared, BOM-less UTF-16. Its presence
+    // must not activate the latin1 recovery path and expose an interleaved NUL after every character.
+    it('keeps a literal U+FFFD in BOM-less UTF-16 declared by Content-Type', async () => {
+        const content = iconv.encode('before � after', 'utf-16le', { addBOM: false })
+        const r = await extractAttachment({ content, contentType: 'text/plain; charset=utf-16le' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBe('before � after')
+        expect(r.extraction).not.toContain('\u0000')
+    })
+
     // Precedence: an in-band BOM is definitive and must beat a wrong Content-Type charset. A
     // UTF-16 file mislabeled charset=windows-1252 would mojibake under the hint; the BOM wins.
     it('lets a BOM override a contradicting charset hint', async () => {
@@ -1950,23 +1960,19 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         expect(r.extraction!.match(/s1r1/g)).toHaveLength(1) // emitted once, not duplicated
     })
 
-    // The fallback path, for an archive whose workbook cannot be read. Without the rels part exceljs
-    // never sets this.workbookRels, so every sheet takes the spool branch the reorder exists to avoid
-    // and whether they all arrive is the upstream race — measured here as 1 of 3, byte-identical
-    // before and after this change, because resolution simply falls back to the archive's own parts.
-    // So the assertion is the CONTRACT rather than a sheet count: a complete workbook or a labeled
-    // failure, never a partial one dressed up as 'extracted'. Repeated, because it is a race.
-    it('never reports a partial workbook when the rels part is missing', async () => {
+    // The fallback path, for an archive whose workbook relationships cannot be read. The reader-only
+    // rewrite injects an empty relationships part, setting exceljs's workbookRels flag and keeping
+    // every worksheet inline instead of spooling it to a temp file. Archive order supplies identity.
+    it('returns every worksheet deterministically when the rels part is missing', async () => {
         const noRels = await rebuild(await workbookWith(3, 2), async (zip) => {
             zip.remove('xl/_rels/workbook.xml.rels')
         })
 
         for (let i = 0; i < 12; i++) {
             const r = await extractAttachment({ content: noRels, contentType: XLSX_TYPE })
-            // Either outcome is sound; a third — 'extracted' with sheets missing — is the one this
-            // forbids, and it is what the lost-worksheet backstop is counting `resolved` to catch.
-            if (r.status === 'extracted') expect(headers(r.extraction)).toHaveLength(3)
-            else expect(r.reason).toMatch(/yielded \d+ of 3 worksheets/)
+            expect(r.status).toBe('extracted')
+            expect(headers(r.extraction)).toEqual(['=== Sheet1 ===', '=== Sheet2 ===', '=== Sheet3 ==='])
+            for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
         }
     })
 
@@ -2437,9 +2443,9 @@ describe('attachment — the rebuild cannot amplify what the budget measured', (
             vi.resetModules()
         }
 
-        // The one entry the rebuild adds that no central record describes is the injected empty
-        // shared-string table — a fixed literal of ours, not anything the input controls.
-        expect(rebuildInflatesTo(rebuilt)).toBeLessThanOrEqual(budgetMeasures(content) + 200)
+        // The only entries the rebuild adds without central records are fixed empty control parts
+        // of ours, not anything the input controls.
+        expect(rebuildInflatesTo(rebuilt)).toBeLessThanOrEqual(budgetMeasures(content) + 300)
     })
 
     // The same "a name is not a key" mistake, on the other side of the ledger: layout stopped
@@ -2610,13 +2616,20 @@ describe('attachment — xlsx honours the deadline on contentless rows', () => {
 describe('attachment — xlsx lost-worksheet backstop', () => {
     // Pins the precomputed CRC against a fresh computation, so the constant and the literal it
     // describes cannot drift if the injected XML is edited.
-    it('the injected shared-string table matches its precomputed CRC', () => {
-        const body = Buffer.from(
-            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
-                '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>',
-            'latin1'
-        )
-        expect(zlib.crc32(body)).toBe(0x2949bd0b)
+    it('the injected control parts match their precomputed CRCs', () => {
+        const parts: Array<[string, number]> = [
+            [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+                    '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>',
+                0x2949bd0b,
+            ],
+            [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
+                0x9f1f1b86,
+            ],
+        ]
+        for (const [body, crc] of parts) expect(zlib.crc32(Buffer.from(body, 'latin1'))).toBe(crc)
     })
 
     // The reorder closes the two KNOWN triggers; this proves the CLASS is closed. Deleting a
@@ -2741,8 +2754,8 @@ describe('attachment — xlsx archive rewrite limits', () => {
     it(
         'refuses an archive whose rewrite would land on the 0xffff entry-count sentinel',
         async () => {
-            // 65534 real entries + the injected shared-string part = 65535 = 0xffff.
-            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 1), contentType: XLSX_TYPE })
+            // 65533 real entries + two injected control parts = 65535 = 0xffff.
+            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2), contentType: XLSX_TYPE })
             expect(r.status).toBe('failed')
             expect(r.reason).toMatch(/0xffff count sentinel/)
             expect(r.reason).not.toMatch(/central directory could not be read/)
@@ -2753,9 +2766,9 @@ describe('attachment — xlsx archive rewrite limits', () => {
     it(
         'accepts one entry below that boundary, so the refusal is the sentinel and not the size',
         async () => {
-            // 65533 + 1 = 65534, a legal count. Same shape, same ~5.6 MB, one fewer entry: without
+            // 65532 + 2 = 65534, a legal count. Same shape, same ~5.6 MB, one fewer entry: without
             // this the test above would also pass if the rewrite simply gave up on large archives.
-            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2), contentType: XLSX_TYPE })
+            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 3), contentType: XLSX_TYPE })
             expect(r.status).toBe('extracted')
         },
         BOUNDARY_TIMEOUT_MS
@@ -2767,7 +2780,7 @@ describe('attachment — xlsx archive rewrite limits', () => {
     it(
         'counts the entries it will write, not the ones it was given',
         async () => {
-            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 1, 2), contentType: XLSX_TYPE })
+            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2, 2), contentType: XLSX_TYPE })
             expect(r.status).toBe('extracted')
         },
         BOUNDARY_TIMEOUT_MS

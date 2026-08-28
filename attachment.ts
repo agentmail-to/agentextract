@@ -139,6 +139,12 @@ const bomCharset = (content: Buffer): string | undefined => {
     return undefined
 }
 
+// Which utf-16 flavour an explicit or resolved charset names, if any.
+const claimsUtf16 = (charset?: string): 'utf-16' | 'utf-16le' | 'utf-16be' | undefined => {
+    const normalized = charset?.trim().toLowerCase().replace(/_/g, '-')
+    return normalized === 'utf-16' || normalized === 'utf-16le' || normalized === 'utf-16be' ? normalized : undefined
+}
+
 // Priority chain: most trustworthy signal first, degrading gracefully.
 const resolveCharset = (content: Buffer, hint?: string): string => {
     // #1. A BOM is definitive. Above the hint: a stale charset= must not override an in-band BOM.
@@ -178,9 +184,10 @@ const decodeText = (content: Buffer, hint?: string): string => {
         .replace(/\r\n?/g, '\n') // normalize line endings
     // U+FFFD means the charset was wrong (jschardet can confidently confuse big5 for GB2312) and is
     // unrecoverable, so fall back to latin1, which maps every byte. Two exceptions: real utf-8 may
-    // legitimately contain U+FFFD, and a BOM makes the charset definitive — re-decoding either as
-    // latin1 would corrupt genuine text.
-    if (text.includes('�') && !isUtf8(content) && !bomCharset(content)) {
+    // legitimately contain U+FFFD, and a BOM or explicitly declared UTF-16 charset makes the decode
+    // definitive — re-decoding any of them as latin1 would corrupt genuine text. A detector guess is
+    // intentionally not exempt: if guessed UTF-16 produces U+FFFD, latin1 remains the lossless floor.
+    if (text.includes('�') && !isUtf8(content) && !bomCharset(content) && !claimsUtf16(hint)) {
         return iconv.decode(content, 'latin1').replace(/\r\n?/g, '\n')
     }
     return text
@@ -333,6 +340,7 @@ const docxHandler: Handler = {
         const decoder = new StringDecoder('utf8')
 
         let truncated = false
+        let sawBody: boolean | undefined
         try {
             for await (const chunk of docxMainPartChunks(part)) {
                 // Both guards here, ahead of the work, at one inflate chunk of granularity. Finer
@@ -350,7 +358,7 @@ const docxHandler: Handler = {
                 reader.write(decoder.write(chunk))
             }
             // Only a read that ran to the end may assert the document ended cleanly.
-            if (!truncated) reader.end(decoder.end())
+            if (!truncated) sawBody = reader.end(decoder.end())
         } catch (error) {
             // saxes is conformant where mammoth's DOM parser recovered, so a document the old reader
             // read to the end can stop short here. Text already extracted is still text, and the
@@ -362,6 +370,12 @@ const docxHandler: Handler = {
             if (reader.text().trim().length === 0) throw error
             truncated = true
         }
+
+        // Keep this semantic assertion outside the malformed-XML recovery above. A bodyless main
+        // part can contain parseable paragraph text, but it is still not a Word document; catching
+        // this assertion as though parsing stopped midway would mislabel the foreign content as a
+        // useful truncated prefix.
+        if (sawBody === false) throw new Error('docx main part has no w:body element')
 
         // Emptiness is left to the entry point: an empty document is exactly '\n\n', which trims to ''.
         return { text: reader.text(), truncated }
@@ -614,9 +628,9 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
 //       - NO FEWER IS FINE. Some measured records are deliberately not written at all (orphan
 //         worksheet parts — see SHEET IDENTITY). Dropping only removes bytes from the reader's
 //         reach, so it cannot loosen the bound.
-//       - ONE EXCEPTION, ours. The injected empty xl/sharedStrings.xml matches no central record. It
-//         is a fixed 153-byte literal in this file, not anything the input controls.
-//     So what unzipper can inflate is at most what was measured, plus those 153 bytes. Hence the
+//       - TWO EXCEPTIONS, ours. The injected empty xl/sharedStrings.xml and workbook.xml.rels match no
+//         central records. They are fixed 153- and 140-byte literals, not anything the input controls.
+//     So what unzipper can inflate is at most what was measured, plus those 293 bytes. Hence the
 //     xlsx handler FAILS when the rewrite can't be produced; the original bytes would drop the
 //     budget on the floor.
 //
@@ -891,6 +905,17 @@ const EMPTY_SHARED_STRINGS = Buffer.from(
 // CRC32 of the literal above, precomputed — the payload is fixed, so computing it per extraction
 // would be work with one possible answer. A test recomputes it, so the two can't drift.
 const EMPTY_SHARED_STRINGS_CRC = 0x2949bd0b
+
+// A missing workbook relationship part leaves exceljs's workbookRels unset, sending every sheet
+// through its temp-file spool branch. Early break/throw then strands those files. An empty relation
+// set is the truthful value for a missing part on the archive-fallback path and keeps every sheet on
+// the inline reader, where abandoning the generator has nothing to clean up.
+const EMPTY_WORKBOOK_RELS = Buffer.from(
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
+    'latin1'
+)
+const EMPTY_WORKBOOK_RELS_CRC = 0x9f1f1b86
 
 const LOCAL_HEADER_BYTES = 30
 const CENTRAL_HEADER_BYTES = 46
@@ -1298,19 +1323,27 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     // the buffer, which Invariant 2 catches. Failing closed keeps that from being load-bearing.
     if (!entries) return { ok: false, reason: 'xlsx central directory could not be read for streaming' }
 
-    const complete = entries.some((entry) => entry.name === 'xl/sharedStrings.xml')
-        ? entries
-        : [
-              ...entries,
-              {
-                  name: 'xl/sharedStrings.xml',
-                  method: 0, // stored: the injected table is 153 bytes, so compressing it is noise
-                  crc: EMPTY_SHARED_STRINGS_CRC,
-                  compSize: EMPTY_SHARED_STRINGS.length,
-                  uncompSize: EMPTY_SHARED_STRINGS.length,
-                  data: EMPTY_SHARED_STRINGS,
-              },
-          ]
+    const complete = [...entries]
+    if (!entries.some((entry) => entry.name === 'xl/sharedStrings.xml')) {
+        complete.push({
+            name: 'xl/sharedStrings.xml',
+            method: 0, // stored: the injected table is 153 bytes, so compressing it is noise
+            crc: EMPTY_SHARED_STRINGS_CRC,
+            compSize: EMPTY_SHARED_STRINGS.length,
+            uncompSize: EMPTY_SHARED_STRINGS.length,
+            data: EMPTY_SHARED_STRINGS,
+        })
+    }
+    if (!entries.some((entry) => entry.name === WORKBOOK_RELS_PART)) {
+        complete.push({
+            name: WORKBOOK_RELS_PART,
+            method: 0,
+            crc: EMPTY_WORKBOOK_RELS_CRC,
+            compSize: EMPTY_WORKBOOK_RELS.length,
+            uncompSize: EMPTY_WORKBOOK_RELS.length,
+            data: EMPTY_WORKBOOK_RELS,
+        })
+    }
 
     const sheets = (await workbookWorksheets(entries)) ?? archiveWorksheets(entries)
     const sheetEntries = new Set(sheets.map((sheet) => sheet.entry))
@@ -1554,6 +1587,7 @@ const endsWith = (stack: string[], path: string[]): boolean =>
 // the paragraph's '\n\n' rather than glued into the middle of it, and an extra that never reaches a
 // w:p is silently lost. Two string fields per open w:p / w:pict reproduce all of that.
 interface DocxFrame {
+    kind: 'root' | 'paragraph' | 'picture'
     value: string
     extra: string
 }
@@ -1561,7 +1595,7 @@ interface DocxFrame {
 interface DocxReader {
     write: (chunk: string) => void // one decoded slice of document.xml; THROWS on malformed XML
     chars: () => number // characters emitted so far — what the handler's cap check reads
-    end: (tail: string) => void // flush, close, and run the end-of-document checks
+    end: (tail: string) => boolean // flush/close; whether the document contained w:body
     text: () => string // the text, complete or partial
 }
 
@@ -1570,7 +1604,7 @@ const createDocxReader = async (): Promise<DocxReader> => {
     const { SaxesParser } = await import('saxes')
 
     const stack: string[] = [] // qualified names of every open element, innermost last
-    const frames: DocxFrame[] = [{ value: '', extra: '' }] // index 0 is the document; extras reaching it are lost
+    const frames: DocxFrame[] = [{ kind: 'root', value: '', extra: '' }] // extras reaching root are lost
     const deleted: boolean[] = [false] // one flag per open w:p; index 0 pairs with the root frame
     let top = frames[frames.length - 1]
     let skip = -1 // stack index where the dropped subtree began, or -1 when we're reading
@@ -1598,7 +1632,7 @@ const createDocxReader = async (): Promise<DocxReader> => {
         // match a table, so the other two exist to guarantee a miss — but they keep the stack
         // readable in a debugger, and they are what makes an unmapped namespace fail closed.
         const uri = tag.uri ?? ''
-        const prefix = OOXML_PREFIXES[uri]
+        const prefix = Object.prototype.hasOwnProperty.call(OOXML_PREFIXES, uri) ? OOXML_PREFIXES[uri] : undefined
         const name = uri === '' ? tag.local : prefix === undefined ? `{${uri}}${tag.local}` : `${prefix}:${tag.local}`
         stack.push(name)
         assertXmlDepth(stack.length)
@@ -1621,7 +1655,7 @@ const createDocxReader = async (): Promise<DocxReader> => {
         if (name === 'w:t') return
 
         if (name === 'w:p' || name === 'w:pict') {
-            top = { value: '', extra: '' }
+            top = { kind: name === 'w:p' ? 'paragraph' : 'picture', value: '', extra: '' }
             frames.push(top)
             if (name === 'w:p') deleted.push(false)
             return
@@ -1630,7 +1664,7 @@ const createDocxReader = async (): Promise<DocxReader> => {
             if (name === 'w:body') sawBody = true
             return
         }
-        const literal = DOCX_LITERALS[name]
+        const literal = Object.prototype.hasOwnProperty.call(DOCX_LITERALS, name) ? DOCX_LITERALS[name] : undefined
         if (literal !== undefined) emit(literal)
         // The whitelist default: this element and everything under it is gone.
         skip = stack.length - 1
@@ -1680,26 +1714,34 @@ const createDocxReader = async (): Promise<DocxReader> => {
         chars: () => chars,
         end: (tail) => {
             parser.write(tail).close() // close() is the well-formedness check: it throws on an unclosed element
-            // mammoth throws "Could not find the body element: are you sure this is a docx file?"
-            // here — for a foreign root AND for a w:document with no w:body, both verified. Keeping
-            // it means a zip whose main part is not WordprocessingML stays a labeled failure instead
-            // of becoming an 'extracted' with no text.
-            if (!sawBody) throw new Error('docx main part has no w:body element')
+            return sawBody
         },
-        // Frames above the root are only still open on the truncated path; concatenating every
-        // frame's `value` in order is exactly the partial text in document order, so a document that
-        // is one enormous paragraph still returns what was read instead of ''. On the complete path
-        // there is only the root frame and this is just frames[0].value. Pending `extra` is dropped
-        // either way — mammoth's own behaviour for an extra that never reaches a w:p.
-        text: () => frames.reduce((text, frame) => text + frame.value, ''),
+        // An open picture frame is NOT inline text: once complete, it is hoisted into an enclosing
+        // paragraph's `extra` and appears only after that paragraph's break. On truncation, exclude
+        // it and every nested frame so the returned text remains a prefix of complete output.
+        // Without a picture, concatenating open values is the partial document order and lets one
+        // enormous paragraph return what was read. Pending `extra` stays deferred either way.
+        text: () => {
+            const picture = frames.findIndex((frame) => frame.kind === 'picture')
+            const visible = picture === -1 ? frames : frames.slice(0, picture)
+            return visible.reduce((text, frame) => text + frame.value, '')
+        },
     }
 }
 
-// One shape for both storage methods, so the handler's loop has a single form. Method 0 is its own
-// single chunk (bounded by MAX_INPUT_BYTES, and no real producer stores document.xml); method 8
-// yields a chunk at a time under backpressure, which is what keeps peak memory flat.
+const DOCX_CHUNK_BYTES = 16 * 1024
+
+const storedDocxChunks = function* (data: Buffer): Iterable<Buffer> {
+    for (let offset = 0; offset < data.length; offset += DOCX_CHUNK_BYTES) {
+        yield data.subarray(offset, offset + DOCX_CHUNK_BYTES)
+    }
+}
+
+// One shape for both storage methods, so the handler's loop has a single form. Stored parts are
+// sliced rather than handed over whole, keeping cap/deadline checks enforceable at the same bounded
+// granularity as deflate's output. Method 8 yields under backpressure from zlib.
 const docxMainPartChunks = (part: ZipEntry): AsyncIterable<Buffer> | Iterable<Buffer> => {
-    if (part.method === 0) return [part.data]
+    if (part.method === 0) return storedDocxChunks(part.data)
     const inflate = zlib.createInflateRaw()
     inflate.end(part.data) // pushes the compressed bytes; the readable side inflates only on demand
     return inflate
@@ -1734,14 +1776,6 @@ const sniff = (content: Buffer, ext?: string): HandlerKind | undefined => {
     if (startsWith(content, RTF_MAGIC)) return undefined
     if (bomCharset(content) || looksLikeText(content)) return 'text'
     return undefined
-}
-
-// Which utf-16 flavour an explicit charset= names, if any. BOM-less utf-16 is NUL-heavy and fails
-// looksLikeText, so the hint is the only thing keeping it routable — but the hint alone must not be
-// enough to earn that exemption. See isWellFormedUtf16.
-const claimsUtf16 = (charset?: string): 'utf-16' | 'utf-16le' | 'utf-16be' | undefined => {
-    const normalized = charset?.trim().toLowerCase().replace(/_/g, '-')
-    return normalized === 'utf-16' || normalized === 'utf-16le' || normalized === 'utf-16be' ? normalized : undefined
 }
 
 // A genuine text file never starts with these, so they contradict a text claim even under a hint.

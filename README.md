@@ -87,7 +87,10 @@ guards reduce blast radius; they are **not** a sandbox.
 - **Input size** — attachments over `MAX_INPUT_BYTES` (10 MB) are skipped before any decode or parse.
 - **Decompression** — OOXML (`.docx`/`.xlsx`) archives are stream-inflated and **measured**; one that
   actually expands past `MAX_UNCOMPRESSED_BYTES` (50 MB) is skipped before the parser loads. Malformed
-  or ZIP64 metadata is treated as over-budget (fail-closed), not trusted.
+  or ZIP64 metadata is treated as over-budget (fail-closed), not trusted. This archive-wide preflight
+  runs before the handler timeout starts. Its work is still bounded by the 10 MB input gate, the ZIP
+  entry-count ceiling and the 50 MB inflate ceiling, but a maximal 65k-entry directory can spend time
+  there that is not charged to `HANDLER_TIMEOUT_MS`.
 - **XML nesting** — OOXML parsing refuses trees deeper than 64 elements. `saxes` namespace resolution
   scans the open-tag stack, so this converts otherwise-quadratic attacker-controlled nesting into a
   fixed bound. Real Word and Excel documents stay far below it; unreadable XLSX identity metadata
@@ -141,7 +144,9 @@ guards reduce blast radius; they are **not** a sandbox.
   That reader loses zip entries unless `xl/sharedStrings.xml` and `xl/_rels/workbook.xml.rels` are
   parsed before the first worksheet ([exceljs #2790](https://github.com/exceljs/exceljs/issues/2790),
   [#3064](https://github.com/exceljs/exceljs/issues/3064)), so the archive's entry order is rewritten
-  in memory first. See `reorderForStreaming`. That rewrite is also what keeps the decompression
+  in memory first; when either control part is legitimately absent, the reader-only copy supplies an
+  empty equivalent so `exceljs` never falls into its temporary-file spool path. See
+  `reorderForStreaming`. That rewrite is also what keeps the decompression
   budget binding on this format: the streaming reader walks local file headers, not the central
   directory the budget measured, and only the rebuilt copy is guaranteed to carry exactly the
   measured entries — so an archive that cannot be rebuilt is `failed`, never streamed as it arrived.

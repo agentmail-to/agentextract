@@ -121,6 +121,14 @@ describe('docx — the whitelist drops unrecognised subtrees', () => {
         expect(r.extraction).toBe('kept\n\n')
     })
 
+    // Plain-object prototype names are valid XML element names. They are not entries in the literal
+    // map: looking them up without an own-property guard used to append native function source.
+    it('treats Object.prototype names as unknown elements, never literals', async () => {
+        const r = await extract(`${text('before')}<constructor/><toString/><x:wrap xmlns:x="constructor"/>${text('after')}`)
+        expect(r.extraction).toBe('before\n\nafter\n\n')
+        expect(r.extraction).not.toMatch(/function|native code/)
+    })
+
     // Character data lives only inside w:t. Whitespace between elements is common in
     // pretty-printed markup, so a reader that accumulated all text would leak indentation.
     it('drops bare character data outside a w:t', async () => {
@@ -414,6 +422,22 @@ describe('docx — the cap and the deadline stop the read', () => {
         expect(r.extraction?.startsWith('lorem ipsum')).toBe(true)
     })
 
+    // A text box is hoisted after its enclosing paragraph only when its w:pict closes. If extraction
+    // stops while that frame is open, returning its value inline would produce `HelloBox...`, which
+    // is not a prefix of the complete `Hello\n\nBox...` output.
+    it('keeps a truncated text-box extraction as a prefix of complete output', async () => {
+        const box = 'boxed '.repeat(30_000)
+        const body =
+            `<w:p><w:r><w:t>Hello</w:t></w:r><w:r><w:pict><v:shape><v:textbox><w:txbxContent>` +
+            `${text(box)}</w:txbxContent></v:textbox></v:shape></w:pict></w:r><w:r><w:t>After</w:t></w:r></w:p>`
+        const whole = await extract(body, { maxOutputChars: MAX_OUTPUT_CHARS })
+        const partial = await extract(body, { maxOutputChars: 100 })
+
+        expect(whole.truncated).toBe(false)
+        expect(partial.truncated).toBe(true)
+        expect(whole.extraction!.startsWith(partial.extraction!)).toBe(true)
+    })
+
     // saxes resolves namespaces by scanning its open-tag stack. Without an explicit depth ceiling,
     // a tiny deeply nested document turns that into quadratic synchronous CPU and blocks the timer
     // that is supposed to contain it.
@@ -433,6 +457,24 @@ describe('docx — archive-level reads', () => {
         const r = await extractAttachment({ content, contentType: DOCX_TYPE })
         expect(r.status).toBe('extracted')
         expect(r.extraction).toBe('stored entry\n\n')
+    })
+
+    // Stored entries used to arrive as one attachment-sized chunk, so neither cap nor deadline was
+    // checked again until the entire XML part had been parsed. A clock that expires between 16 KiB
+    // slices makes the incremental stop observable without relying on wall-clock timing.
+    it('checks the deadline between chunks of a stored document part', async () => {
+        const body = `${text('prefix')}${Array.from({ length: 5_000 }, () => text('stored paragraph')).join('')}${text('TRAILING-MARKER')}`
+        const content = await buildDocx(body, 'STORE')
+        const base = Date.now()
+        let calls = 0
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => (++calls <= 2 ? base : base + HANDLER_TIMEOUT_MS + 1))
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        clock.mockRestore()
+
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(true)
+        expect(r.extraction).toContain('prefix')
+        expect((r.extraction ?? '').includes('TRAILING-MARKER')).toBe(false)
     })
 
     // A table flattens to one paragraph per cell paragraph: no tabs, no row markers, no column
