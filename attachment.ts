@@ -276,41 +276,47 @@ const pdfHandler: Handler = {
     extract: async ({ content, maxOutputChars, deadline }) => {
         const { getDocumentProxy } = await import('unpdf')
         const pdf = await getDocumentProxy(new Uint8Array(content))
-        // Iterate pages ourselves — unpdf's extractText parses EVERY page up front, so a pathological
-        // page count runs unbounded. Bounds our accumulation and the pages parsed, NOT pdf.js's
-        // per-page decompression (no hook exists); that residual is the host memory limit's job.
-        const pageCount = Math.min(pdf.numPages, MAX_PDF_PAGES)
-        const pages: string[] = []
-        let length = 0
-        let truncated = false
-        for (let n = 1; n <= pageCount; n++) {
-            // This loop awaits per page, so the deadline is enforceable here in a way withTimeout's
-            // race is not. Before the fetch: stopping is only useful if it precedes the work.
-            if (Date.now() > deadline) {
-                truncated = true
-                break
-            }
-            const page = await pdf.getPage(n)
-            const { items } = await page.getTextContent()
-            // Replicates unpdf's per-page join: str, plus a newline on hasEOL.
-            const pageText = (items as Array<{ str?: string; hasEOL?: boolean }>)
-                .filter((item) => item.str != null)
-                .map((item) => (item.str ?? '') + (item.hasEOL ? '\n' : ''))
-                .join('')
-                .trim()
-            if (pageText) {
-                length += pageText.length + (pages.length === 0 ? 0 : 2) // '\n\n' only BETWEEN pages
-                pages.push(pageText)
-                if (length > maxOutputChars) {
+        try {
+            // Iterate pages ourselves — unpdf's extractText parses EVERY page up front, so a pathological
+            // page count runs unbounded. Bounds our accumulation and the pages parsed, NOT pdf.js's
+            // per-page decompression (no hook exists); that residual is the host memory limit's job.
+            const pageCount = Math.min(pdf.numPages, MAX_PDF_PAGES)
+            const pages: string[] = []
+            let length = 0
+            let truncated = false
+            for (let n = 1; n <= pageCount; n++) {
+                // This loop awaits per page, so the deadline is enforceable here in a way withTimeout's
+                // race is not. Before the fetch: stopping is only useful if it precedes the work.
+                if (Date.now() > deadline) {
                     truncated = true
-                    break // one page of overshoot, trimmed centrally
+                    break
+                }
+                const page = await pdf.getPage(n)
+                const { items } = await page.getTextContent()
+                // Replicates unpdf's per-page join: str, plus a newline on hasEOL.
+                const pageText = (items as Array<{ str?: string; hasEOL?: boolean }>)
+                    .filter((item) => item.str != null)
+                    .map((item) => (item.str ?? '') + (item.hasEOL ? '\n' : ''))
+                    .join('')
+                    .trim()
+                if (pageText) {
+                    length += pageText.length + (pages.length === 0 ? 0 : 2) // '\n\n' only BETWEEN pages
+                    pages.push(pageText)
+                    if (length > maxOutputChars) {
+                        truncated = true
+                        break // one page of overshoot, trimmed centrally
+                    }
                 }
             }
+            // Pages past the ceiling are text we never read.
+            if (pageCount < pdf.numPages) truncated = true
+            const joined = pages.join('\n\n').trim()
+            return { text: joined, empty: joined.length === 0, truncated }
+        } finally {
+            // getDocumentProxy exposes pdf.js's loading task; release its worker handler, document
+            // bytes, and page cache on success, early stop, and errors alike.
+            await pdf.loadingTask?.destroy?.()
         }
-        // Pages past the ceiling are text we never read.
-        if (pageCount < pdf.numPages) truncated = true
-        const joined = pages.join('\n\n').trim()
-        return { text: joined, empty: joined.length === 0, truncated }
     },
 }
 
@@ -402,6 +408,19 @@ interface StreamedRow {
     eachCell: (options: { includeEmpty: boolean }, callback: (cell: { text?: string }) => void) => void
 }
 
+type ExcelXmlChunks = AsyncIterable<Buffer | string>
+interface ExcelXmlEntry {
+    setEncoding: (encoding: BufferEncoding) => unknown
+}
+interface ExcelJsInternalReader {
+    _parseRels?: (entry: ExcelXmlEntry) => Promise<void>
+    _parseWorkbook?: (entry: ExcelXmlEntry) => Promise<void>
+    _parseSharedStrings?: (entry: ExcelXmlEntry) => AsyncIterable<unknown>
+    _parseStyles?: (entry: ExcelXmlEntry) => Promise<void>
+    _parseWorksheet?: (chunks: ExcelXmlChunks, sheetNo: string) => Iterable<unknown>
+    _parseHyperlinks?: (chunks: ExcelXmlChunks, sheetNo: string) => Iterable<unknown>
+}
+
 // XLSX — modern Excel. Each sheet flattened to text for search/indexing.
 const xlsxHandler: Handler = {
     kind: 'xlsx',
@@ -409,6 +428,7 @@ const xlsxHandler: Handler = {
     extensions: ['.xlsx'],
     extract: async ({ content, maxOutputChars, deadline }) => {
         const { Readable } = await import('node:stream')
+        const { StringDecoder } = await import('node:string_decoder')
         const { default: ExcelJS } = await import('exceljs') // not SheetJS: no known parse-time CVEs
         // Stream rather than workbook.xlsx.load(), which materializes every cell as a live object
         // before any cap can apply — a 4 MB in-cap .xlsx peaked at hundreds of MB and OOMed a 1024 MB
@@ -429,6 +449,53 @@ const xlsxHandler: Handler = {
             entries: 'ignore',
         })
 
+        // ExcelJS 4.4 decodes each unzipper output chunk independently before feeding saxes. A
+        // multi-byte code point split by inflate therefore becomes U+FFFD without any parse error.
+        // Its entry parsers accept streams and its worksheet parsers accept async iterables, so
+        // normalize both boundaries to decoded strings with state carried across chunks.
+        const internal = reader as unknown as ExcelJsInternalReader
+        const decodeEntry = (entry: ExcelXmlEntry): ExcelXmlEntry => {
+            entry.setEncoding('utf8') // Node streams use StringDecoder internally across chunks.
+            return entry
+        }
+        const decodeChunks = async function* (chunks: ExcelXmlChunks): AsyncIterable<string> {
+            const decoder = new StringDecoder('utf8')
+            for await (const chunk of chunks) {
+                if (typeof chunk === 'string') {
+                    yield chunk
+                } else {
+                    const decoded = decoder.write(chunk)
+                    if (decoded) yield decoded
+                }
+            }
+            const tail = decoder.end()
+            if (tail) yield tail
+        }
+        if (internal._parseRels) {
+            const parse = internal._parseRels.bind(internal)
+            internal._parseRels = (entry) => parse(decodeEntry(entry))
+        }
+        if (internal._parseWorkbook) {
+            const parse = internal._parseWorkbook.bind(internal)
+            internal._parseWorkbook = (entry) => parse(decodeEntry(entry))
+        }
+        if (internal._parseSharedStrings) {
+            const parse = internal._parseSharedStrings.bind(internal)
+            internal._parseSharedStrings = (entry) => parse(decodeEntry(entry))
+        }
+        if (internal._parseStyles) {
+            const parse = internal._parseStyles.bind(internal)
+            internal._parseStyles = (entry) => parse(decodeEntry(entry))
+        }
+        if (internal._parseWorksheet) {
+            const parse = internal._parseWorksheet.bind(internal)
+            internal._parseWorksheet = (chunks, sheetNo) => parse(decodeChunks(chunks), sheetNo)
+        }
+        if (internal._parseHyperlinks) {
+            const parse = internal._parseHyperlinks.bind(internal)
+            internal._parseHyperlinks = (chunks, sheetNo) => parse(decodeChunks(chunks), sheetNo)
+        }
+
         const sheets: string[] = []
         let length = 0
         let truncated = false
@@ -441,6 +508,8 @@ const xlsxHandler: Handler = {
                 break
             }
             seen++
+            const name = resolved[seen - 1]?.name ?? `Sheet${seen}`
+            const header = `=== ${name} ===\n`
             const rows: string[] = []
             for await (const batch of worksheet) {
                 // 4.4.0 yields ONE Row per iteration (worksheet-reader.js:275 pushes
@@ -464,8 +533,11 @@ const xlsxHandler: Handler = {
                     // Drop empty cells/rows so a sparse sheet doesn't flatten into runs of empty tabs.
                     if (cells.length === 0) continue
                     const line = cells.join('\t')
+                    length +=
+                        rows.length === 0
+                            ? (sheets.length === 0 ? 0 : 2) + header.length + line.length
+                            : 1 + line.length
                     rows.push(line)
-                    length += line.length + 1 // + newline
                     if (length > maxOutputChars) {
                         truncated = true
                         break // one line of overshoot, trimmed centrally
@@ -479,8 +551,7 @@ const xlsxHandler: Handler = {
             // against one exact spelling (workbook-reader.js:302) and gives up on every other, and
             // its .d.ts does not admit the field either way. The fallback is unreachable — an
             // out-of-range index means the reader emitted a part we never wrote.
-            const name = resolved[seen - 1]?.name ?? `Sheet${seen}`
-            if (rows.length > 0) sheets.push(`=== ${name} ===\n${rows.join('\n')}`)
+            if (rows.length > 0) sheets.push(`${header}${rows.join('\n')}`)
             // Safe to abandon mid-archive: the reorder keeps every worksheet on the inline path,
             // which spools nothing, so no temp files are stranded (#2147).
             if (truncated) break
@@ -699,6 +770,7 @@ const findEocd = (buf: Buffer): number => {
 // One entry as the central directory describes it, plus its stored (still-compressed) bytes.
 interface ZipEntry {
     name: string
+    utf8Name: boolean
     method: number
     crc: number
     compSize: number
@@ -725,7 +797,8 @@ const zipEntryNames = (buf: Buffer): string[] | undefined => {
         if (p + 46 > buf.length || buf.readUInt32LE(p) !== CD_SIG) return undefined
         const nameLen = buf.readUInt16LE(p + 28)
         if (p + 46 + nameLen > buf.length) return undefined
-        names.push(buf.toString('latin1', p + 46, p + 46 + nameLen))
+        const encoding = (buf.readUInt16LE(p + 8) & 0x0800) !== 0 ? 'utf8' : 'latin1'
+        names.push(buf.toString(encoding, p + 46, p + 46 + nameLen))
         p += 46 + nameLen + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
     }
     return names
@@ -765,7 +838,8 @@ const zipEntries = (buf: Buffer): ZipEntry[] | undefined => {
         const data = buf.subarray(dataStart, dataStart + compSize)
         if (data.length < compSize) return undefined
         entries.push({
-            name: buf.toString('latin1', p + 46, p + 46 + nameLen),
+            name: buf.toString((buf.readUInt16LE(p + 8) & 0x0800) !== 0 ? 'utf8' : 'latin1', p + 46, p + 46 + nameLen),
+            utf8Name: (buf.readUInt16LE(p + 8) & 0x0800) !== 0,
             method: buf.readUInt16LE(p + 10),
             crc: buf.readUInt32LE(p + 16),
             compSize,
@@ -1120,27 +1194,38 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
     // styles.xml from making that unrelated part replace real rows. Conventional sheetN.xml parts
     // retain the compatibility fallback and do not depend on this metadata.
     const worksheetParts = new Set<string>()
+    const worksheetExtensions = new Set<string>()
+    const overriddenParts = new Set<string>()
     if (contentTypesXml !== undefined) {
         const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
         const contentTypes = new SaxesParser<{ xmlns: true }>({ xmlns: true })
         let contentTypesDepth = 0
         contentTypes.on('opentag', (tag) => {
             assertXmlDepth(++contentTypesDepth)
-            if (tag.uri !== CONTENT_TYPES_NS || tag.local !== 'Override') return
-            const partName = tag.attributes.PartName?.value
-            const contentType = tag.attributes.ContentType?.value
-            if (!partName || !contentType || !WORKSHEET_CONTENT_TYPE.has(contentType)) return
-            try {
-                worksheetParts.add(decodeURIComponent(partName).replace(/^\/+/, '').toLowerCase())
-            } catch {
-                // A malformed escape makes this declaration unusable, not the workbook unreadable.
+            if (tag.uri !== CONTENT_TYPES_NS) return
+            if (tag.local === 'Override') {
+                const partName = tag.attributes.PartName?.value
+                if (!partName) return
+                try {
+                    const part = decodeURIComponent(partName).replace(/^\/+/, '').toLowerCase()
+                    overriddenParts.add(part)
+                    const contentType = tag.attributes.ContentType?.value?.trim().toLowerCase()
+                    if (contentType && WORKSHEET_CONTENT_TYPE.has(contentType)) worksheetParts.add(part)
+                } catch {
+                    // A malformed escape makes this declaration unusable, not the workbook unreadable.
+                }
+            } else if (tag.local === 'Default') {
+                const contentType = tag.attributes.ContentType?.value?.trim().toLowerCase()
+                if (!contentType || !WORKSHEET_CONTENT_TYPE.has(contentType)) return
+                const extension = tag.attributes.Extension?.value?.replace(/^\./, '').toLowerCase()
+                if (extension) worksheetExtensions.add(extension)
             }
         })
         contentTypes.on('closetag', () => void contentTypesDepth--)
         contentTypes.write(contentTypesXml).close()
     }
 
-    return { declared, targets, worksheetParts }
+    return { declared, targets, worksheetParts, worksheetExtensions, overriddenParts }
 }
 
 // A Target is relative to the rels part's base — xl/ — but may legally be an absolute package path
@@ -1176,9 +1261,15 @@ const resolveRelTarget = (target: string): string | undefined => {
 // completion, so failing here would turn a workbook that works today into a `failed`. archiveWorksheets
 // is the fallback, and it is what main did for every workbook.
 const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] | undefined> => {
-    const workbookEntry = entries.find((entry) => entry.name === WORKBOOK_PART)
-    const relsEntry = entries.find((entry) => entry.name === WORKBOOK_RELS_PART)
-    const contentTypesEntry = entries.find((entry) => entry.name === CONTENT_TYPES_PART)
+    const metadata = new Map<string, ZipEntry>()
+    for (const entry of entries) {
+        const folded = entry.name.toLowerCase()
+        if (!metadata.has(folded)) metadata.set(folded, entry)
+    }
+    const workbookEntry = entries.find((entry) => entry.name === WORKBOOK_PART) ?? metadata.get(WORKBOOK_PART.toLowerCase())
+    const relsEntry = entries.find((entry) => entry.name === WORKBOOK_RELS_PART) ?? metadata.get(WORKBOOK_RELS_PART.toLowerCase())
+    const contentTypesEntry =
+        entries.find((entry) => entry.name === CONTENT_TYPES_PART) ?? metadata.get(CONTENT_TYPES_PART.toLowerCase())
     if (!workbookEntry || !relsEntry) return undefined
 
     const [workbookXml, relsXml, contentTypesXml] = await Promise.all([
@@ -1245,6 +1336,15 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
             if (part === undefined || !present.has(part) || !part.startsWith(`xl/${otherFamily}/`)) hasUnplaced = true
             continue
         }
+        const dot = part?.lastIndexOf('.') ?? -1
+        const slash = part?.lastIndexOf('/') ?? -1
+        const extension = dot > slash ? part?.slice(dot + 1).toLowerCase() : undefined
+        const authorizedByContentType =
+            part !== undefined &&
+            (parsed.worksheetParts.has(part) ||
+                (!parsed.overriddenParts.has(part) &&
+                    extension !== undefined &&
+                    parsed.worksheetExtensions.has(extension)))
         // A conventional worksheet path remains recoverable under a missing/unknown type. Outside
         // that convention, require the exact worksheet relationship identity and content type.
         // Reader-control parts are never eligible even when both declarations are forged together:
@@ -1254,7 +1354,7 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
             part === undefined ||
             (!WORKSHEET_PART.test(part) &&
                 (!WORKSHEET_REL.has(rel.type) ||
-                    !parsed.worksheetParts.has(part) ||
+                    !authorizedByContentType ||
                     XLSX_READER_CONTROL_PARTS.has(part)))
         ) {
             hasUnplaced = true
@@ -1342,6 +1442,7 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     if (!complete.some((entry) => entry.name === 'xl/sharedStrings.xml')) {
         complete.push({
             name: 'xl/sharedStrings.xml',
+            utf8Name: false,
             method: 0, // stored: the injected table is 153 bytes, so compressing it is noise
             crc: EMPTY_SHARED_STRINGS_CRC,
             compSize: EMPTY_SHARED_STRINGS.length,
@@ -1352,6 +1453,7 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     if (!complete.some((entry) => entry.name === WORKBOOK_RELS_PART)) {
         complete.push({
             name: WORKBOOK_RELS_PART,
+            utf8Name: false,
             method: 0,
             crc: EMPTY_WORKBOOK_RELS_CRC,
             compSize: EMPTY_WORKBOOK_RELS.length,
@@ -1409,11 +1511,13 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     const centrals: Buffer[] = []
     let offset = 0
     for (const entry of ordered) {
-        const name = Buffer.from(entry.name, 'latin1')
+        const name = Buffer.from(entry.name, entry.utf8Name ? 'utf8' : 'latin1')
+        const flags = entry.utf8Name ? 0x0800 : 0
 
         const local = Buffer.alloc(LOCAL_HEADER_BYTES)
         local.writeUInt32LE(LOCAL_SIG, 0)
         local.writeUInt16LE(ZIP_VERSION, 4)
+        local.writeUInt16LE(flags, 6)
         local.writeUInt16LE(entry.method, 8)
         local.writeUInt32LE(entry.crc, 14)
         local.writeUInt32LE(entry.compSize, 18)
@@ -1425,6 +1529,7 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
         central.writeUInt32LE(CD_SIG, 0)
         central.writeUInt16LE(ZIP_VERSION, 4)
         central.writeUInt16LE(ZIP_VERSION, 6)
+        central.writeUInt16LE(flags, 8)
         central.writeUInt16LE(entry.method, 10)
         central.writeUInt32LE(entry.crc, 16)
         central.writeUInt32LE(entry.compSize, 20)
@@ -1530,8 +1635,6 @@ const OOXML_ASSUMED_PREFIXES: Record<string, string> = {
 
 // Recurse into these; emit nothing of their own. Absent from the list = subtree dropped.
 const DOCX_CONTAINERS = new Set([
-    'w:document',
-    'w:body',
     'w:r',
     'w:hyperlink',
     'w:ins',
@@ -1627,6 +1730,10 @@ const createDocxReader = async (): Promise<DocxReader> => {
     let sawBody = false
     let inBody = false
     let chars = 0
+    // mammoth holds a deleted-mark paragraph until the following paragraph is read. Its value
+    // merges into that paragraph, while any text-box `extra` still follows the completed merged
+    // paragraph. Keep only the deferred extra here; the value can stream straight into `top.value`.
+    let pendingDeletedExtra = ''
 
     const emit = (text: string): void => {
         top.value += text
@@ -1684,6 +1791,13 @@ const createDocxReader = async (): Promise<DocxReader> => {
         // illegal anyway — fall through to the drop below exactly as they do in mammoth.
         if (name === 'w:t') return
 
+        if (name === 'w:pict' && !frames.some((frame) => frame.kind === 'paragraph')) {
+            // A picture's text can reach mammoth's output only through an enclosing paragraph.
+            // Dropping an orphan at entry also keeps unreachable text out of both memory and the
+            // incremental cap instead of accumulating it in root.extra and falsely truncating.
+            skip = stack.length - 1
+            return
+        }
         if (name === 'w:p' || name === 'w:pict') {
             top = { kind: name === 'w:p' ? 'paragraph' : 'picture', value: '', extra: '' }
             frames.push(top)
@@ -1735,9 +1849,10 @@ const createDocxReader = async (): Promise<DocxReader> => {
             // paragraph follows. If this is the final paragraph, mammoth drops its stashed text;
             // this reader keeps it — a documented, availability-preserving divergence.
             top.value += frame.value
-            top.extra += frame.extra
+            pendingDeletedExtra += frame.extra
         } else {
-            top.value += `${frame.value}\n\n${frame.extra}`
+            top.value += `${frame.value}\n\n${pendingDeletedExtra}${frame.extra}`
+            pendingDeletedExtra = ''
             chars += 2
         }
     })
@@ -1946,7 +2061,7 @@ const errorMessage = (error: unknown): string => (error instanceof Error ? error
 // "no cap at all" while -5 meant 0, which is a seam nothing benefits from. Both routes are safe
 // either way: this can only ever tighten.
 const resolveCap = (requested?: number): number =>
-    requested === undefined || Number.isNaN(requested)
+    typeof requested !== 'number' || Number.isNaN(requested)
         ? MAX_OUTPUT_CHARS
         : Math.min(MAX_OUTPUT_CHARS, Math.max(0, Math.floor(requested)))
 

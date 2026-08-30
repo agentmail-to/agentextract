@@ -99,6 +99,15 @@ describe('docx — the whitelist drops unrecognised subtrees', () => {
         expect(r.extraction).toBe('after\n\n')
     })
 
+    it('does not charge a large orphan picture to the output cap', async () => {
+        const hidden = Array.from({ length: 4_000 }, () => text('x'.repeat(50))).join('')
+        const r = await extract(
+            `<w:pict><v:shape><v:textbox><w:txbxContent>${hidden}</w:txbxContent></v:textbox></v:shape></w:pict>${text('visible')}`,
+            { maxOutputChars: 1_000 }
+        )
+        expect(r).toMatchObject({ status: 'extracted', extraction: 'visible\n\n', truncated: false })
+    })
+
     // Over-tightening the whitelist loses real body text silently. None of these containers appears
     // anywhere in the fidelity corpus, so nothing else would catch it.
     it.each([
@@ -184,6 +193,17 @@ describe('docx — the whitelist drops unrecognised subtrees', () => {
         expect(r.extraction).toBe('first half second half\n\n')
     })
 
+    it('keeps a deleted-mark paragraph text box after the following merged paragraph', async () => {
+        const deleted =
+            `<w:p><w:pPr><w:rPr><w:del/></w:rPr></w:pPr>` +
+            `<w:r><w:t>one</w:t></w:r>` +
+            `<w:r><w:pict><v:shape><v:textbox><w:txbxContent>${text('boxed')}</w:txbxContent></v:textbox></v:shape></w:pict></w:r>` +
+            `</w:p>`
+        const r = await extract(`${deleted}${text('two')}`)
+        expect(r.extraction).toBe('onetwo\n\nboxed\n\n')
+        expect(r.truncated).toBe(false)
+    })
+
     // ACCEPTED DIVERGENCE. mammoth stashes a deleted-mark paragraph for the next paragraph and
     // drops that text when there is no next one. The streaming reader emits as it goes and keeps the
     // trailing text. This is the safer direction for attachment extraction, but it is not exact
@@ -224,6 +244,14 @@ describe('docx — leaf and character contract', () => {
         const r = await extractAttachment({ content, contentType: DOCX_TYPE })
         expect(r.status).toBe('extracted')
         expect(r.extraction).toBe('INSIDE\n\n')
+    })
+
+    it.each([
+        ['w:body', `<w:body>${text('HIDDEN')}</w:body>`],
+        ['w:document', `<w:document>${text('HIDDEN')}</w:document>`],
+    ])('drops a nested %s subtree inside the real body', async (_name, nested) => {
+        const r = await extract(`${text('before')}${nested}${text('after')}`)
+        expect(r.extraction).toBe('before\n\nafter\n\n')
     })
 
     // An empty paragraph is exactly '\n\n', which the entry point then trims to nothing rather than

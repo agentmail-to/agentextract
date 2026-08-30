@@ -500,6 +500,35 @@ describe('attachment — pdf handler', () => {
         expect(r.reason).toBeDefined()
         expect(r.extraction).toBeUndefined()
     })
+
+    it('destroys the PDF loading task after both successful and failed page reads', async () => {
+        const destroy = vi.fn(async () => undefined)
+        let fail = false
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => ({
+                numPages: 1,
+                loadingTask: { destroy },
+                getPage: async () => ({
+                    getTextContent: async () => {
+                        if (fail) throw new Error('page failed')
+                        return { items: [{ str: 'page text' }] }
+                    },
+                }),
+            }),
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const input = { content: buf('%PDF-1.4 mock'), contentType: 'application/pdf' }
+            expect((await extract(input)).status).toBe('extracted')
+            fail = true
+            expect((await extract(input)).status).toBe('failed')
+            expect(destroy).toHaveBeenCalledTimes(2)
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
 })
 
 // DOCX handler ---------------------------------------------------------------
@@ -1741,6 +1770,15 @@ describe('attachment — extract options', () => {
         }
     })
 
+    it.each(['abc', {}, null, true])('falls back to the ceiling for a non-number JS cap: %j', async (bad) => {
+        const r = await extractAttachment(
+            { content: oversized(), ...asText },
+            { maxOutputChars: bad as never }
+        )
+        expect(r.extraction).toHaveLength(MAX_OUTPUT_CHARS)
+        expect(r.truncated).toBe(true)
+    })
+
     it('floors a fractional cap', async () => {
         const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 10.9 })
         expect(r.extraction).toHaveLength(10)
@@ -1830,6 +1868,23 @@ describe('attachment — xlsx streaming determinism', () => {
         for (let i = 0; i < READS; i++) {
             expect(await extractAttachment({ content, contentType: XLSX_TYPE })).toEqual(first)
         }
+    })
+
+    it('decodes shared strings across inflate chunk boundaries without replacement characters', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Unicode')
+        const values = Array.from({ length: 2_000 }, (_, i) => `row ${i}: café — 東京 😀`)
+        for (const value of values) sheet.addRow([value])
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).not.toContain('\uFFFD')
+        expect(r.extraction).toContain(values[0])
+        expect(r.extraction).toContain(values[999])
+        expect(r.extraction).toContain(values[1_999])
     })
 
     // The ORDINARY case, where tab order and file order agree — so this pins that the reorder does
@@ -2113,6 +2168,88 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
         expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
     })
+
+    it('matches a UTF-8 flagged non-ASCII worksheet part name to its relationship target', async () => {
+        const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/custom/café.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', 'custom/café.xml'))
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file('[Content_Types].xml', types.replace('/xl/worksheets/sheet1.xml', '/xl/custom/café.xml'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toBe('=== S1 ===\ns1r1\t1\ns1r2\t2')
+    })
+
+    it('resolves case-variant workbook metadata before placing a custom worksheet', async () => {
+        const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/custom/data.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const relsName = 'xl/_rels/workbook.xml.rels'
+            const rels = (await part(zip, relsName)).replace('worksheets/sheet1.xml', 'custom/data.xml')
+            zip.remove(relsName)
+            zip.file('XL/_rels/Workbook.xml.rels', rels)
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file('[Content_Types].xml', types.replace('/xl/worksheets/sheet1.xml', '/xl/custom/data.xml'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toContain('=== S1 ===\ns1r1')
+    })
+
+    it.each(['uppercase Override media type', 'Default extension mapping'])(
+        'authorizes a custom worksheet through %s',
+        async (variant) => {
+            const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+                const from = 'xl/worksheets/sheet1.xml'
+                const to = variant.startsWith('Default') ? 'xl/custom/data.foo' : 'xl/custom/data.xml'
+                const sheet = await zip.file(from)!.async('nodebuffer')
+                zip.remove(from)
+                zip.file(to, sheet)
+
+                const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+                zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', to.slice(3)))
+                const types = await part(zip, '[Content_Types].xml')
+                if (variant.startsWith('Default')) {
+                    zip.file(
+                        '[Content_Types].xml',
+                        types
+                            .replace(/<Override PartName="\/xl\/worksheets\/sheet1\.xml"[^>]*\/>/, '')
+                            .replace(
+                                '</Types>',
+                                '<Default Extension="foo" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
+                            )
+                    )
+                } else {
+                    zip.file(
+                        '[Content_Types].xml',
+                        types
+                            .replace('/xl/worksheets/sheet1.xml', '/xl/custom/data.xml')
+                            .replace(
+                                'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml',
+                                'APPLICATION/VND.OPENXMLFORMATS-OFFICEDOCUMENT.SPREADSHEETML.WORKSHEET+XML'
+                            )
+                    )
+                }
+            })
+
+            const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+            expect(r).toMatchObject({ status: 'extracted', truncated: false })
+            expect(r.extraction).toContain('=== S1 ===\ns1r1')
+        }
+    )
 
     // Relationship type and content type are declarations from the same untrusted package, not
     // independent corroboration. Even when both call styles.xml a worksheet, a structural part must
@@ -2641,6 +2778,46 @@ describe('attachment — xlsx honours the deadline on contentless rows', () => {
             expect(r.extraction).toContain('kept')
         } finally {
             clock.mockRestore()
+            vi.doUnmock('exceljs')
+            vi.resetModules()
+        }
+    })
+})
+
+describe('attachment — xlsx incremental output cap', () => {
+    it('charges sheet headers and separators before reading later worksheets', async () => {
+        const content = await workbookWith(20, 1)
+        const row = {
+            eachCell: (_options: unknown, callback: (cell: { text: string }) => void) => callback({ text: 'x' }),
+        }
+        const worksheet = {
+            async *[Symbol.asyncIterator]() {
+                yield row
+            },
+        }
+
+        vi.resetModules()
+        vi.doMock('exceljs', () => ({
+            default: {
+                stream: {
+                    xlsx: {
+                        WorkbookReader: class {
+                            async *[Symbol.asyncIterator]() {
+                                for (let i = 0; i < 4; i++) yield worksheet
+                                throw new Error('reader advanced beyond the header-bound cap')
+                            }
+                        },
+                    },
+                },
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content, contentType: XLSX_TYPE }, { maxOutputChars: 20 })
+            expect(r.status).toBe('extracted')
+            expect(r.truncated).toBe(true)
+            expect(r.extraction).toBe('=== S1 ===\nx\n\n=== S2')
+        } finally {
             vi.doUnmock('exceljs')
             vi.resetModules()
         }
