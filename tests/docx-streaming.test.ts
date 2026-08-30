@@ -215,6 +215,17 @@ describe('docx — leaf and character contract', () => {
         expect((await extract(`${text('a')}${text('b')}`)).extraction).toBe('a\n\nb\n\n')
     })
 
+    // mammoth selects the document's w:body child. Paragraphs beside it are malformed package
+    // debris, not body content, and must not be prepended or appended to the extraction.
+    it('extracts only content inside the first direct w:body', async () => {
+        const content = await docxFrom(
+            `<?xml version="1.0"?><w:document ${NS}>${text('BEFORE')}<w:body>${text('INSIDE')}</w:body>${text('AFTER')}</w:document>`
+        )
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBe('INSIDE\n\n')
+    })
+
     // An empty paragraph is exactly '\n\n', which the entry point then trims to nothing rather than
     // storing ''. Both halves matter: the break is produced, and the result still omits `extraction`.
     it('produces only breaks for an empty paragraph, and omits the extraction', async () => {
@@ -442,10 +453,10 @@ describe('docx — the cap and the deadline stop the read', () => {
     // a tiny deeply nested document turns that into quadratic synchronous CPU and blocks the timer
     // that is supposed to contain it.
     it('refuses pathological XML nesting before namespace resolution becomes quadratic', async () => {
-        const nested = '<w:p>'.repeat(100) + '</w:p>'.repeat(100)
+        const nested = '<w:p>'.repeat(300) + '</w:p>'.repeat(300)
         const r = await extract(nested)
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/XML nesting exceeds 64 elements/)
+        expect(r.reason).toMatch(/XML nesting exceeds 256 elements/)
     })
 })
 
@@ -457,6 +468,17 @@ describe('docx — archive-level reads', () => {
         const r = await extractAttachment({ content, contentType: DOCX_TYPE })
         expect(r.status).toBe('extracted')
         expect(r.extraction).toBe('stored entry\n\n')
+    })
+
+    // Each table level contributes w:tbl/w:tr/w:tc. Twenty levels put the deepest text at XML depth
+    // 65: valid structure that the former 64-element guard rejected before the parser reached it.
+    it('reads text through twenty nested tables', async () => {
+        let nested = text('deeply nested')
+        for (let i = 0; i < 20; i++) nested = `<w:tbl><w:tr><w:tc>${nested}</w:tc></w:tr></w:tbl>`
+        const r = await extract(nested)
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(false)
+        expect(r.extraction).toBe('deeply nested\n\n')
     })
 
     // Stored entries used to arrive as one attachment-sized chunk, so neither cap nor deadline was

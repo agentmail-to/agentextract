@@ -1526,6 +1526,19 @@ describe('attachment — a utf-16 charset claim must be earned by the bytes', ()
         })
     }
 
+    // Every pair of zero bytes is a decoded U+0000. It satisfies surrogate/noncharacter checks and
+    // used to turn an ordinary NUL-filled binary into thousands of invisible "text" characters.
+    it('rejects NUL-filled binary under a utf-16 charset claim', async () => {
+        const content = Buffer.alloc(9_000)
+        const r = await extractAttachment({
+            content,
+            filename: 'payload.bin',
+            contentType: 'text/plain; charset=utf-16',
+        })
+        expect(r.status).toBe('skipped')
+        expect(r.extraction).toBeUndefined()
+    })
+
     // The allowlisted magics keep their stronger behaviour: not merely skipped, but re-sniffed back to
     // the real handler. Guards against a regression that closes the hole by dropping hasKnownBinaryMagic.
     it('still recovers an allowlisted binary (PDF) mislabeled charset=utf-16 via the sniff', async () => {
@@ -1844,6 +1857,27 @@ describe('attachment — xlsx streaming determinism', () => {
             expect(r.status).toBe('extracted')
             for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`=== N${s} ===`)
         }
+    })
+
+    // OPC part names compare ASCII-case-insensitively, while exceljs dispatches this control part by
+    // exact spelling. The private rewrite canonicalizes it so shared-string indices resolve to text.
+    it('preserves text from a case-variant shared-string part', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Data')
+        sheet.addRow(['Alpha Beta'])
+        sheet.addRow(['Gamma', 42])
+        const zip = await JSZip.loadAsync(Buffer.from(await workbook.xlsx.writeBuffer()))
+        const strings = await zip.file('xl/sharedStrings.xml')!.async('nodebuffer')
+        zip.remove('xl/sharedStrings.xml')
+        zip.file('xl/SharedStrings.xml', strings)
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(false)
+        expect(r.extraction).toBe('=== Data ===\nAlpha Beta\nGamma\t42')
     })
 
     // The two shapes where streaming deliberately does NOT reproduce workbook.xlsx.load(). Pinned so

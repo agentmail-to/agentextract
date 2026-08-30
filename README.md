@@ -91,10 +91,12 @@ guards reduce blast radius; they are **not** a sandbox.
   runs before the handler timeout starts. Its work is still bounded by the 10 MB input gate, the ZIP
   entry-count ceiling and the 50 MB inflate ceiling, but a maximal 65k-entry directory can spend time
   there that is not charged to `HANDLER_TIMEOUT_MS`.
-- **XML nesting** — OOXML parsing refuses trees deeper than 64 elements. `saxes` namespace resolution
+- **XML nesting** — OOXML parsing refuses trees deeper than 256 elements. `saxes` namespace resolution
   scans the open-tag stack, so this converts otherwise-quadratic attacker-controlled nesting into a
-  fixed bound. Real Word and Excel documents stay far below it; unreadable XLSX identity metadata
-  falls back to archive order, while DOCX returns a labeled failure or a truncated prefix.
+  fixed bound while leaving room for legitimately nested Word tables. The parser work inside one
+  chunk is synchronous, so the deadline cannot replace this structural ceiling. Unreadable XLSX
+  identity metadata falls back to archive order, while DOCX returns a labeled failure or a truncated
+  prefix.
 - **Output** — extracted text is capped at `MAX_OUTPUT_CHARS` (250k), or lower via `maxOutputChars`.
   Cutting sets `truncated` on the result, so a partial extraction is never mistaken for a complete
   one. The PDF, `.docx` and `.xlsx` handlers apply the cap **incrementally** as they build — and stop
@@ -170,6 +172,16 @@ guards reduce blast radius; they are **not** a sandbox.
   at all — one from which not a single declaration parses, or whose workbook part is too large to
   read whole — falls back to the archive's own parts, in entry order, named `Sheet1`, `Sheet2`, ….
   The rule throughout is that a sheet may lose its position or its name, never its rows.
+
+### Accepted dependency advisory
+
+ExcelJS 4.4.0 requires `uuid@^8.3.0`, so consumers currently install `uuid@8.3.2`, which npm flags
+under [GHSA-w5hq-g745-h8pq](https://github.com/advisories/GHSA-w5hq-g745-h8pq). The affected APIs are
+UUID v3/v5/v6 writes into caller-provided buffers. ExcelJS loads UUID v4 for its conditional-formatting
+write transform; AgentExtract only exercises the streaming read path, and never calls the affected
+APIs. The advisory is therefore accepted until ExcelJS publishes a compatible dependency update.
+An `overrides` entry would only alter this repository's root install and would not protect consumers,
+so the published dependency graph is left honest rather than making local audit output misleading.
 
 ## What it does that off-the-shelf engines don't
 

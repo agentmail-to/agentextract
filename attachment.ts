@@ -43,9 +43,10 @@ export const HANDLER_TIMEOUT_MS = 10_000
 export const HANDLER_DEADLINE_MARGIN_MS = 1_000
 
 // saxes resolves namespace prefixes by scanning the open-tag stack, so attacker-controlled nesting
-// makes its xmlns mode quadratic even when the XML is tiny. Real OOXML stays far below this; refusing
-// a deeper tree caps the scan before it can block the event loop past HANDLER_TIMEOUT_MS.
-const MAX_XML_NESTING_DEPTH = 64
+// makes its xmlns mode quadratic even when the XML is tiny. Twenty nested Word tables legitimately
+// reach depth 65, so the ceiling must leave real structure room while still bounding a synchronous
+// parser call the between-chunk deadline cannot interrupt.
+const MAX_XML_NESTING_DEPTH = 256
 
 const assertXmlDepth = (depth: number): void => {
     if (depth > MAX_XML_NESTING_DEPTH) {
@@ -891,7 +892,8 @@ const XLSX_LEADING_ENTRIES = [
     'xl/sharedStrings.xml', // -> this.sharedStrings
     'xl/styles.xml', // -> this.styles      (number formats)
 ]
-const XLSX_READER_CONTROL_PARTS = new Set(XLSX_LEADING_ENTRIES.map((name) => name.toLowerCase()))
+const XLSX_CANONICAL_CONTROL_PARTS = new Map(XLSX_LEADING_ENTRIES.map((name) => [name.toLowerCase(), name]))
+const XLSX_READER_CONTROL_PARTS = new Set(XLSX_CANONICAL_CONTROL_PARTS.keys())
 
 // A workbook with no strings has no xl/sharedStrings.xml, so this.sharedStrings is never set and
 // ordering alone cannot lift it out of the spool branch (measured: 35 of 50 reads dropped sheets).
@@ -1323,8 +1325,21 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     // the buffer, which Invariant 2 catches. Failing closed keeps that from being load-bearing.
     if (!entries) return { ok: false, reason: 'xlsx central directory could not be read for streaming' }
 
-    const complete = [...entries]
-    if (!entries.some((entry) => entry.name === 'xl/sharedStrings.xml')) {
+    // OPC part names compare ASCII-case-insensitively; exceljs's streaming dispatch does not. Give
+    // the first case-variant control part its canonical name in the private copy, just as worksheets
+    // below are canonicalized. If an exact spelling already exists, leave any invalid case-duplicate
+    // alone rather than creating a second entry with the same name.
+    const exactControls = new Set(entries.map((entry) => entry.name))
+    const canonicalized = new Set<string>()
+    const complete = entries.map((entry) => {
+        const canonical = XLSX_CANONICAL_CONTROL_PARTS.get(entry.name.toLowerCase())
+        if (!canonical || entry.name === canonical || exactControls.has(canonical) || canonicalized.has(canonical)) {
+            return entry
+        }
+        canonicalized.add(canonical)
+        return { ...entry, name: canonical }
+    })
+    if (!complete.some((entry) => entry.name === 'xl/sharedStrings.xml')) {
         complete.push({
             name: 'xl/sharedStrings.xml',
             method: 0, // stored: the injected table is 153 bytes, so compressing it is noise
@@ -1334,7 +1349,7 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
             data: EMPTY_SHARED_STRINGS,
         })
     }
-    if (!entries.some((entry) => entry.name === WORKBOOK_RELS_PART)) {
+    if (!complete.some((entry) => entry.name === WORKBOOK_RELS_PART)) {
         complete.push({
             name: WORKBOOK_RELS_PART,
             method: 0,
@@ -1610,6 +1625,7 @@ const createDocxReader = async (): Promise<DocxReader> => {
     let skip = -1 // stack index where the dropped subtree began, or -1 when we're reading
     let rowDeleted = false // a w:trPr said its row is deleted; act on it once that w:trPr closes
     let sawBody = false
+    let inBody = false
     let chars = 0
 
     const emit = (text: string): void => {
@@ -1649,6 +1665,20 @@ const createDocxReader = async (): Promise<DocxReader> => {
             return
         }
 
+        // mammoth reads the w:body child, not every paragraph anywhere under w:document. Preserve
+        // the root only as a path to that child; any sibling before or after the first body is a
+        // malformed-document subtree and is dropped without affecting the body itself.
+        if (!inBody) {
+            if (name === 'w:document' && stack.length === 1) return
+            if (name === 'w:body' && stack.length === 2 && stack[0] === 'w:document' && !sawBody) {
+                sawBody = true
+                inBody = true
+                return
+            }
+            skip = stack.length - 1
+            return
+        }
+
         // w:t is the ONE text-bearing element; the text handler recognizes it off the stack top, so
         // it needs no flag of its own. Deliberately before the container test, so its children —
         // illegal anyway — fall through to the drop below exactly as they do in mammoth.
@@ -1661,7 +1691,6 @@ const createDocxReader = async (): Promise<DocxReader> => {
             return
         }
         if (DOCX_CONTAINERS.has(name)) {
-            if (name === 'w:body') sawBody = true
             return
         }
         const literal = Object.prototype.hasOwnProperty.call(DOCX_LITERALS, name) ? DOCX_LITERALS[name] : undefined
@@ -1685,6 +1714,10 @@ const createDocxReader = async (): Promise<DocxReader> => {
                 rowDeleted = false
                 skip = stack.length - 1
             }
+            return
+        }
+        if (name === 'w:body' && stack.length === 1) {
+            inBody = false
             return
         }
 
@@ -1785,15 +1818,15 @@ const hasKnownBinaryMagic = (content: Buffer): boolean =>
 // Are the bytes structurally well-formed utf-16? A printable-ratio test can't tell: read as utf-16,
 // arbitrary bytes land across the BMP and are nearly all "printable", so png/jpeg/gif sail through.
 // Well-formedness can. The surrogate block is 1/32 of the BMP, so binary hits it constantly and
-// essentially never as a correct high-then-low pair; real utf-16 pairs every one and never carries
-// the U+FFFE/U+FFFF noncharacters. Either tell proves the bytes aren't the utf-16 they claim to be.
+// essentially never as a correct high-then-low pair; attachment text pairs every one and carries
+// neither embedded NULs nor the U+FFFE/U+FFFF noncharacters. Any tell disproves the charset claim.
 const isWellFormedUtf16 = (content: Buffer, bigEndian: boolean): boolean => {
     const sample = content.subarray(0, SNIFF_BYTES)
     const end = sample.length - (sample.length % 2) // whole code units only
     if (end === 0) return false
     for (let i = 0; i < end; i += 2) {
         const unit = bigEndian ? sample.readUInt16BE(i) : sample.readUInt16LE(i)
-        if (unit === 0xfffe || unit === 0xffff) return false // noncharacter
+        if (unit === 0 || unit === 0xfffe || unit === 0xffff) return false // embedded NUL or noncharacter
         if (unit >= 0xdc00 && unit <= 0xdfff) return false // low surrogate with no high before it
         if (unit >= 0xd800 && unit <= 0xdbff) {
             // Nothing after a high surrogate means two different things. A truncated sample just puts
