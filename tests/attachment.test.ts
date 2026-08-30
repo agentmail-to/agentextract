@@ -376,6 +376,16 @@ describe('attachment — charset-correct decoding', () => {
         expect(r.extraction).toBe('hello world')
     })
 
+    it.each(['ucs-2', 'ucs2', 'utf16le', 'utf16', 'utf16be'])(
+        'accepts the iconv UTF-16 alias %s in Content-Type',
+        async (charset) => {
+            const encoding = charset.endsWith('be') ? 'utf-16be' : 'utf-16le'
+            const content = iconv.encode('hello world', encoding, { addBOM: false })
+            const r = await extractAttachment({ content, contentType: `text/plain; charset=${charset}` })
+            expect(r).toMatchObject({ status: 'extracted', extraction: 'hello world', truncated: false })
+        }
+    )
+
     // U+FFFD is also a legitimate code point in explicitly declared, BOM-less UTF-16. Its presence
     // must not activate the latin1 recovery path and expose an interleaved NUL after every character.
     it('keeps a literal U+FFFD in BOM-less UTF-16 declared by Content-Type', async () => {
@@ -1887,6 +1897,34 @@ describe('attachment — xlsx streaming determinism', () => {
         expect(r.extraction).toContain(values[1_999])
     })
 
+    it.each([0.9, 0.7, 0.5])('fails a worksheet whose XML stops at %s of its original length', async (ratio) => {
+        const zip = await JSZip.loadAsync(await workbookWith(1, 40))
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('nodebuffer')
+        zip.file(name, xml.subarray(0, Math.floor(xml.length * ratio)))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.extraction).toBeUndefined()
+    })
+
+    it('fails when a truncated later worksheet yields no rows but still counts as emitted', async () => {
+        const zip = await JSZip.loadAsync(await workbookWith(2, 10))
+        const name = 'xl/worksheets/sheet2.xml'
+        const xml = await zip.file(name)!.async('nodebuffer')
+        zip.file(name, xml.subarray(0, Math.floor(xml.length * 0.2)))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.extraction).toBeUndefined()
+    })
+
     // The ORDINARY case, where tab order and file order agree — so this pins that the reorder does
     // not scramble a normal workbook, and nothing more. It cannot see where the two authorities
     // disagree, because exceljs's writer never emits a workbook in which they do: that is what the
@@ -2065,6 +2103,30 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         }
     })
 
+    it.each([
+        ['empty', ''],
+        ['rootless', '<root/>'],
+    ])('never enters ExcelJS temp-file spooling for a present-but-%s rels part', async (_label, relsBody) => {
+        const content = await rebuild(await workbookWith(6, 1), async (zip) => {
+            zip.file('xl/_rels/workbook.xml.rels', relsBody)
+        })
+        const tmp = require('tmp') as { file: (...args: unknown[]) => unknown }
+        const originalFile = tmp.file
+        let spoolCalls = 0
+        tmp.file = (..._args) => {
+            spoolCalls += 1
+            throw new Error('ExcelJS temp-file spool reached')
+        }
+        try {
+            const r = await extractAttachment({ content, contentType: XLSX_TYPE }, { maxOutputChars: 12 })
+            expect(r.status).toBe('extracted')
+            expect(r.truncated).toBe(true)
+            expect(spoolCalls).toBe(0)
+        } finally {
+            tmp.file = originalFile
+        }
+    })
+
     // MEMBERSHIP is the archive's, not the workbook's. The workbook still declares three sheets here
     // — only the relationship placing one of them is gone — so dropping that part would DELETE its
     // text, and invisibly: the backstop compares `seen` against the resolved list, so removing a
@@ -2186,6 +2248,37 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         const r = await extractAttachment({ content, contentType: XLSX_TYPE })
         expect(r).toMatchObject({ status: 'extracted', truncated: false })
         expect(r.extraction).toBe('=== S1 ===\ns1r1\t1\ns1r2\t2')
+    })
+
+    it('keeps non-ASCII part names distinct when only Unicode case folding would merge them', async () => {
+        const content = await rebuild(await workbookWith(2, 1), async (zip) => {
+            for (const [from, to] of [
+                ['xl/worksheets/sheet1.xml', 'xl/custom/Ä.xml'],
+                ['xl/worksheets/sheet2.xml', 'xl/custom/ä.xml'],
+            ]) {
+                const sheet = await zip.file(from)!.async('nodebuffer')
+                zip.remove(from)
+                zip.file(to, sheet)
+            }
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file(
+                'xl/_rels/workbook.xml.rels',
+                rels.replace('worksheets/sheet1.xml', 'custom/Ä.xml').replace('worksheets/sheet2.xml', 'custom/ä.xml')
+            )
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file(
+                '[Content_Types].xml',
+                types
+                    .replace('/xl/worksheets/sheet1.xml', '/xl/custom/Ä.xml')
+                    .replace('/xl/worksheets/sheet2.xml', '/xl/custom/ä.xml')
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toContain('=== S1 ===\ns1r1')
+        expect(r.extraction).toContain('=== S2 ===\ns2r1')
     })
 
     it('resolves case-variant workbook metadata before placing a custom worksheet', async () => {

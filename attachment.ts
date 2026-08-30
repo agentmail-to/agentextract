@@ -143,7 +143,12 @@ const bomCharset = (content: Buffer): string | undefined => {
 // Which utf-16 flavour an explicit or resolved charset names, if any.
 const claimsUtf16 = (charset?: string): 'utf-16' | 'utf-16le' | 'utf-16be' | undefined => {
     const normalized = charset?.trim().toLowerCase().replace(/_/g, '-')
-    return normalized === 'utf-16' || normalized === 'utf-16le' || normalized === 'utf-16be' ? normalized : undefined
+    if (normalized === 'utf-16' || normalized === 'utf16') return 'utf-16'
+    if (normalized === 'utf-16le' || normalized === 'utf16le' || normalized === 'ucs-2' || normalized === 'ucs2') {
+        return 'utf-16le'
+    }
+    if (normalized === 'utf-16be' || normalized === 'utf16be') return 'utf-16be'
+    return undefined
 }
 
 // Priority chain: most trustworthy signal first, degrading gracefully.
@@ -430,6 +435,7 @@ const xlsxHandler: Handler = {
         const { Readable } = await import('node:stream')
         const { StringDecoder } = await import('node:string_decoder')
         const { default: ExcelJS } = await import('exceljs') // not SheetJS: no known parse-time CVEs
+        const { SaxesParser } = await import('saxes')
         // Stream rather than workbook.xlsx.load(), which materializes every cell as a live object
         // before any cap can apply — a 4 MB in-cap .xlsx peaked at hundreds of MB and OOMed a 1024 MB
         // worker. Peak now follows the shared-string table, not the cell graph. See
@@ -458,18 +464,31 @@ const xlsxHandler: Handler = {
             entry.setEncoding('utf8') // Node streams use StringDecoder internally across chunks.
             return entry
         }
-        const decodeChunks = async function* (chunks: ExcelXmlChunks): AsyncIterable<string> {
+        const decodeChunks = async function* (chunks: ExcelXmlChunks, validateAtEof = false): AsyncIterable<string> {
             const decoder = new StringDecoder('utf8')
+            const validator = validateAtEof ? new SaxesParser() : undefined
             for await (const chunk of chunks) {
                 if (typeof chunk === 'string') {
+                    validator?.write(chunk)
                     yield chunk
                 } else {
                     const decoded = decoder.write(chunk)
-                    if (decoded) yield decoded
+                    if (decoded) {
+                        validator?.write(decoded)
+                        yield decoded
+                    }
                 }
             }
             const tail = decoder.end()
-            if (tail) yield tail
+            if (tail) {
+                validator?.write(tail)
+                yield tail
+            }
+            // ExcelJS's parseSax never closes its saxes parser, so truncated worksheet XML otherwise
+            // looks like a successful short sheet. This line is reached only at NATURAL EOF: if our
+            // cap or deadline abandons the iterator, generator return skips it and that intentional
+            // partial read remains `extracted, truncated: true` rather than becoming a parse failure.
+            validator?.close()
         }
         if (internal._parseRels) {
             const parse = internal._parseRels.bind(internal)
@@ -489,7 +508,7 @@ const xlsxHandler: Handler = {
         }
         if (internal._parseWorksheet) {
             const parse = internal._parseWorksheet.bind(internal)
-            internal._parseWorksheet = (chunks, sheetNo) => parse(decodeChunks(chunks), sheetNo)
+            internal._parseWorksheet = (chunks, sheetNo) => parse(decodeChunks(chunks, true), sheetNo)
         }
         if (internal._parseHyperlinks) {
             const parse = internal._parseHyperlinks.bind(internal)
@@ -966,7 +985,12 @@ const XLSX_LEADING_ENTRIES = [
     'xl/sharedStrings.xml', // -> this.sharedStrings
     'xl/styles.xml', // -> this.styles      (number formats)
 ]
-const XLSX_CANONICAL_CONTROL_PARTS = new Map(XLSX_LEADING_ENTRIES.map((name) => [name.toLowerCase(), name]))
+
+// ECMA-376 defines part-name equivalence by folding A-Z only. JavaScript's Unicode lowercasing also
+// merges distinct legal names such as Ä.xml and ä.xml, so it cannot be used for any OPC identity.
+const asciiFold = (value: string): string => value.replace(/[A-Z]/g, (char) => char.toLowerCase())
+
+const XLSX_CANONICAL_CONTROL_PARTS = new Map(XLSX_LEADING_ENTRIES.map((name) => [asciiFold(name), name]))
 const XLSX_READER_CONTROL_PARTS = new Set(XLSX_CANONICAL_CONTROL_PARTS.keys())
 
 // A workbook with no strings has no xl/sharedStrings.xml, so this.sharedStrings is never set and
@@ -982,10 +1006,11 @@ const EMPTY_SHARED_STRINGS = Buffer.from(
 // would be work with one possible answer. A test recomputes it, so the two can't drift.
 const EMPTY_SHARED_STRINGS_CRC = 0x2949bd0b
 
-// A missing workbook relationship part leaves exceljs's workbookRels unset, sending every sheet
-// through its temp-file spool branch. Early break/throw then strands those files. An empty relation
-// set is the truthful value for a missing part on the archive-fallback path and keeps every sheet on
-// the inline reader, where abandoning the generator has nothing to clean up.
+// A missing, empty, or malformed workbook relationship part leaves exceljs's workbookRels unset,
+// sending every sheet through its temp-file spool branch. Early break/throw then strands those files.
+// Sheet identity is resolved from the ORIGINAL part before the rebuild; ExcelJS needs only a truthy
+// relationship model after that, so its private copy always receives this known-valid empty set and
+// keeps every sheet on the inline reader, where abandoning the generator has nothing to clean up.
 const EMPTY_WORKBOOK_RELS = Buffer.from(
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
@@ -1001,7 +1026,8 @@ const ZIP_VERSION = 20 // 2.0 — the floor for deflate, which is all we re-emit
 // The conventional worksheet path, anchored. OPC part URIs are ASCII-case-insensitive, so this also
 // recognizes a stored xl/Worksheets/Sheet2.xml. The rebuild canonicalizes every resolved sheet before
 // exceljs sees it because exceljs's streaming dispatch below is case-sensitive.
-const WORKSHEET_PART = /^xl\/worksheets\/sheet\d+\.xml$/i
+const WORKSHEET_PART = /^xl\/worksheets\/sheet\d+\.xml$/
+const isWorksheetPart = (name: string): boolean => WORKSHEET_PART.test(asciiFold(name))
 
 // What EXCELJS treats as a worksheet: the same shape, UNANCHORED (workbook-reader.js:311). So it
 // dispatches xl/worksheets/sheet1.xml.bak, or a copy nested under any prefix, where WORKSHEET_PART
@@ -1075,11 +1101,11 @@ interface WorkbookSheet {
     name: string
 }
 
-const worksheetEntries = (entries: ZipEntry[]): ZipEntry[] => entries.filter((entry) => WORKSHEET_PART.test(entry.name))
+const worksheetEntries = (entries: ZipEntry[]): ZipEntry[] => entries.filter((entry) => isWorksheetPart(entry.name))
 
 // A worksheet part the workbook does not name. sheetN.xml's own number is the most stable label
 // available, and is what the reader's own fallback produced for these.
-const partFallbackName = (part: string): string => `Sheet${/(\d+)\.xml$/.exec(part)?.[1] ?? ''}`
+const partFallbackName = (part: string): string => `Sheet${/(\d+)\.xml$/.exec(asciiFold(part))?.[1] ?? ''}`
 
 // A ceiling on the two metadata parts, which is NOT the decompression budget. The budget bounds the
 // whole archive at 50 MB, and letting one part spend all of it here costs ~2x that in peak: the
@@ -1207,7 +1233,7 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
                 const partName = tag.attributes.PartName?.value
                 if (!partName) return
                 try {
-                    const part = decodeURIComponent(partName).replace(/^\/+/, '').toLowerCase()
+                    const part = asciiFold(decodeURIComponent(partName).replace(/^\/+/, ''))
                     overriddenParts.add(part)
                     const contentType = tag.attributes.ContentType?.value?.trim().toLowerCase()
                     if (contentType && WORKSHEET_CONTENT_TYPE.has(contentType)) worksheetParts.add(part)
@@ -1217,8 +1243,9 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
             } else if (tag.local === 'Default') {
                 const contentType = tag.attributes.ContentType?.value?.trim().toLowerCase()
                 if (!contentType || !WORKSHEET_CONTENT_TYPE.has(contentType)) return
-                const extension = tag.attributes.Extension?.value?.replace(/^\./, '').toLowerCase()
-                if (extension) worksheetExtensions.add(extension)
+                const extension = tag.attributes.Extension?.value?.replace(/^\./, '')
+                const foldedExtension = extension === undefined ? undefined : asciiFold(extension)
+                if (foldedExtension) worksheetExtensions.add(foldedExtension)
             }
         })
         contentTypes.on('closetag', () => void contentTypesDepth--)
@@ -1263,13 +1290,13 @@ const resolveRelTarget = (target: string): string | undefined => {
 const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] | undefined> => {
     const metadata = new Map<string, ZipEntry>()
     for (const entry of entries) {
-        const folded = entry.name.toLowerCase()
+        const folded = asciiFold(entry.name)
         if (!metadata.has(folded)) metadata.set(folded, entry)
     }
-    const workbookEntry = entries.find((entry) => entry.name === WORKBOOK_PART) ?? metadata.get(WORKBOOK_PART.toLowerCase())
-    const relsEntry = entries.find((entry) => entry.name === WORKBOOK_RELS_PART) ?? metadata.get(WORKBOOK_RELS_PART.toLowerCase())
+    const workbookEntry = entries.find((entry) => entry.name === WORKBOOK_PART) ?? metadata.get(asciiFold(WORKBOOK_PART))
+    const relsEntry = entries.find((entry) => entry.name === WORKBOOK_RELS_PART) ?? metadata.get(asciiFold(WORKBOOK_RELS_PART))
     const contentTypesEntry =
-        entries.find((entry) => entry.name === CONTENT_TYPES_PART) ?? metadata.get(CONTENT_TYPES_PART.toLowerCase())
+        entries.find((entry) => entry.name === CONTENT_TYPES_PART) ?? metadata.get(asciiFold(CONTENT_TYPES_PART))
     if (!workbookEntry || !relsEntry) return undefined
 
     const [workbookXml, relsXml, contentTypesXml] = await Promise.all([
@@ -1294,11 +1321,11 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
     // may differ only in case, or an explicit worksheet relationship may point outside the usual
     // xl/worksheets/sheetN.xml convention. reorderForStreaming gives those entries canonical names
     // in its private copy so exceljs's narrower, case-sensitive dispatcher can yield them.
-    const present = new Set(entries.map((entry) => entry.name.toLowerCase()))
+    const present = new Set(entries.map((entry) => asciiFold(entry.name)))
     const worksheets = worksheetEntries(entries)
     const byPart = new Map<string, ZipEntry>()
     for (const entry of entries) {
-        const folded = entry.name.toLowerCase()
+        const folded = asciiFold(entry.name)
         if (!byPart.has(folded)) byPart.set(folded, entry)
     }
 
@@ -1318,7 +1345,8 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
             hasUnplaced = true // no relationship, an external one, or nothing to call it
             continue
         }
-        const part = resolveRelTarget(rel.target)?.toLowerCase()
+        const resolvedPart = resolveRelTarget(rel.target)
+        const part = resolvedPart === undefined ? undefined : asciiFold(resolvedPart)
         // A chartsheet or dialogsheet is a real declaration with no xl/worksheets part for the reader
         // to yield, so it is accounted for and must NOT count as unplaced — otherwise every workbook
         // holding one flips into the rescue below and resurrects genuine orphans.
@@ -1338,7 +1366,7 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
         }
         const dot = part?.lastIndexOf('.') ?? -1
         const slash = part?.lastIndexOf('/') ?? -1
-        const extension = dot > slash ? part?.slice(dot + 1).toLowerCase() : undefined
+        const extension = dot > slash ? asciiFold(part?.slice(dot + 1) ?? '') : undefined
         const authorizedByContentType =
             part !== undefined &&
             (parsed.worksheetParts.has(part) ||
@@ -1352,7 +1380,7 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
         // an orphan and this same central record would be written twice by the rebuild.
         if (
             part === undefined ||
-            (!WORKSHEET_PART.test(part) &&
+            (!isWorksheetPart(part) &&
                 (!WORKSHEET_REL.has(rel.type) ||
                     !authorizedByContentType ||
                     XLSX_READER_CONTROL_PARTS.has(part)))
@@ -1387,11 +1415,11 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
     // pointing at theme XML while the real rows sit in sheetN.xml. Rescue them all. A legitimate
     // custom sheet may therefore keep a stale conventional orphan, preferring possible duplicate
     // text over the silent row loss this feature exists to prevent.
-    const placedNonConventional = ordered.some((sheet) => !WORKSHEET_PART.test(sheet.entry.name))
+    const placedNonConventional = ordered.some((sheet) => !isWorksheetPart(sheet.entry.name))
     const rescued = worksheets.filter(
         (entry) =>
             !placed.has(entry) &&
-            (hasUnplaced || placedNonConventional || claimedNames.has(entry.name.toLowerCase()))
+            (hasUnplaced || placedNonConventional || claimedNames.has(asciiFold(entry.name)))
     )
     // Zero worksheets is a real answer for a chartsheet-only workbook — but only from a workbook that
     // told us something. A <sheets> we could not read one declaration out of is not that answer, and
@@ -1432,7 +1460,7 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     const exactControls = new Set(entries.map((entry) => entry.name))
     const canonicalized = new Set<string>()
     const complete = entries.map((entry) => {
-        const canonical = XLSX_CANONICAL_CONTROL_PARTS.get(entry.name.toLowerCase())
+        const canonical = XLSX_CANONICAL_CONTROL_PARTS.get(asciiFold(entry.name))
         if (!canonical || entry.name === canonical || exactControls.has(canonical) || canonicalized.has(canonical)) {
             return entry
         }
@@ -1450,17 +1478,18 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
             data: EMPTY_SHARED_STRINGS,
         })
     }
-    if (!complete.some((entry) => entry.name === WORKBOOK_RELS_PART)) {
-        complete.push({
-            name: WORKBOOK_RELS_PART,
-            utf8Name: false,
-            method: 0,
-            crc: EMPTY_WORKBOOK_RELS_CRC,
-            compSize: EMPTY_WORKBOOK_RELS.length,
-            uncompSize: EMPTY_WORKBOOK_RELS.length,
-            data: EMPTY_WORKBOOK_RELS,
-        })
+    const safeWorkbookRels: ZipEntry = {
+        name: WORKBOOK_RELS_PART,
+        utf8Name: false,
+        method: 0,
+        crc: EMPTY_WORKBOOK_RELS_CRC,
+        compSize: EMPTY_WORKBOOK_RELS.length,
+        uncompSize: EMPTY_WORKBOOK_RELS.length,
+        data: EMPTY_WORKBOOK_RELS,
     }
+    const workbookRelsIndex = complete.findIndex((entry) => entry.name === WORKBOOK_RELS_PART)
+    if (workbookRelsIndex === -1) complete.push(safeWorkbookRels)
+    else complete[workbookRelsIndex] = safeWorkbookRels
 
     const sheets = (await workbookWorksheets(entries)) ?? archiveWorksheets(entries)
     const sheetEntries = new Set(sheets.map((sheet) => sheet.entry))

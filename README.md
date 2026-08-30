@@ -86,9 +86,9 @@ guards reduce blast radius; they are **not** a sandbox.
 
 - **Input size** — attachments over `MAX_INPUT_BYTES` (10 MB) are skipped before any decode or parse.
 - **Decompression** — OOXML (`.docx`/`.xlsx`) archives are stream-inflated and **measured**; one that
-  actually expands past `MAX_UNCOMPRESSED_BYTES` (50 MB) is skipped before the parser loads. Malformed
-  or ZIP64 metadata is treated as over-budget (fail-closed), not trusted. This archive-wide preflight
-  runs before the handler timeout starts. Its work is still bounded by the 10 MB input gate, the ZIP
+  actually expands past `MAX_UNCOMPRESSED_BYTES` (50 MB) is skipped before the parser loads. ZIP64 or
+  out-of-range metadata is likewise `skipped`; malformed metadata is `failed`. This archive-wide
+  preflight runs before the handler timeout starts. Its work is still bounded by the 10 MB input gate, the ZIP
   entry-count ceiling and the 50 MB inflate ceiling, but a maximal 65k-entry directory can spend time
   there that is not charged to `HANDLER_TIMEOUT_MS`.
 - **XML nesting** — OOXML parsing refuses trees deeper than 256 elements. `saxes` namespace resolution
