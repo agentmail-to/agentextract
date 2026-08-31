@@ -114,8 +114,9 @@ guards reduce blast radius; they are **not** a sandbox.
 - **PDF** — page count and accumulated output are bounded (`MAX_PDF_PAGES`, `MAX_OUTPUT_CHARS`), but
   pdf.js's internal per-page decompression is **not** bounded in-library (no hook exists).
 - **`.docx`** — `word/document.xml` is located in the archive's central directory, inflated on its
-  own, and read with a streaming SAX parser (`saxes`) rather than loaded into a DOM. Peak memory
-  therefore tracks one inflate chunk plus the text kept so far, independent of document size.
+  own, and read with a streaming SAX parser (`saxes`) rather than loaded into a DOM. Parser memory
+  tracks one inflate chunk plus bounded retained text; deferred text-box frames stop retaining new
+  text once the output cap is crossed, so nesting depth cannot multiply the output allowance.
   Measured at a 1024 MB heap on a 45 MB `document.xml` inside a 3.65 MB archive, against the previous
   DOM-based reader:
 
@@ -135,9 +136,11 @@ guards reduce blast radius; they are **not** a sandbox.
   bodies are not extracted** (they are separate zip parts), and neither are headers or footers.
   **Table structure is not preserved**: each cell's paragraphs are emitted in reading order with the
   same blank-line separator as body paragraphs, so a 2×2 table is indistinguishable from four
-  consecutive paragraphs. List bullets and numbers are dropped; the item text remains. All of this
-  matches the previous reader exactly — it is a documented limit, not a regression — but a consumer
-  reading an invoice or a contract should know the column a figure sat in is gone.
+  consecutive paragraphs. List bullets and numbers are dropped; the item text remains. Vertical-
+  merge continuation cells are omitted as they were by the previous reader. These are compatibility
+  targets rather than a claim of byte-for-byte identity for every malformed OOXML tree; intentional
+  recovery differences are pinned in the DOCX streaming tests. A consumer reading an invoice or a
+  contract should still know the column a figure sat in is gone.
 - **`.xlsx`** — read row-by-row through `exceljs`'s streaming reader rather than loaded whole, so
   peak memory tracks the shared-string table plus one row instead of a live object per cell
   (measured: 294 MB → 171 MB, and 3.7x faster, on a 5 MB / 38 MB-uncompressed workbook). It is not

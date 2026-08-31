@@ -27,6 +27,19 @@ const fixture = (name: string) => readFileSync(join(process.cwd(), 'tests', 'fix
 const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
+const stubExcelReaderHooks = (reader: Record<string, unknown>, omit?: string) => {
+    const hooks: Record<string, unknown> = {
+        _parseRels: async () => undefined,
+        _parseWorkbook: async () => undefined,
+        _parseSharedStrings: async function* () {},
+        _parseStyles: async () => undefined,
+        _parseWorksheet: () => [],
+        _parseHyperlinks: () => [],
+    }
+    if (omit) delete hooks[omit]
+    Object.assign(reader, hooks)
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic tests for attachment.ts
 // ---------------------------------------------------------------------------
@@ -701,6 +714,21 @@ describe('attachment — xlsx handler', () => {
         expect(r.extraction).not.toContain('SUM(')
     })
 
+    it('extracts shared-formula continuation results instead of their raw value objects', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Shared')
+        sheet.getCell('A1').value = 2
+        sheet.fillFormula('B1:B2', 'A1+1', [3, 6])
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toBe('=== Shared ===\n2\t3\n6')
+        expect(r.extraction).not.toContain('{"formula"')
+    })
+
     it('preserves boolean and date result types for streamed formula cells', async () => {
         const workbook = new ExcelJS.Workbook()
         workbook.properties.date1904 = true
@@ -733,6 +761,70 @@ describe('attachment — xlsx handler', () => {
             contentType: XLSX_TYPE,
         })
         expect(r).toMatchObject({ status: 'extracted', extraction: '=== Encoded ===\ntrue', truncated: false })
+    })
+
+    it('does not coerce non-finite formula results into dates or booleans', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Invalid')
+        sheet.getCell('A1').value = { formula: 'DATE(2024,1,2)', result: 45_293 }
+        sheet.getCell('A1').numFmt = 'yyyy-mm-dd'
+        sheet.getCell('B1').value = { formula: '1=1', result: true }
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(
+            name,
+            xml
+                .replace(/(<c r="A1"[^>]*)(>.*?<v>)[^<]*(<\/v>)/, '$1 t="e"$2#N/A$3')
+                .replace(/(<c r="B1"[^>]*t="b"[^>]*>.*?<v>)[^<]*(<\/v>)/, '$1not-a-number$2')
+        )
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).not.toContain('Invalid Date')
+        expect(r.extraction).not.toContain('true')
+    })
+
+    it('ignores boolean-looking cells outside worksheet rows', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Scoped').getCell('A1').value = { formula: '1+0', result: 1 }
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(name, xml.replace('<sheetData>', '<extLst><c r="A1" t="b"/></extLst><sheetData>'))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Scoped ===\n1', truncated: false })
+    })
+
+    it.each([
+        ['worksheet', 'xl/worksheets/sheet1.xml'],
+        ['shared strings', 'xl/sharedStrings.xml'],
+        ['styles', 'xl/styles.xml'],
+    ])('enforces the XML depth ceiling in streamed %s', async (_label, name) => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Deep')
+        sheet.getCell('A1').value = 'text'
+        sheet.getCell('B1').value = 1
+        sheet.getCell('B1').numFmt = '0.00'
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const xml = await zip.file(name)!.async('string')
+        const close = xml.lastIndexOf('</')
+        const nested = '<extLst>'.repeat(300) + '</extLst>'.repeat(300)
+        zip.file(name, xml.slice(0, close) + nested + xml.slice(close))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/XML nesting exceeds 256 elements/)
     })
 
     // A workbook with only empty sheets parses fine but yields no rows: extracted, no extraction.
@@ -2821,6 +2913,7 @@ describe('attachment — the rebuild cannot amplify what the budget measured', (
                             stream: NodeJS.ReadableStream
                             constructor(stream: NodeJS.ReadableStream) {
                                 this.stream = stream
+                                stubExcelReaderHooks(this)
                             }
                             async *[Symbol.asyncIterator]() {
                                 const chunks: Buffer[] = []
@@ -2969,8 +3062,12 @@ describe('attachment — xlsx honours the deadline on contentless rows', () => {
 
     it('returns earlier sheet text when the deadline expires across row-less sheets', async () => {
         const content = await workbookWith(2, 1)
+        let readKept = false
         const row = {
-            eachCell: (_options: unknown, callback: (cell: { text: string }) => void) => callback({ text: 'kept' }),
+            eachCell: (_options: unknown, callback: (cell: { text: string }) => void) => {
+                callback({ text: 'kept' })
+                readKept = true
+            },
         }
         const worksheet = (rows: unknown[]) => ({
             async *[Symbol.asyncIterator]() {
@@ -2984,6 +3081,9 @@ describe('attachment — xlsx honours the deadline on contentless rows', () => {
                 stream: {
                     xlsx: {
                         WorkbookReader: class {
+                            constructor() {
+                                stubExcelReaderHooks(this)
+                            }
                             async *[Symbol.asyncIterator]() {
                                 yield worksheet([row])
                                 yield worksheet([]) // never enters the per-row deadline check
@@ -2994,8 +3094,9 @@ describe('attachment — xlsx honours the deadline on contentless rows', () => {
             },
         }))
         const base = Date.now()
-        let calls = 0
-        const clock = vi.spyOn(Date, 'now').mockImplementation(() => (++calls < 4 ? base : base + HANDLER_TIMEOUT_MS))
+        const clock = vi
+            .spyOn(Date, 'now')
+            .mockImplementation(() => (readKept ? base + HANDLER_TIMEOUT_MS : base))
         try {
             const { extractAttachment: extract } = await import('../attachment')
             const r = await extract({ content, contentType: XLSX_TYPE })
@@ -3007,6 +3108,28 @@ describe('attachment — xlsx honours the deadline on contentless rows', () => {
             vi.doUnmock('exceljs')
             vi.resetModules()
         }
+    })
+
+    it('checks the deadline while parsing non-row worksheet markup', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Markup').addRow(['kept'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(name, xml.replace('</worksheet>', `<extLst><!--${'x'.repeat(512 * 1024)}--></extLst></worksheet>`))
+        const content = await zip.generateAsync({ type: 'nodebuffer' })
+
+        const base = Date.now()
+        let calls = 0
+        const clock = vi
+            .spyOn(Date, 'now')
+            .mockImplementation(() => (++calls < 8 ? base : base + HANDLER_TIMEOUT_MS + 1))
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        clock.mockRestore()
+
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(true)
+        expect(r.extraction).toContain('kept')
     })
 })
 
@@ -3028,6 +3151,9 @@ describe('attachment — xlsx incremental output cap', () => {
                 stream: {
                     xlsx: {
                         WorkbookReader: class {
+                            constructor() {
+                                stubExcelReaderHooks(this)
+                            }
                             async *[Symbol.asyncIterator]() {
                                 for (let i = 0; i < 4; i++) yield worksheet
                                 throw new Error('reader advanced beyond the header-bound cap')
@@ -3108,6 +3234,34 @@ describe('attachment — xlsx lost-worksheet backstop', () => {
 
         expect(r.status).toBe('failed')
         expect(r.reason).toMatch(/yielded 2 of 3 worksheets/)
+    })
+
+    it('fails fast when the pinned ExcelJS streaming hooks are unavailable', async () => {
+        const content = await workbookWith(1, 1)
+        vi.resetModules()
+        vi.doMock('exceljs', () => ({
+            default: {
+                stream: {
+                    xlsx: {
+                        WorkbookReader: class {
+                            constructor() {
+                                stubExcelReaderHooks(this, '_parseStyles')
+                            }
+                            async *[Symbol.asyncIterator]() {}
+                        },
+                    },
+                },
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content, contentType: XLSX_TYPE })
+            expect(r.status).toBe('failed')
+            expect(r.reason).toMatch(/no _parseStyles; expected the 4\.4\.0 internals/)
+        } finally {
+            vi.doUnmock('exceljs')
+            vi.resetModules()
+        }
     })
 
     // The backstop must not fire on a deliberate stop: truncation leaves later sheets unread BY
@@ -3196,6 +3350,7 @@ describe('attachment — xlsx archive rewrite limits', () => {
                             stream: NodeJS.ReadableStream
                             constructor(stream: NodeJS.ReadableStream) {
                                 this.stream = stream
+                                stubExcelReaderHooks(this)
                             }
                             async *[Symbol.asyncIterator]() {
                                 const chunks: Buffer[] = []

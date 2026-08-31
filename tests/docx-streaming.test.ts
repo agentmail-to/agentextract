@@ -514,6 +514,22 @@ describe('docx — the cap and the deadline stop the read', () => {
         expect(r.extraction!.length).toBe(100)
     })
 
+    it('bounds retained text across deeply nested picture frames', async () => {
+        const depth = 100
+        let nested = ''
+        for (let i = 0; i < depth; i++) {
+            nested += `<w:pict><w:p><w:r><w:t>${'x'.repeat(1_000)}</w:t></w:r>`
+        }
+        nested += '</w:p></w:pict>'.repeat(depth)
+
+        const r = await extract(`<w:p><w:r><w:t>prefix</w:t></w:r>${nested}</w:p>`, {
+            maxOutputChars: 100,
+        })
+        expect(r).toMatchObject({ status: 'extracted', truncated: true })
+        expect(r.extraction).toHaveLength(100)
+        expect(r.extraction).toMatch(/^prefix\n\n/)
+    })
+
     // saxes resolves namespaces by scanning its open-tag stack. Without an explicit depth ceiling,
     // a tiny deeply nested document turns that into quadratic synchronous CPU and blocks the timer
     // that is supposed to contain it.
@@ -576,5 +592,20 @@ describe('docx — archive-level reads', () => {
         expect(r.extraction).toBe('r1c1\n\nr1c2\n\nr2c1\n\nr2c2\n\n')
         // ...i.e. indistinguishable from four consecutive paragraphs:
         expect(r.extraction).toBe((await extract(['r1c1', 'r1c2', 'r2c1', 'r2c2'].map(text).join(''))).extraction)
+    })
+
+    it('drops vertical-merge continuation cells, including horizontally spanned ones', async () => {
+        const properties = (merge: 'restart' | 'continue') =>
+            `<w:tcPr><w:gridSpan w:val="2"/><w:vMerge${merge === 'restart' ? ' w:val="restart"' : ''}/></w:tcPr>`
+        const cell = (propertiesXml: string, contents: string) => `<w:tc>${propertiesXml}${contents}</w:tc>`
+        const r = await extract(
+            `<w:tbl>` +
+                `<w:tr>${cell(properties('restart'), text('MASTER'))}${cell('', text('R1'))}</w:tr>` +
+                `<w:tr>${cell(properties('continue'), text('DROPPED'))}${cell('', text('R2'))}</w:tr>` +
+                `</w:tbl>`
+        )
+
+        expect(r.extraction).toBe('MASTER\n\nR1\n\nR2\n\n')
+        expect(r.extraction).not.toContain('DROPPED')
     })
 })

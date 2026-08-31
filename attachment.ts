@@ -417,6 +417,7 @@ const docHandler: Handler = {
 // type (Row) disagrees with what it yields at runtime (Row[]), putting the real element out of reach.
 interface StreamedCell {
     address: string
+    value?: unknown
     text?: string
     formula?: string
     result?: unknown
@@ -431,6 +432,7 @@ interface StreamedRow {
 type ExcelXmlChunks = AsyncIterable<Buffer | string>
 interface ExcelXmlEntry {
     setEncoding: (encoding: BufferEncoding) => unknown
+    pipe: (destination: ExcelXmlEntry) => ExcelXmlEntry
 }
 interface ExcelJsInternalReader {
     _parseRels?: (entry: ExcelXmlEntry) => Promise<void>
@@ -443,16 +445,17 @@ interface ExcelJsInternalReader {
 
 // ExcelJS's worksheet parser already rejects malformed XML as it receives it, but never calls
 // saxes.close() at natural EOF. A second SAX parser used to close that one hole at nearly the cost
-// of parsing every worksheet twice. This lexical companion records only the two facts ExcelJS
-// throws away: whether the root actually closed, and which formula cells declare a boolean result.
-// It understands XML comments/CDATA/PIs so a closing-tag-shaped string cannot spoof completion.
-interface WorksheetXmlScan {
+// of parsing every worksheet twice. This lexical companion enforces the common depth ceiling and
+// records the two facts ExcelJS throws away: whether the root actually closed, and which in-row
+// formula cells declare a boolean result. It understands XML comments/CDATA/PIs so a
+// closing-tag-shaped string cannot spoof completion.
+interface ExcelXmlScan {
     booleanCells: Set<string>
     write: (chunk: string) => void
     complete: () => boolean
 }
 
-const createWorksheetXmlScan = (): WorksheetXmlScan => {
+const createXmlScan = (booleanCellLimit = 0): ExcelXmlScan => {
     type Mode = 'text' | 'tag' | 'comment' | 'cdata' | 'pi' | 'declaration'
     let mode: Mode = 'text'
     let tag = ''
@@ -462,6 +465,7 @@ const createWorksheetXmlScan = (): WorksheetXmlScan => {
     let declarationDepth = 0
     let rootClosed = false
     let depth = 0
+    const openIsRow: boolean[] = []
     const booleanCells = new Set<string>()
     const TAG_CAPTURE_LIMIT = 8 * 1024
 
@@ -492,15 +496,19 @@ const createWorksheetXmlScan = (): WorksheetXmlScan => {
 
     const finishTag = (): void => {
         const body = tag.slice(1, tag.endsWith('>') ? -1 : undefined).trim()
-        if (body.startsWith('/')) {
+        const closing = body.startsWith('/')
+        const inRow = openIsRow[openIsRow.length - 1] === true
+        if (closing) {
             depth = Math.max(0, depth - 1)
+            openIsRow.pop()
             if (depth === 0) rootClosed = true
         } else if (body.endsWith('/') || lastUnquoted === '/') {
             if (depth === 0) rootClosed = true
         } else {
-            depth++
+            assertXmlDepth(++depth)
+            openIsRow.push(/^row(?:\s|\/|$)/.test(body))
         }
-        if (/^c(?:\s|\/|$)/.test(body)) {
+        if (!closing && inRow && booleanCells.size < booleanCellLimit && /^c(?:\s|\/|$)/.test(body)) {
             const type = /(?:^|\s)t\s*=\s*(["'])([^"']*)\1/.exec(body)
             const address = /(?:^|\s)r\s*=\s*(["'])([^"']+)\1/.exec(body)
             if (type && address && decodeAttribute(type[2]) === 'b') {
@@ -586,18 +594,27 @@ const createWorksheetXmlScan = (): WorksheetXmlScan => {
 const isExcelDateFormat = (format?: string): boolean =>
     Boolean(format?.replace(/\[[^\]]*]/g, '').replace(/"[^"]*"/g, '').match(/[ymdhMsb]+/))
 
+const streamedFormula = (cell: StreamedCell): { result: unknown; text: string } | undefined => {
+    if (cell.formula !== undefined) return { result: cell.result, text: cell.text ?? '' }
+    if (typeof cell.value !== 'object' || cell.value === null) return undefined
+    const shared = cell.value as { formula?: unknown; result?: unknown }
+    if (shared.formula !== '') return undefined
+    return { result: shared.result, text: shared.result ? String(shared.result) : '' }
+}
+
 const excelFormulaText = (cell: StreamedCell, booleanCells: Set<string>): string => {
-    if (cell.formula !== undefined && typeof cell.result === 'number') {
-        if (booleanCells.delete(cell.address)) return String(cell.result !== 0)
+    const formula = streamedFormula(cell)
+    if (formula !== undefined && typeof formula.result === 'number' && Number.isFinite(formula.result)) {
+        if (booleanCells.delete(cell.address)) return String(formula.result !== 0)
         if (isExcelDateFormat(cell.numFmt)) {
             const date1904 = cell.workbook?.properties?.model?.date1904 ?? false
-            const milliseconds = Math.round((cell.result - 25569 + (date1904 ? 1462 : 0)) * 86_400_000)
+            const milliseconds = Math.round((formula.result - 25569 + (date1904 ? 1462 : 0)) * 86_400_000)
             return new Date(milliseconds).toString()
         }
     } else {
         booleanCells.delete(cell.address)
     }
-    return cell.text ?? ''
+    return formula?.text ?? cell.text ?? ''
 }
 
 // XLSX — modern Excel. Each sheet flattened to text for search/indexing.
@@ -606,7 +623,7 @@ const xlsxHandler: Handler = {
     contentTypes: ['application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
     extensions: ['.xlsx'],
     extract: async ({ content, maxOutputChars, deadline }) => {
-        const { Readable } = await import('node:stream')
+        const { Readable, Transform } = await import('node:stream')
         const { StringDecoder } = await import('node:string_decoder')
         const { default: ExcelJS } = await import('exceljs') // not SheetJS: no known parse-time CVEs
         // Stream rather than workbook.xlsx.load(), which materializes every cell as a live object
@@ -633,69 +650,83 @@ const xlsxHandler: Handler = {
         // Its entry parsers accept streams and its worksheet parsers accept async iterables, so
         // normalize both boundaries to decoded strings with state carried across chunks.
         const internal = reader as unknown as ExcelJsInternalReader
-        const decodeEntry = (entry: ExcelXmlEntry): ExcelXmlEntry => {
-            entry.setEncoding('utf8') // Node streams use StringDecoder internally across chunks.
-            return entry
+        const hook = <K extends keyof ExcelJsInternalReader>(name: K): NonNullable<ExcelJsInternalReader[K]> => {
+            const method = internal[name]
+            if (typeof method !== 'function') {
+                throw new Error(`exceljs stream reader has no ${String(name)}; expected the 4.4.0 internals`)
+            }
+            return method.bind(internal) as NonNullable<ExcelJsInternalReader[K]>
         }
+        let truncated = false
+        const booleanCellLimit = 2 * maxOutputChars + 1_024
+        const decodeEntry = (entry: ExcelXmlEntry, guardDepth = true): ExcelXmlEntry => {
+            entry.setEncoding('utf8') // Node streams use StringDecoder internally across chunks.
+            if (!guardDepth) return entry
+            const scan = createXmlScan()
+            const guard = new Transform({
+                decodeStrings: false,
+                encoding: 'utf8',
+                transform(chunk, _encoding, done) {
+                    try {
+                        scan.write(String(chunk))
+                    } catch (error) {
+                        done(error as Error)
+                        return
+                    }
+                    done(null, chunk)
+                },
+            })
+            return entry.pipe(guard as unknown as ExcelXmlEntry)
+        }
+        const XML_SLICE_CHARS = 16 * 1024
         const decodeChunks = async function* (
             chunks: ExcelXmlChunks,
-            scan?: WorksheetXmlScan
+            scan?: ExcelXmlScan
         ): AsyncIterable<string> {
             const decoder = new StringDecoder('utf8')
-            for await (const chunk of chunks) {
-                if (typeof chunk === 'string') {
-                    scan?.write(chunk)
-                    yield chunk
-                } else {
-                    const decoded = decoder.write(chunk)
-                    if (decoded) {
-                        scan?.write(decoded)
-                        yield decoded
+            let stopped = false
+            const slices = function* (text: string): Iterable<string> {
+                for (let offset = 0; offset < text.length; offset += XML_SLICE_CHARS) {
+                    if (Date.now() > deadline) {
+                        truncated = true
+                        stopped = true
+                        return
                     }
+                    const slice = text.slice(offset, offset + XML_SLICE_CHARS)
+                    scan?.write(slice)
+                    yield slice
                 }
             }
-            const tail = decoder.end()
-            if (tail) {
-                scan?.write(tail)
-                yield tail
+            for await (const chunk of chunks) {
+                yield* slices(typeof chunk === 'string' ? chunk : decoder.write(chunk))
+                if (stopped) return
             }
+            yield* slices(decoder.end())
+            if (stopped) return
             // Reached only at NATURAL EOF. Abandonment for the cap/deadline skips this assertion,
             // keeping intentional partial reads labeled `truncated` rather than parse failures.
             if (scan && !scan.complete()) throw new Error('unclosed worksheet XML')
         }
-        if (internal._parseRels) {
-            const parse = internal._parseRels.bind(internal)
-            internal._parseRels = (entry) => parse(decodeEntry(entry))
+        const parseRels = hook('_parseRels')
+        internal._parseRels = (entry) => parseRels(decodeEntry(entry, false))
+        const parseWorkbook = hook('_parseWorkbook')
+        internal._parseWorkbook = (entry) => parseWorkbook(decodeEntry(entry, false))
+        const parseSharedStrings = hook('_parseSharedStrings')
+        internal._parseSharedStrings = (entry) => parseSharedStrings(decodeEntry(entry))
+        const parseStyles = hook('_parseStyles')
+        internal._parseStyles = (entry) => parseStyles(decodeEntry(entry))
+        const worksheetScans: ExcelXmlScan[] = []
+        const parseWorksheet = hook('_parseWorksheet')
+        internal._parseWorksheet = (chunks, sheetNo) => {
+            const scan = createXmlScan(booleanCellLimit)
+            worksheetScans.push(scan)
+            return parseWorksheet(decodeChunks(chunks, scan), sheetNo)
         }
-        if (internal._parseWorkbook) {
-            const parse = internal._parseWorkbook.bind(internal)
-            internal._parseWorkbook = (entry) => parse(decodeEntry(entry))
-        }
-        if (internal._parseSharedStrings) {
-            const parse = internal._parseSharedStrings.bind(internal)
-            internal._parseSharedStrings = (entry) => parse(decodeEntry(entry))
-        }
-        if (internal._parseStyles) {
-            const parse = internal._parseStyles.bind(internal)
-            internal._parseStyles = (entry) => parse(decodeEntry(entry))
-        }
-        const worksheetScans: WorksheetXmlScan[] = []
-        if (internal._parseWorksheet) {
-            const parse = internal._parseWorksheet.bind(internal)
-            internal._parseWorksheet = (chunks, sheetNo) => {
-                const scan = createWorksheetXmlScan()
-                worksheetScans.push(scan)
-                return parse(decodeChunks(chunks, scan), sheetNo)
-            }
-        }
-        if (internal._parseHyperlinks) {
-            const parse = internal._parseHyperlinks.bind(internal)
-            internal._parseHyperlinks = (chunks, sheetNo) => parse(decodeChunks(chunks), sheetNo)
-        }
+        const parseHyperlinks = hook('_parseHyperlinks')
+        internal._parseHyperlinks = (chunks, sheetNo) => parseHyperlinks(decodeChunks(chunks), sheetNo)
 
         const sheets: string[] = []
         let length = 0
-        let truncated = false
         let seen = 0
         for await (const worksheet of reader) {
             // Row-less sheets never enter the inner loop. Check here as well so thousands of them
@@ -746,6 +777,7 @@ const xlsxHandler: Handler = {
                 }
                 if (truncated) break
             }
+            worksheetScan?.booleanCells.clear()
             // Positional, and sound because the rebuild laid out exactly `resolved` and nothing else
             // this reader dispatches as a worksheet, in this order. Reading worksheet.name instead is
             // what produced "Sheet1" for a legal absolute rel Target: exceljs matches rel.Target
@@ -1899,8 +1931,8 @@ const DOCX_CONTAINERS = new Set([
 // here); a w:t holding a comment or a nested element makes mammoth's text() throw "Not implemented"
 // (we extract); the main part is read at
 // its conventional path rather than resolved through _rels/.rels, which routing already requires;
-// and a final deleted-mark paragraph is retained here while mammoth drops its stashed text for lack
-// of a following paragraph. That last direction is deliberately availability-preserving.
+// and a deleted-mark paragraph whose stash never reaches a surviving paragraph is retained here
+// while mammoth drops it. That last direction is deliberately availability-preserving.
 
 // Emit a literal, then drop any children — mammoth's handlers for these ignore children entirely.
 const DOCX_LITERALS: Record<string, string> = {
@@ -1940,6 +1972,20 @@ interface DocxFrame {
     claimedExtra: string
 }
 
+interface DocxTableCell {
+    column: number
+    gridSpan: number
+    vMerge: boolean | null
+    finalized: boolean
+    suppressed: boolean
+}
+
+interface DocxTable {
+    columns: Set<number>
+    column: number
+    cell?: DocxTableCell
+}
+
 interface DocxReader {
     write: (chunk: string) => void // one decoded slice of document.xml; THROWS on malformed XML
     chars: () => number // characters emitted so far — what the handler's cap check reads
@@ -1958,6 +2004,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     const frames: DocxFrame[] = [{ kind: 'root', value: '', extra: '', claimedExtra: '' }] // root extras are lost
     const deleted: boolean[] = [false] // one flag per open w:p; index 0 pairs with the root frame
     const selectors: { depth: number; parent: string; target: string; selected: boolean }[] = []
+    const tables: DocxTable[] = []
     let top = frames[frames.length - 1]
     let skip = -1 // stack index where the dropped subtree began, or -1 when we're reading
     let rowDeleted = false // a w:trPr said its row is deleted; act on it once that w:trPr closes
@@ -1971,9 +2018,18 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     let capExceeded = false
     let drainUntil: DocxFrame | undefined
     let drainPendingDeletedExtra = false
+    let discardDeferredText = false
     const storageLimit = maxOutputChars + 2
 
-    const append = (frame: DocxFrame, field: 'value' | 'extra' | 'claimedExtra', text: string): void => {
+    const append = (
+        frame: DocxFrame,
+        field: 'value' | 'extra' | 'claimedExtra',
+        text: string,
+        preserve = false
+    ): void => {
+        if (discardDeferredText && !preserve) {
+            if (field !== 'value' || frames.some((candidate) => candidate.kind === 'picture')) return
+        }
         const room = storageLimit - frame[field].length
         if (room > 0) frame[field] += text.slice(0, room)
     }
@@ -1988,6 +2044,12 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         const picture = frames.findIndex((frame) => frame.kind === 'picture')
         if (picture > 0) {
             drainUntil = [...frames.slice(0, picture)].reverse().find((frame) => frame.kind === 'paragraph')
+            // Picture text is deferred until after the enclosing paragraph. Once it alone crosses
+            // the output cap, keeping cap-sized strings on every nested picture/paragraph frame can
+            // multiply retention by XML depth while we drain for later paragraph text that sorts
+            // before it. Dropping all deferred text still returns a valid prefix: the paragraph and
+            // its break precede every one of these extras in Mammoth's output order.
+            discardDeferredText = true
         }
     }
 
@@ -2019,6 +2081,18 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         if (!font || !char) return
         const mapped = dingbatHex(font, char) ?? (/^F0..$/.test(char) ? dingbatHex(font, char.slice(2)) : undefined)
         if (mapped) emit(mapped.string)
+    }
+
+    const currentTable = (): DocxTable | undefined => tables[tables.length - 1]
+
+    const finalizeTableCell = (): DocxTableCell | undefined => {
+        const table = currentTable()
+        const cell = table?.cell
+        if (!table || !cell || cell.finalized) return cell
+        cell.finalized = true
+        if (cell.vMerge === true && table.columns.has(cell.column)) cell.suppressed = true
+        else table.columns.add(cell.column)
+        return cell
     }
 
     const openSelector = (name: string): void => {
@@ -2094,6 +2168,44 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             return
         }
 
+        const parent = stack[stack.length - 2]
+        if (parent === 'w:tc' && name !== 'w:tcPr') {
+            const cell = finalizeTableCell()
+            if (cell?.suppressed) {
+                skip = stack.length - 1
+                return
+            }
+        }
+
+        if (name === 'w:tbl') tables.push({ columns: new Set(), column: 0 })
+        else if (name === 'w:tr') {
+            const table = currentTable()
+            if (table) table.column = 0
+        } else if (name === 'w:tc') {
+            const table = currentTable()
+            if (table) {
+                table.cell = {
+                    column: table.column,
+                    gridSpan: 1,
+                    vMerge: null,
+                    finalized: false,
+                    suppressed: false,
+                }
+            }
+        } else if (name === 'w:gridSpan' && parent === 'w:tcPr') {
+            const cell = currentTable()?.cell
+            const span = Number.parseInt(wordAttribute(tag.attributes, 'val') ?? '', 10)
+            if (cell && Number.isFinite(span) && span > 0) cell.gridSpan = span
+            skip = stack.length - 1
+            return
+        } else if (name === 'w:vMerge' && parent === 'w:tcPr') {
+            const cell = currentTable()?.cell
+            const value = wordAttribute(tag.attributes, 'val')
+            if (cell) cell.vMerge = value === undefined || value === '' || value === 'continue'
+            skip = stack.length - 1
+            return
+        }
+
         // w:t is the ONE text-bearing element; the text handler recognizes it off the stack top, so
         // it needs no flag of its own. Deliberately before the container test, so its children —
         // illegal anyway — fall through to the drop below exactly as they do in mammoth.
@@ -2125,7 +2237,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             }
             return
         }
-        if (DOCX_CONTAINERS.has(name)) {
+        if (name === 'w:tcPr' || DOCX_CONTAINERS.has(name)) {
             openSelector(name)
             return
         }
@@ -2157,6 +2269,22 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             return
         }
 
+        if (name === 'w:tcPr') {
+            finalizeTableCell()
+            return
+        }
+        if (name === 'w:tc') {
+            const table = currentTable()
+            const cell = finalizeTableCell()
+            if (table && cell) table.column += cell.gridSpan
+            if (table) table.cell = undefined
+            return
+        }
+        if (name === 'w:tbl') {
+            tables.pop()
+            return
+        }
+
         if (name !== 'w:p' && name !== 'w:pict') {
             if (name !== undefined) closeSelector(name)
             return
@@ -2168,8 +2296,10 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         if (name === 'w:pict') {
             // Hoist: the picture's own text becomes the parent's `extra`, behind any extra it
             // already carried. It reaches the output only if some ancestor w:p reinserts it.
-            append(top, 'extra', frame.extra)
-            append(top, 'extra', frame.value)
+            // These strings were retained before the cap crossed; moving them upward does not add
+            // new deferred content, and keeps the useful prefix of the first text box.
+            append(top, 'extra', frame.extra, true)
+            append(top, 'extra', frame.value, true)
         } else {
             const wasDeleted = deleted.pop() ?? false
             closedDeleted = wasDeleted
@@ -2178,13 +2308,13 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
                 // runs straight into the next paragraph. Appending now matches mammoth whenever
                 // another paragraph follows. If this is the final paragraph, mammoth drops its
                 // stashed text; this reader keeps it — an availability-preserving divergence.
-                append(top, 'value', frame.value)
+                append(top, 'value', frame.value, true)
                 pendingDeletedExtra = `${frame.claimedExtra}${frame.extra}`.slice(0, storageLimit)
             } else {
-                append(top, 'value', frame.value)
+                append(top, 'value', frame.value, true)
                 append(top, 'value', '\n\n')
-                append(top, 'value', frame.claimedExtra)
-                append(top, 'value', frame.extra)
+                append(top, 'value', frame.claimedExtra, true)
+                append(top, 'value', frame.extra, true)
                 charge(2)
             }
         }
