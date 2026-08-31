@@ -67,6 +67,7 @@
     "vitest": "^4.1.2"
   },
   "dependencies": {
+    "dingbat-to-unicode": "^1.0.1",
     "exceljs": "^4.4.0",
     "html-to-text": "^10.0.1",
     "iconv-lite": "^0.7.2",

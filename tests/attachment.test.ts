@@ -670,6 +670,23 @@ describe('attachment — xlsx handler', () => {
         expect(r.extraction).not.toContain('SUM(')
     })
 
+    it('preserves boolean and date result types for streamed formula cells', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.properties.date1904 = true
+        const sheet = workbook.addWorksheet('Typed formulas')
+        const date = new Date(Date.UTC(2024, 0, 2))
+        sheet.getCell('A1').value = { formula: 'DATE(2024,1,2)', result: date }
+        sheet.getCell('A2').value = { formula: '1=1', result: true }
+        sheet.getCell('A3').value = { formula: '1=0', result: false }
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toBe(`=== Typed formulas ===\n${date.toString()}\ntrue\nfalse`)
+    })
+
     // A workbook with only empty sheets parses fine but yields no rows: extracted, no extraction.
     it('reports an empty workbook as extracted with no extraction', async () => {
         const r = await extractAttachment({ content: fixture('empty.xlsx'), contentType: XLSX_TYPE })
@@ -2649,6 +2666,62 @@ describe('attachment — the rebuild cannot amplify what the budget measured', (
         }
         return total
     }
+
+    it.each(['xl/sharedStrings.xml', 'xl/SharedStrings.xml'])(
+        'fails closed when a duplicate control part is stored as %s',
+        async (duplicateName) => {
+            const xml = (value: string) => Buffer.from(value, 'latin1')
+            const content = buildZip([
+                {
+                    name: '[Content_Types].xml',
+                    data: xml(
+                        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+                            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+                            '</Types>'
+                    ),
+                },
+                {
+                    name: 'xl/workbook.xml',
+                    data: xml(
+                        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+                            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+                            '<sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>'
+                    ),
+                },
+                {
+                    name: 'xl/_rels/workbook.xml.rels',
+                    data: xml(
+                        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+                            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+                            '</Relationships>'
+                    ),
+                },
+                {
+                    name: 'xl/worksheets/sheet1.xml',
+                    data: xml(
+                        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+                            '<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData></worksheet>'
+                    ),
+                },
+                {
+                    name: 'xl/sharedStrings.xml',
+                    data: xml(
+                        '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1"><si><t>KEEP</t></si></sst>'
+                    ),
+                },
+                {
+                    name: duplicateName,
+                    data: xml(
+                        '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>'
+                    ),
+                },
+            ])
+
+            const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+            expect(r.status).toBe('failed')
+            expect(r.reason).toMatch(/duplicate control part xl\/sharedStrings\.xml/i)
+        }
+    )
 
     it('writes each measured entry at most once, even when many entries share a name', async () => {
         const DUPLICATES = 20

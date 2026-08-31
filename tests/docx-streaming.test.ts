@@ -80,6 +80,23 @@ describe('docx — the whitelist drops unrecognised subtrees', () => {
         expect(r.extraction).not.toContain('CHOICE')
     })
 
+    it('takes only the first selected child from sdt and AlternateContent', async () => {
+        const sdt = await extract(
+            `<w:p><w:sdt>` +
+                `<w:sdtContent><w:r><w:t>FIRST</w:t></w:r></w:sdtContent>` +
+                `<w:sdtContent><w:r><w:t>SECOND</w:t></w:r></w:sdtContent>` +
+                `</w:sdt></w:p>`
+        )
+        const alternate = await extract(
+            `<w:p><w:r><mc:AlternateContent>` +
+                `<mc:Fallback><w:r><w:t>FIRST</w:t></w:r></mc:Fallback>` +
+                `<mc:Fallback><w:r><w:t>SECOND</w:t></w:r></mc:Fallback>` +
+                `</mc:AlternateContent></w:r></w:p>`
+        )
+        expect(sdt.extraction).toBe('FIRST\n\n')
+        expect(alternate.extraction).toBe('FIRST\n\n')
+    })
+
     // A w:pict's text is hoisted out and reinserted as a SIBLING of the enclosing paragraph, so it
     // lands AFTER that paragraph's break rather than inside it. Emitting it inline would glue two
     // words into one nonword token — 'HelloBoxed' — which is exactly the shape an LLM reads wrong.
@@ -204,6 +221,18 @@ describe('docx — the whitelist drops unrecognised subtrees', () => {
         expect(r.truncated).toBe(false)
     })
 
+    it('does not let a nested text-box paragraph steal a deleted paragraph extra', async () => {
+        const box = (value: string) =>
+            `<w:r><w:pict><v:shape><v:textbox><w:txbxContent>${text(value)}</w:txbxContent></v:textbox></v:shape></w:pict></w:r>`
+        const deleted =
+            `<w:p><w:pPr><w:rPr><w:del/></w:rPr></w:pPr>` +
+            `<w:r><w:t>DELTEXT</w:t></w:r>${box('DEL-BOX')}</w:p>`
+        const following = `<w:p><w:r><w:t>NEXT</w:t></w:r>${box('NEXT-BOX')}</w:p>`
+
+        const r = await extract(deleted + following)
+        expect(r.extraction).toBe('DELTEXTNEXT\n\nDEL-BOX\n\nNEXT-BOX\n\n')
+    })
+
     // ACCEPTED DIVERGENCE. mammoth stashes a deleted-mark paragraph for the next paragraph and
     // drops that text when there is no next one. The streaming reader emits as it goes and keeps the
     // trailing text. This is the safer direction for attachment extraction, but it is not exact
@@ -275,13 +304,9 @@ describe('docx — leaf and character contract', () => {
         expect(r.extraction).toBe(`a\tb‑­c\n\n`)
     })
 
-    // ACCEPTED DIVERGENCE. mammoth maps w:sym through the dingbat-to-unicode package; we drop it,
-    // because that table would be the only reason to keep any of mammoth's dependency tree and the
-    // only place this reader would read an attribute at all. Pinned so the choice is visible rather
-    // than incidental — if the corpus ever shows it matters, the fix is a small inline table.
-    it('drops w:sym rather than taking a dependency to map it', async () => {
+    it('maps w:sym through the same dingbat table and F0 fallback as mammoth', async () => {
         const r = await extract(para('<w:t>a</w:t><w:sym w:font="Wingdings" w:char="F0FC"/><w:t>b</w:t>'))
-        expect(r.extraction).toBe('ab\n\n')
+        expect(r.extraction).toBe('a✓b\n\n')
     })
 
     // Leading and trailing spaces inside a w:t are content. A "helpful" trim would silently join
@@ -475,6 +500,18 @@ describe('docx — the cap and the deadline stop the read', () => {
         expect(whole.truncated).toBe(false)
         expect(partial.truncated).toBe(true)
         expect(whole.extraction!.startsWith(partial.extraction!)).toBe(true)
+    })
+
+    it('drains the enclosing paragraph after the cap so text-box-only output stays useful', async () => {
+        const boxParagraphs = Array.from({ length: 500 }, (_, i) => text(`boxed-${String(i).padStart(3, '0')}`)).join('')
+        const body =
+            `<w:p><w:r><w:t>Intro</w:t></w:r><w:r><w:pict><v:shape><v:textbox><w:txbxContent>` +
+            `${boxParagraphs}</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>`
+        const r = await extract(body, { maxOutputChars: 100 })
+
+        expect(r).toMatchObject({ status: 'extracted', truncated: true })
+        expect(r.extraction).toContain('Intro\n\nboxed-000')
+        expect(r.extraction!.length).toBe(100)
     })
 
     // saxes resolves namespaces by scanning its open-tag stack. Without an explicit depth ceiling,
