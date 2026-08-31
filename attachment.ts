@@ -675,6 +675,13 @@ const xlsxHandler: Handler = {
                     }
                     done(null, chunk)
                 },
+                flush(done) {
+                    if (!scan.complete()) {
+                        done(new Error('unclosed XLSX control XML'))
+                        return
+                    }
+                    done()
+                },
             })
             return entry.pipe(guard as unknown as ExcelXmlEntry)
         }
@@ -1535,13 +1542,9 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
     // may differ only in case, or an explicit worksheet relationship may point outside the usual
     // xl/worksheets/sheetN.xml convention. reorderForStreaming gives those entries canonical names
     // in its private copy so exceljs's narrower, case-sensitive dispatcher can yield them.
-    const present = new Set(entries.map((entry) => asciiFold(entry.name)))
+    const present = new Set(metadata.keys())
     const worksheets = worksheetEntries(entries)
-    const byPart = new Map<string, ZipEntry>()
-    for (const entry of entries) {
-        const folded = asciiFold(entry.name)
-        if (!byPart.has(folded)) byPart.set(folded, entry)
-    }
+    const byPart = metadata
 
     // Two sets, because a zip name is not a key here either. `claimedNames` answers "did any
     // declaration reference this part?", which is what makes an entry an ORPHAN. `placed` answers
@@ -1962,14 +1965,16 @@ const endsWith = (stack: string[], path: string[]): boolean =>
 // (body-reader.js:439 .toExtra()), extras bubble up through every container, and only w:p reinserts
 // them — as a SIBLING AFTER the paragraph (:296 .insertExtra()). So VML text-box text lands after
 // the paragraph's '\n\n' rather than glued into the middle of it, and an extra that never reaches a
-// w:p is silently lost. Two string fields per open w:p / w:pict reproduce all of that.
+// w:p is silently lost. Paragraph/picture frames reproduce that ordering; table/cell frames add a
+// bounded choice between Mammoth's normal vertical-merge filtering and its malformed-table bail-out.
 interface DocxFrame {
-    kind: 'root' | 'paragraph' | 'picture'
+    kind: 'root' | 'paragraph' | 'picture' | 'table' | 'cell'
     value: string
     extra: string
     // Extras from deleted paragraphs are claimed by the next paragraph when it OPENS. Keeping the
     // ownership on that frame prevents a nested text-box paragraph from stealing them on close.
     claimedExtra: string
+    allValue?: string
 }
 
 interface DocxTableCell {
@@ -1978,11 +1983,21 @@ interface DocxTableCell {
     vMerge: boolean | null
     finalized: boolean
     suppressed: boolean
+    frame: DocxFrame
+    chars: number
+    tcPrSeen: boolean
+    tcPrDepth?: number
+    gridSpanSeen: boolean
+    vMergeSeen: boolean
 }
 
 interface DocxTable {
     columns: Set<number>
     column: number
+    frame: DocxFrame
+    mergeBailout: boolean
+    deferredChars: number
+    rowDepth?: number
     cell?: DocxTableCell
 }
 
@@ -2019,7 +2034,14 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     let drainUntil: DocxFrame | undefined
     let drainPendingDeletedExtra = false
     let discardDeferredText = false
+    let discardTableText = false
     const storageLimit = maxOutputChars + 2
+
+    const appendRaw = (frame: DocxFrame, field: 'value' | 'extra' | 'claimedExtra' | 'allValue', text: string): void => {
+        const value = frame[field] ?? ''
+        const room = storageLimit - value.length
+        if (room > 0) frame[field] = value + text.slice(0, room)
+    }
 
     const append = (
         frame: DocxFrame,
@@ -2027,14 +2049,31 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         text: string,
         preserve = false
     ): void => {
+        if (discardTableText && !preserve && frames.some((candidate) => candidate.kind === 'table')) return
         if (discardDeferredText && !preserve) {
             if (field !== 'value' || frames.some((candidate) => candidate.kind === 'picture')) return
         }
-        const room = storageLimit - frame[field].length
-        if (room > 0) frame[field] += text.slice(0, room)
+        appendRaw(frame, field, text)
+        if (frame.kind === 'table' && field === 'value') appendRaw(frame, 'allValue', text)
     }
 
     const charge = (length: number): void => {
+        const activeCell = [...tables].reverse().find((table) => table.cell !== undefined)?.cell
+        if (activeCell) {
+            activeCell.chars += length
+            const speculative = tables.reduce((total, table) => total + (table.cell?.chars ?? 0), chars)
+            if (!capExceeded && speculative > maxOutputChars) {
+                // Until a table closes, a later bookmark may make a continuation cell visible.
+                // Treat speculative cell text as cap-bearing for retention even though it is not
+                // committed to `chars` yet. This can conservatively truncate a hostile table whose
+                // oversized continuation is ultimately hidden, but keeps nested cell/table frames
+                // from multiplying the cap by XML depth.
+                capExceeded = true
+                drainUntil = frames.find((frame) => frame.kind === 'table')
+                discardTableText = drainUntil !== undefined
+            }
+            return
+        }
         chars += length
         if (capExceeded || chars <= maxOutputChars) return
         capExceeded = true
@@ -2050,6 +2089,12 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             // before it. Dropping all deferred text still returns a valid prefix: the paragraph and
             // its break precede every one of these extras in Mammoth's output order.
             discardDeferredText = true
+        } else {
+            // Table output is withheld until the table closes because a later non-row/non-cell
+            // child can make Mammoth cancel vertical-merge suppression retroactively. Drain the
+            // outermost table so the returned text uses the table's final, known variant.
+            drainUntil = frames.find((frame) => frame.kind === 'table')
+            discardTableText = drainUntil !== undefined
         }
     }
 
@@ -2094,6 +2139,29 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         else table.columns.add(cell.column)
         return cell
     }
+
+    // calculateRowSpans() bails out when the flattened children of a table are not all rows, or a
+    // row's are not all cells. These are the handlers that directly create a document node rather
+    // than an ignored property/range end. Recursive wrappers are decided by the children they
+    // expose, so they are deliberately absent here.
+    const TABLE_STRUCTURAL_NODES = new Set([
+        'w:p',
+        'w:r',
+        'w:t',
+        'w:tab',
+        'w:noBreakHyphen',
+        'w:softHyphen',
+        'w:sym',
+        'w:hyperlink',
+        'w:tbl',
+        'w:tr',
+        'w:tc',
+        'w:footnoteReference',
+        'w:endnoteReference',
+        'w:commentReference',
+        'w:br',
+        'w:bookmarkStart',
+    ])
 
     const openSelector = (name: string): void => {
         if (name === 'w:sdt') selectors.push({ depth: stack.length, parent: name, target: 'w:sdtContent', selected: false })
@@ -2169,37 +2237,77 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         }
 
         const parent = stack[stack.length - 2]
-        if (parent === 'w:tc' && name !== 'w:tcPr') {
-            const cell = finalizeTableCell()
-            if (cell?.suppressed) {
-                skip = stack.length - 1
-                return
+        const openTable = currentTable()
+        if (openTable && openTable.cell === undefined && TABLE_STRUCTURAL_NODES.has(name)) {
+            const goBack = name === 'w:bookmarkStart' && wordAttribute(tag.attributes, 'name') === '_GoBack'
+            const expected = openTable.rowDepth === undefined ? 'w:tr' : 'w:tc'
+            if (!goBack && name !== expected) {
+                openTable.mergeBailout = true
             }
         }
 
-        if (name === 'w:tbl') tables.push({ columns: new Set(), column: 0 })
-        else if (name === 'w:tr') {
+        if (name === 'w:tbl') {
+            const frame: DocxFrame = { kind: 'table', value: '', allValue: '', extra: '', claimedExtra: '' }
+            top = frame
+            frames.push(frame)
+            tables.push({
+                columns: new Set(),
+                column: 0,
+                frame,
+                mergeBailout: false,
+                deferredChars: 0,
+            })
+        } else if (name === 'w:tr') {
             const table = currentTable()
-            if (table) table.column = 0
+            if (table) {
+                table.column = 0
+                table.rowDepth = stack.length
+            }
         } else if (name === 'w:tc') {
             const table = currentTable()
             if (table) {
+                const frame: DocxFrame = { kind: 'cell', value: '', extra: '', claimedExtra: '' }
+                top = frame
+                frames.push(frame)
                 table.cell = {
                     column: table.column,
                     gridSpan: 1,
                     vMerge: null,
                     finalized: false,
                     suppressed: false,
+                    frame,
+                    chars: 0,
+                    tcPrSeen: false,
+                    gridSpanSeen: false,
+                    vMergeSeen: false,
                 }
             }
-        } else if (name === 'w:gridSpan' && parent === 'w:tcPr') {
+        } else if (name === 'w:tcPr') {
             const cell = currentTable()?.cell
+            if (parent !== 'w:tc' || !cell || cell.tcPrSeen) {
+                skip = stack.length - 1
+                return
+            }
+            cell.tcPrSeen = true
+            cell.tcPrDepth = stack.length
+        } else if (name === 'w:gridSpan') {
+            const cell = currentTable()?.cell
+            if (!cell || parent !== 'w:tcPr' || cell.tcPrDepth !== stack.length - 1 || cell.gridSpanSeen) {
+                skip = stack.length - 1
+                return
+            }
+            cell.gridSpanSeen = true
             const span = Number.parseInt(wordAttribute(tag.attributes, 'val') ?? '', 10)
             if (cell && Number.isFinite(span) && span > 0) cell.gridSpan = span
             skip = stack.length - 1
             return
-        } else if (name === 'w:vMerge' && parent === 'w:tcPr') {
+        } else if (name === 'w:vMerge') {
             const cell = currentTable()?.cell
+            if (!cell || parent !== 'w:tcPr' || cell.tcPrDepth !== stack.length - 1 || cell.vMergeSeen) {
+                skip = stack.length - 1
+                return
+            }
+            cell.vMergeSeen = true
             const value = wordAttribute(tag.attributes, 'val')
             if (cell) cell.vMerge = value === undefined || value === '' || value === 'continue'
             skip = stack.length - 1
@@ -2237,7 +2345,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             }
             return
         }
-        if (name === 'w:tcPr' || DOCX_CONTAINERS.has(name)) {
+        if (DOCX_CONTAINERS.has(name) || name === 'w:tcPr') {
             openSelector(name)
             return
         }
@@ -2270,18 +2378,44 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         }
 
         if (name === 'w:tcPr') {
-            finalizeTableCell()
             return
         }
         if (name === 'w:tc') {
             const table = currentTable()
             const cell = finalizeTableCell()
-            if (table && cell) table.column += cell.gridSpan
-            if (table) table.cell = undefined
+            if (table && cell) {
+                frames.pop()
+                top = frames[frames.length - 1]
+                appendRaw(table.frame, 'allValue', cell.frame.value)
+                if (cell.suppressed) table.deferredChars += cell.chars
+                else {
+                    appendRaw(table.frame, 'value', cell.frame.value)
+                    // Clear before charging so a nested table commits into its enclosing cell,
+                    // while an outermost table commits into the extraction's global count.
+                    table.cell = undefined
+                    charge(cell.chars)
+                }
+                table.column += cell.gridSpan
+                table.cell = undefined
+            }
+            return
+        }
+        if (name === 'w:tr') {
+            const table = currentTable()
+            if (table) table.rowDepth = undefined
             return
         }
         if (name === 'w:tbl') {
-            tables.pop()
+            const table = tables.pop()
+            if (table) {
+                frames.pop()
+                top = frames[frames.length - 1]
+                const value = table.mergeBailout ? table.frame.allValue ?? '' : table.frame.value
+                append(top, 'value', value, true)
+                append(top, 'extra', table.frame.extra, true)
+                if (table.mergeBailout) charge(table.deferredChars)
+                if (drainUntil === table.frame) drainUntil = undefined
+            }
             return
         }
 
@@ -2312,7 +2446,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
                 pendingDeletedExtra = `${frame.claimedExtra}${frame.extra}`.slice(0, storageLimit)
             } else {
                 append(top, 'value', frame.value, true)
-                append(top, 'value', '\n\n')
+                append(top, 'value', '\n\n', true)
                 append(top, 'value', frame.claimedExtra, true)
                 append(top, 'value', frame.extra, true)
                 charge(2)
@@ -2341,10 +2475,19 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         // enormous paragraph return what was read. Pending `extra` stays deferred either way.
         text: () => {
             const picture = frames.findIndex((frame) => frame.kind === 'picture')
-            const visible = picture === -1 ? frames : frames.slice(0, picture)
+            const cell = frames.findIndex((frame) => frame.kind === 'cell')
+            const boundary = [picture, cell].filter((index) => index >= 0).reduce((a, b) => Math.min(a, b), frames.length)
+            const visible = frames.slice(0, boundary)
             let text = ''
             for (const frame of visible) {
-                text += frame.value.slice(0, storageLimit - text.length)
+                let value = frame.value
+                if (frame.kind === 'table') {
+                    const all = frame.allValue ?? ''
+                    let common = 0
+                    while (common < value.length && common < all.length && value[common] === all[common]) common++
+                    value = value.slice(0, common)
+                }
+                text += value.slice(0, storageLimit - text.length)
                 if (text.length >= storageLimit) break
             }
             return text

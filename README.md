@@ -99,10 +99,12 @@ guards reduce blast radius; they are **not** a sandbox.
   prefix.
 - **Output** — extracted text is capped at `MAX_OUTPUT_CHARS` (250k), or lower via `maxOutputChars`.
   Cutting sets `truncated` on the result, so a partial extraction is never mistaken for a complete
-  one. The PDF, `.docx` and `.xlsx` handlers apply the cap **incrementally** as they build — and stop
-  reading the document once they reach it — so none of them ever materializes in full. Only the HTML
-  handler (html-to-text) returns a complete string that is then trimmed, so for that one the cap is
-  **post-materialization** and peak memory follows the whole document.
+  one. The PDF, `.docx` and `.xlsx` handlers apply the cap **incrementally** as they build and stop at
+  the next format-safe boundary. DOCX may drain an enclosing text box or table whose output order is
+  not known until it closes, but retains only cap-clipped variants while doing so. None materializes
+  the full document. Only the HTML handler (html-to-text) returns a complete string that is then
+  trimmed, so for that one the cap is **post-materialization** and peak memory follows the whole
+  document.
 - **Timeout** — `HANDLER_TIMEOUT_MS` (10 s) stops *awaiting* a slow async parse. It cannot cancel
   synchronous CPU already running inside a parser, so handlers that yield between units of work (PDF
   per page, `.docx` per inflate chunk, `.xlsx` per row) also check the deadline themselves and stop;
@@ -116,7 +118,8 @@ guards reduce blast radius; they are **not** a sandbox.
 - **`.docx`** — `word/document.xml` is located in the archive's central directory, inflated on its
   own, and read with a streaming SAX parser (`saxes`) rather than loaded into a DOM. Parser memory
   tracks one inflate chunk plus bounded retained text; deferred text-box frames stop retaining new
-  text once the output cap is crossed, so nesting depth cannot multiply the output allowance.
+  text once the output cap is crossed, and tables retain at most two cap-clipped merge variants, so
+  nesting depth cannot multiply the output allowance.
   Measured at a 1024 MB heap on a 45 MB `document.xml` inside a 3.65 MB archive, against the previous
   DOM-based reader:
 

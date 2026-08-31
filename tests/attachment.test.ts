@@ -827,6 +827,43 @@ describe('attachment — xlsx handler', () => {
         expect(r.reason).toMatch(/XML nesting exceeds 256 elements/)
     })
 
+    it('rejects an incomplete shared-string table instead of silently dropping later cells', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Data')
+        sheet.addRow(['first'])
+        sheet.addRow(['second'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/sharedStrings.xml'
+        const xml = await zip.file(name)!.async('string')
+        const firstEnd = xml.indexOf('</si>') + '</si>'.length
+        zip.file(name, `${xml.slice(0, firstEnd)}<si><t>second`)
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/unclosed XLSX control XML/)
+    })
+
+    it('rejects an incomplete styles table at natural EOF', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const cell = workbook.addWorksheet('Styled').getCell('A1')
+        cell.value = 1
+        cell.numFmt = '0.00'
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/styles.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(name, xml.slice(0, xml.lastIndexOf('</styleSheet>')))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/unclosed XLSX control XML/)
+    })
+
     // A workbook with only empty sheets parses fine but yields no rows: extracted, no extraction.
     it('reports an empty workbook as extracted with no extraction', async () => {
         const r = await extractAttachment({ content: fixture('empty.xlsx'), contentType: XLSX_TYPE })

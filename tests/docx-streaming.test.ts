@@ -530,6 +530,29 @@ describe('docx — the cap and the deadline stop the read', () => {
         expect(r.extraction).toMatch(/^prefix\n\n/)
     })
 
+    it('bounds speculative cell text across deeply nested tables', async () => {
+        let nested = ''
+        for (let i = 0; i < 70; i++) nested = `<w:tbl><w:tr><w:tc>${text('x'.repeat(1_000))}${nested}</w:tc></w:tr></w:tbl>`
+
+        const r = await extract(nested, { maxOutputChars: 100 })
+        expect(r).toMatchObject({ status: 'extracted', truncated: true })
+        expect(r.extraction).toHaveLength(100)
+        expect(r.extraction).toBe('x'.repeat(100))
+    })
+
+    it('keeps nested text-box truncation as a prefix across paragraph boundaries', async () => {
+        const run = (value: string) => `<w:r><w:t>${value}</w:t></w:r>`
+        const body =
+            `<w:p>${run('ONE')}<w:pict><w:p>${run('OUT')}<w:pict>${text('INNER')}</w:pict></w:p></w:pict></w:p>` +
+            text('AFTER')
+        const whole = await extract(body)
+        const partial = await extract(body, { maxOutputChars: 9 })
+
+        expect(whole.extraction).toBe('ONE\n\nOUT\n\nINNER\n\nAFTER\n\n')
+        expect(partial.extraction).toBe('ONE\n\nOUT\n')
+        expect(whole.extraction!.startsWith(partial.extraction!)).toBe(true)
+    })
+
     // saxes resolves namespaces by scanning its open-tag stack. Without an explicit depth ceiling,
     // a tiny deeply nested document turns that into quadratic synchronous CPU and blocks the timer
     // that is supposed to contain it.
@@ -607,5 +630,46 @@ describe('docx — archive-level reads', () => {
 
         expect(r.extraction).toBe('MASTER\n\nR1\n\nR2\n\n')
         expect(r.extraction).not.toContain('DROPPED')
+    })
+
+    it('uses only the first direct tcPr and first merge property, as Mammoth does', async () => {
+        const cell = (propertiesXml: string, contents: string) => `<w:tc>${propertiesXml}${contents}</w:tc>`
+        const duplicate = await extract(
+            `<w:tbl><w:tr>${cell('', text('MASTER'))}</w:tr>` +
+                `<w:tr>${cell('<w:tcPr><w:vMerge w:val="restart"/><w:vMerge/></w:tcPr>', text('KEEP'))}</w:tr></w:tbl>`
+        )
+        const nested = await extract(
+            `<w:tbl><w:tr><w:tc><w:p><w:r><w:t>A</w:t></w:r><w:tcPr><w:gridSpan w:val="2"/></w:tcPr></w:p></w:tc>${cell('', text('B'))}</w:tr>` +
+                `<w:tr>${cell('', text('C'))}${cell('<w:tcPr><w:vMerge/></w:tcPr>', text('DROPPED'))}</w:tr></w:tbl>`
+        )
+        const late = await extract(
+            `<w:tbl><w:tr>${cell('', text('MASTER'))}</w:tr>` +
+                `<w:tr>${cell(`${text('DROPPED')}<w:tcPr><w:vMerge/></w:tcPr>`, '')}</w:tr></w:tbl>`
+        )
+
+        expect(duplicate.extraction).toBe('MASTER\n\nKEEP\n\n')
+        expect(nested.extraction).toBe('A\n\nB\n\nC\n\n')
+        expect(late.extraction).toBe('MASTER\n\n')
+    })
+
+    it.each([
+        [
+            'table children non-row-only',
+            (master: string, continuation: string) => `${master}${continuation}<w:bookmarkStart w:id="1" w:name="rows"/>`,
+        ],
+        [
+            'row children non-cell-only',
+            (master: string, continuation: string) =>
+                `${master}<w:tr>${continuation.replace(/^<w:tr>|<\/w:tr>$/g, '')}<w:bookmarkStart w:id="1" w:name="cells"/></w:tr>`,
+        ],
+    ])('cancels merge suppression when a bookmark makes %s', async (_label, body) => {
+        const cell = (propertiesXml: string, value: string) => `<w:tc>${propertiesXml}${text(value)}</w:tc>`
+        const master = `<w:tr>${cell('', 'MASTER')}</w:tr>`
+        const continuation = `<w:tr>${cell('<w:tcPr><w:vMerge/></w:tcPr>', 'CONT')}</w:tr>`
+        const r = await extract(`<w:tbl>${body(master, continuation)}</w:tbl>`)
+
+        // The bookmark comes AFTER the continuation cell, pinning the retroactive part of Mammoth's
+        // calculateRowSpans bail-out rather than merely disabling suppression for later cells.
+        expect(r.extraction).toBe('MASTER\n\nCONT\n\n')
     })
 })
