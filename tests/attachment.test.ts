@@ -27,7 +27,7 @@ const fixture = (name: string) => readFileSync(join(process.cwd(), 'tests', 'fix
 const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
-const stubExcelReaderHooks = (reader: Record<string, unknown>, omit?: string) => {
+const stubExcelReaderHooks = (reader: object, omit?: string) => {
     const hooks: Record<string, unknown> = {
         _parseRels: async () => undefined,
         _parseWorkbook: async () => undefined,
@@ -801,6 +801,28 @@ describe('attachment — xlsx handler', () => {
             contentType: XLSX_TYPE,
         })
         expect(r).toMatchObject({ status: 'extracted', extraction: '=== Scoped ===\n1', truncated: false })
+    })
+
+    it('concatenates visible inline rich-text runs without phonetic guides', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Rich').getCell('A1').value = 'placeholder'
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(
+            name,
+            xml.replace(
+                /<c r="A1"[^>]*>.*?<\/c>/,
+                '<c r="A1" t="inlineStr"><is><r><t>Alpha &amp; </t></r><r><t>Beta</t></r>' +
+                    '<rPh sb="0" eb="1"><t>PHONETIC</t></rPh></is></c>'
+            )
+        )
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Rich ===\nAlpha & Beta', truncated: false })
     })
 
     it.each([

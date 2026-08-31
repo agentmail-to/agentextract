@@ -540,6 +540,31 @@ describe('docx — the cap and the deadline stop the read', () => {
         expect(r.extraction).toBe('x'.repeat(100))
     })
 
+    it('does not charge known vertical-merge continuations to the output cap', async () => {
+        const cell = (properties: string, body: string) => `<w:tc>${properties}${body}</w:tc>`
+        const hidden = Array.from({ length: 60 }, () => text('x'.repeat(5_000))).join('')
+        const r = await extract(
+            `<w:tbl><w:tr>${cell('', text('BEFORE'))}</w:tr>` +
+                `<w:tr>${cell('<w:tcPr><w:vMerge/></w:tcPr>', hidden)}</w:tr>` +
+                `<w:tr>${cell('', text('VISIBLE'))}</w:tr></w:tbl>` +
+                text('AFTER')
+        )
+
+        expect(r).toMatchObject({
+            status: 'extracted',
+            extraction: 'BEFORE\n\nVISIBLE\n\nAFTER\n\n',
+            truncated: false,
+        })
+    })
+
+    it('treats a malformed nested table cell as content of the active cell without leaking its frame', async () => {
+        const nested = `<w:tc>${text('INNER')}</w:tc>`
+        const body = `<w:tbl><w:tr><w:tc>${text('OUTER1')}${nested}${text('OUTER2')}</w:tc></w:tr></w:tbl>${text('AFTER')}`
+        const r = await extract(body, { maxOutputChars: 20 })
+
+        expect(r).toMatchObject({ status: 'extracted', extraction: 'OUTER1\n\nINNER\n\nOUTER', truncated: true })
+    })
+
     it('keeps nested text-box truncation as a prefix across paragraph boundaries', async () => {
         const run = (value: string) => `<w:r><w:t>${value}</w:t></w:r>`
         const body =
@@ -671,5 +696,25 @@ describe('docx — archive-level reads', () => {
         // The bookmark comes AFTER the continuation cell, pinning the retroactive part of Mammoth's
         // calculateRowSpans bail-out rather than merely disabling suppression for later cells.
         expect(r.extraction).toBe('MASTER\n\nCONT\n\n')
+    })
+
+    it('clears row state when a deleted row is skipped at its closing tag', async () => {
+        const cell = (properties: string, value: string) => `<w:tc>${properties}${text(value)}</w:tc>`
+        const r = await extract(
+            `<w:tbl><w:tr>${cell('', 'MASTER')}</w:tr>` +
+                `<w:tr><w:trPr><w:del/></w:trPr>${cell('', 'DELETED')}</w:tr>` +
+                `<w:tr>${cell('<w:tcPr><w:vMerge/></w:tcPr>', 'CONT')}</w:tr></w:tbl>`
+        )
+
+        expect(r.extraction).toBe('MASTER\n\n')
+    })
+
+    it('drops non-property content inside tcPr as Mammoth does', async () => {
+        const r = await extract(
+            `<w:tbl><w:tr><w:tc>` +
+                `<w:tcPr><w:t>LEAK</w:t></w:tcPr>` +
+                `${text('KEEP')}</w:tc></w:tr></w:tbl>`
+        )
+        expect(r.extraction).toBe('KEEP\n\n')
     })
 })

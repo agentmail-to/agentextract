@@ -91,12 +91,13 @@ guards reduce blast radius; they are **not** a sandbox.
   preflight runs before the handler timeout starts. Its work is still bounded by the 10 MB input gate, the ZIP
   entry-count ceiling and the 50 MB inflate ceiling, but a maximal 65k-entry directory can spend time
   there that is not charged to `HANDLER_TIMEOUT_MS`.
-- **XML nesting** — OOXML parsing refuses trees deeper than 256 elements. `saxes` namespace resolution
-  scans the open-tag stack, so this converts otherwise-quadratic attacker-controlled nesting into a
-  fixed bound while leaving room for legitimately nested Word tables. The parser work inside one
-  chunk is synchronous, so the deadline cannot replace this structural ceiling. Unreadable XLSX
-  identity metadata falls back to archive order, while DOCX returns a labeled failure or a truncated
-  prefix.
+- **XML nesting** — DOCX, streamed XLSX worksheets/control tables, and namespace-aware XLSX identity
+  parsing refuse trees deeper than 256 elements. `saxes` namespace resolution scans the open-tag
+  stack, so this converts otherwise-quadratic attacker-controlled nesting into a fixed bound while
+  leaving room for legitimately nested Word tables. After identity fallback, ExcelJS may reparse
+  `workbook.xml` and its relationships without namespace resolution; that linear path is not depth-
+  capped. The parser work inside one chunk is synchronous, so the deadline cannot replace the
+  structural ceiling where namespace mode is used.
 - **Output** — extracted text is capped at `MAX_OUTPUT_CHARS` (250k), or lower via `maxOutputChars`.
   Cutting sets `truncated` on the result, so a partial extraction is never mistaken for a complete
   one. The PDF, `.docx` and `.xlsx` handlers apply the cap **incrementally** as they build and stop at

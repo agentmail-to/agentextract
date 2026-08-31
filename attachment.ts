@@ -451,6 +451,7 @@ interface ExcelJsInternalReader {
 // closing-tag-shaped string cannot spoof completion.
 interface ExcelXmlScan {
     booleanCells: Set<string>
+    inlineCells?: Map<string, string>
     write: (chunk: string) => void
     complete: () => boolean
 }
@@ -625,7 +626,10 @@ const xlsxHandler: Handler = {
     extract: async ({ content, maxOutputChars, deadline }) => {
         const { Readable, Transform } = await import('node:stream')
         const { StringDecoder } = await import('node:string_decoder')
-        const { default: ExcelJS } = await import('exceljs') // not SheetJS: no known parse-time CVEs
+        const [{ default: ExcelJS }, { SaxesParser }] = await Promise.all([
+            import('exceljs'), // not SheetJS: no known parse-time CVEs
+            import('saxes'),
+        ])
         // Stream rather than workbook.xlsx.load(), which materializes every cell as a live object
         // before any cap can apply — a 4 MB in-cap .xlsx peaked at hundreds of MB and OOMed a 1024 MB
         // worker. Peak now follows the shared-string table, not the cell graph. See
@@ -723,9 +727,93 @@ const xlsxHandler: Handler = {
         const parseStyles = hook('_parseStyles')
         internal._parseStyles = (entry) => parseStyles(decodeEntry(entry))
         const worksheetScans: ExcelXmlScan[] = []
+        const createWorksheetScan = (): ExcelXmlScan => {
+            const base = createXmlScan(booleanCellLimit)
+            const inlineCells = new Map<string, string>()
+            // Keep only enough scan-order metadata to produce the capped output. The extra 1,024
+            // cells in booleanCellLimit cover sparse/empty inline strings without making this map
+            // grow with worksheet size.
+            const inlineTextLimit = booleanCellLimit
+            let inlineChars = 0
+            let depth = 0
+            let rowDepth = -1
+            let cell:
+                | {
+                      depth: number
+                      address: string
+                      inline: boolean
+                      text: string
+                      textDepth?: number
+                      phoneticDepth?: number
+                  }
+                | undefined
+            const inline = new SaxesParser()
+            const localName = (name: string): string => name.slice(name.lastIndexOf(':') + 1)
+            const attribute = (
+                attributes: Record<string, string | { value: string }>,
+                name: string
+            ): string | undefined => {
+                const value = attributes[name]
+                return typeof value === 'string' ? value : value?.value
+            }
+            inline.on('opentag', (tag) => {
+                depth++
+                const name = localName(tag.name)
+                if (name === 'row' && rowDepth < 0) rowDepth = depth
+                else if (name === 'c' && rowDepth === depth - 1 && cell === undefined) {
+                    cell = {
+                        depth,
+                        address: attribute(tag.attributes, 'r') ?? '',
+                        inline: attribute(tag.attributes, 't') === 'inlineStr',
+                        text: '',
+                    }
+                } else if (name === 'rPh' && cell?.inline) cell.phoneticDepth = depth
+                else if (name === 't' && cell?.inline && cell.phoneticDepth === undefined) {
+                    cell.textDepth = depth
+                }
+            })
+            const appendInline = (text: string): void => {
+                if (!cell?.inline || cell.textDepth === undefined) return
+                const room = inlineTextLimit - inlineChars - cell.text.length
+                if (room > 0) cell.text += text.slice(0, room)
+            }
+            inline.on('text', appendInline)
+            inline.on('cdata', appendInline)
+            inline.on('closetag', (tag) => {
+                const name = localName(tag.name)
+                if (cell?.textDepth === depth && name === 't') cell.textDepth = undefined
+                if (cell?.phoneticDepth === depth && name === 'rPh') cell.phoneticDepth = undefined
+                if (cell?.depth === depth && name === 'c') {
+                    if (
+                        cell.inline &&
+                        cell.address !== '' &&
+                        inlineCells.size < inlineTextLimit &&
+                        inlineChars < inlineTextLimit
+                    ) {
+                        inlineCells.set(cell.address, cell.text)
+                        inlineChars += cell.text.length
+                    }
+                    cell = undefined
+                }
+                if (rowDepth === depth && name === 'row') rowDepth = -1
+                depth--
+            })
+            return {
+                booleanCells: base.booleanCells,
+                inlineCells,
+                write: (chunk) => {
+                    base.write(chunk)
+                    inline.write(chunk)
+                },
+                complete: () => {
+                    inline.close()
+                    return base.complete()
+                },
+            }
+        }
         const parseWorksheet = hook('_parseWorksheet')
         internal._parseWorksheet = (chunks, sheetNo) => {
-            const scan = createXmlScan(booleanCellLimit)
+            const scan = createWorksheetScan()
             worksheetScans.push(scan)
             return parseWorksheet(decodeChunks(chunks, scan), sheetNo)
         }
@@ -766,9 +854,11 @@ const xlsxHandler: Handler = {
                     }
                     const cells: string[] = []
                     // cell.text = the shown value (formula result, formatted date), not the raw formula.
-                    row.eachCell({ includeEmpty: false }, (cell) =>
-                        cells.push(excelFormulaText(cell, booleanCells))
-                    )
+                    row.eachCell({ includeEmpty: false }, (cell) => {
+                        const inline = worksheetScan?.inlineCells?.get(cell.address)
+                        if (inline !== undefined) worksheetScan?.inlineCells?.delete(cell.address)
+                        cells.push(inline ?? excelFormulaText(cell, booleanCells))
+                    })
                     // Drop empty cells/rows so a sparse sheet doesn't flatten into runs of empty tabs.
                     if (cells.length === 0) continue
                     const line = cells.join('\t')
@@ -785,6 +875,7 @@ const xlsxHandler: Handler = {
                 if (truncated) break
             }
             worksheetScan?.booleanCells.clear()
+            worksheetScan?.inlineCells?.clear()
             // Positional, and sound because the rebuild laid out exactly `resolved` and nothing else
             // this reader dispatches as a worksheet, in this order. Reading worksheet.name instead is
             // what produced "Sheet1" for a legal absolute rel Target: exceljs matches rel.Target
@@ -1978,6 +2069,7 @@ interface DocxFrame {
 }
 
 interface DocxTableCell {
+    depth: number
     column: number
     gridSpan: number
     vMerge: boolean | null
@@ -2061,13 +2153,20 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         const activeCell = [...tables].reverse().find((table) => table.cell !== undefined)?.cell
         if (activeCell) {
             activeCell.chars += length
-            const speculative = tables.reduce((total, table) => total + (table.cell?.chars ?? 0), chars)
+            const speculative = tables.reduce(
+                (total, table) =>
+                    total +
+                    (table.cell === undefined || (table.cell.suppressed && !table.mergeBailout)
+                        ? 0
+                        : table.cell.chars),
+                chars
+            )
             if (!capExceeded && speculative > maxOutputChars) {
-                // Until a table closes, a later bookmark may make a continuation cell visible.
-                // Treat speculative cell text as cap-bearing for retention even though it is not
-                // committed to `chars` yet. This can conservatively truncate a hostile table whose
-                // oversized continuation is ultimately hidden, but keeps nested cell/table frames
-                // from multiplying the cap by XML depth.
+                // A valid continuation is already known to be hidden once tcPr closes, so it is
+                // excluded above. If later structure triggers mergeBailout, its deferred count is
+                // restored on the next charge or when the table closes. Other active cell text is
+                // speculative until table close but remains cap-bearing, preventing nested frames
+                // from multiplying retention by XML depth.
                 capExceeded = true
                 drainUntil = frames.find((frame) => frame.kind === 'table')
                 discardTableText = drainUntil !== undefined
@@ -2265,11 +2364,12 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             }
         } else if (name === 'w:tc') {
             const table = currentTable()
-            if (table) {
+            if (table && table.cell === undefined) {
                 const frame: DocxFrame = { kind: 'cell', value: '', extra: '', claimedExtra: '' }
                 top = frame
                 frames.push(frame)
                 table.cell = {
+                    depth: stack.length,
                     column: table.column,
                     gridSpan: 1,
                     vMerge: null,
@@ -2284,7 +2384,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             }
         } else if (name === 'w:tcPr') {
             const cell = currentTable()?.cell
-            if (parent !== 'w:tc' || !cell || cell.tcPrSeen) {
+            if (parent !== 'w:tc' || !cell || stack.length !== cell.depth + 1 || cell.tcPrSeen) {
                 skip = stack.length - 1
                 return
             }
@@ -2310,6 +2410,18 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             cell.vMergeSeen = true
             const value = wordAttribute(tag.attributes, 'val')
             if (cell) cell.vMerge = value === undefined || value === '' || value === 'continue'
+            skip = stack.length - 1
+            return
+        }
+
+        const activeTableCell = currentTable()?.cell
+        if (
+            activeTableCell?.tcPrDepth !== undefined &&
+            stack.length === activeTableCell.tcPrDepth + 1 &&
+            parent === 'w:tcPr'
+        ) {
+            // Mammoth reads gridSpan/vMerge from tcPr as metadata, then drops that element as an
+            // ignored subtree. No other child — including a malformed w:t — contributes text.
             skip = stack.length - 1
             return
         }
@@ -2370,6 +2482,10 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
                 rowDeleted = false
                 skip = stack.length - 1
             }
+            if (name === 'w:tr') {
+                const table = currentTable()
+                if (table) table.rowDepth = undefined
+            }
             return
         }
         if (name === 'w:body' && stack.length === 1) {
@@ -2378,10 +2494,16 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         }
 
         if (name === 'w:tcPr') {
+            const cell = currentTable()?.cell
+            if (cell?.tcPrDepth === stack.length + 1) {
+                cell.tcPrDepth = undefined
+                finalizeTableCell()
+            }
             return
         }
         if (name === 'w:tc') {
             const table = currentTable()
+            if (table?.cell && stack.length !== table.cell.depth - 1) return
             const cell = finalizeTableCell()
             if (table && cell) {
                 frames.pop()
