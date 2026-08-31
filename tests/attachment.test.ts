@@ -539,6 +539,37 @@ describe('attachment — pdf handler', () => {
             vi.resetModules()
         }
     })
+
+    it('preserves successful output and the primary parse error when PDF teardown rejects', async () => {
+        let fail = false
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => ({
+                numPages: 1,
+                loadingTask: { destroy: async () => Promise.reject(new Error('teardown failed')) },
+                getPage: async () => ({
+                    getTextContent: async () => {
+                        if (fail) throw new Error('page failed')
+                        return { items: [{ str: 'page text' }] }
+                    },
+                }),
+            }),
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const input = { content: buf('%PDF-1.4 mock'), contentType: 'application/pdf' }
+            expect(await extract(input)).toMatchObject({
+                status: 'extracted',
+                extraction: 'page text',
+                truncated: false,
+            })
+            fail = true
+            expect(await extract(input)).toMatchObject({ status: 'failed', reason: 'page failed' })
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
 })
 
 // DOCX handler ---------------------------------------------------------------
@@ -685,6 +716,23 @@ describe('attachment — xlsx handler', () => {
         })
         expect(r).toMatchObject({ status: 'extracted', truncated: false })
         expect(r.extraction).toBe(`=== Typed formulas ===\n${date.toString()}\ntrue\nfalse`)
+    })
+
+    it.each([
+        ['type', (xml: string) => xml.replace('t="b"', 't="&#98;"')],
+        ['address', (xml: string) => xml.replace('r="A1"', 'r="&#x41;1"')],
+    ])('decodes an XML-encoded formula %s attribute before matching the streamed cell', async (_label, encode) => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Encoded').getCell('A1').value = { formula: '1=1', result: true }
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        zip.file(name, encode(await zip.file(name)!.async('string')))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Encoded ===\ntrue', truncated: false })
     })
 
     // A workbook with only empty sheets parses fine but yields no rows: extracted, no extraction.
@@ -1203,6 +1251,18 @@ describe('attachextract — OOXML decompression preflight', () => {
         eocd.writeUInt16LE(comment.length, 20) // archive comment length (matches the appended comment bytes)
         return Buffer.concat([localRec, cdh, eocd, comment])
     }
+
+    it('labels an unexpected decompression-preflight rejection instead of throwing', async () => {
+        const createInflate = vi.spyOn(zlib, 'createInflateRaw').mockImplementationOnce(() => {
+            throw new Error('inflate setup failed')
+        })
+        try {
+            const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
+            expect(r).toEqual({ status: 'failed', reason: 'inflate setup failed' })
+        } finally {
+            createInflate.mockRestore()
+        }
+    })
 
     // Content that genuinely inflates past the 50 MB cap (compresses to a few KB on disk).
     const overCapContent = () => Buffer.alloc(MAX_UNCOMPRESSED_BYTES + 10 * 1024 * 1024, 0x41)
@@ -3119,11 +3179,46 @@ describe('attachment — xlsx archive rewrite limits', () => {
         return Buffer.concat([...locals, directory, end])
     }
 
-    // Both boundary tests carry an explicit timeout. These fixtures are ~5.6 MB with 65k entries by
-    // construction — the size IS the test — and the accepting one ran at 3660ms against vitest's
-    // 5000ms default in a full-suite run, close enough that it failed on a loaded machine and passed
-    // on rerun. A cheaper fixture is not available without giving up what the pair proves.
+    // These fixtures are ~5.6 MB with 65k entries by construction — the size IS the test. For the
+    // accepting cases, replace ExcelJS with a drain-only reader and freeze timers: the behavior under
+    // test is the rewritten archive's entry count, not whether a loaded CI worker parses 65k empty
+    // entries inside the production 10-second handler timeout.
     const BOUNDARY_TIMEOUT_MS = 30_000
+
+    const rewriteAtBoundary = async (content: Buffer) => {
+        let rebuilt = Buffer.alloc(0)
+        vi.resetModules()
+        vi.doMock('exceljs', () => ({
+            default: {
+                stream: {
+                    xlsx: {
+                        WorkbookReader: class {
+                            stream: NodeJS.ReadableStream
+                            constructor(stream: NodeJS.ReadableStream) {
+                                this.stream = stream
+                            }
+                            async *[Symbol.asyncIterator]() {
+                                const chunks: Buffer[] = []
+                                for await (const chunk of this.stream) chunks.push(chunk as Buffer)
+                                rebuilt = Buffer.concat(chunks)
+                            }
+                        },
+                    },
+                },
+            },
+        }))
+        vi.useFakeTimers()
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const result = await extract({ content, contentType: XLSX_TYPE })
+            const eocd = rebuilt.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]))
+            return { result, entryCount: eocd < 0 ? undefined : rebuilt.readUInt16LE(eocd + 10) }
+        } finally {
+            vi.useRealTimers()
+            vi.doUnmock('exceljs')
+            vi.resetModules()
+        }
+    }
 
     // The reason is asserted, not just the status: this archive's directory read perfectly well — we
     // declined to REWRITE it — and reporting that as "could not be read" sent an investigation at the
@@ -3145,8 +3240,9 @@ describe('attachment — xlsx archive rewrite limits', () => {
         async () => {
             // 65532 + 2 = 65534, a legal count. Same shape, same ~5.6 MB, one fewer entry: without
             // this the test above would also pass if the rewrite simply gave up on large archives.
-            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 3), contentType: XLSX_TYPE })
-            expect(r.status).toBe('extracted')
+            const { result, entryCount } = await rewriteAtBoundary(zipWithEntryCount(0xffff - 3))
+            expect(result.status).toBe('extracted')
+            expect(entryCount).toBe(0xfffe)
         },
         BOUNDARY_TIMEOUT_MS
     )
@@ -3157,8 +3253,9 @@ describe('attachment — xlsx archive rewrite limits', () => {
     it(
         'counts the entries it will write, not the ones it was given',
         async () => {
-            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2, 2), contentType: XLSX_TYPE })
-            expect(r.status).toBe('extracted')
+            const { result, entryCount } = await rewriteAtBoundary(zipWithEntryCount(0xffff - 2, 2))
+            expect(result.status).toBe('extracted')
+            expect(entryCount).toBe(0xfffd)
         },
         BOUNDARY_TIMEOUT_MS
     )

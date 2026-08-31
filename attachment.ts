@@ -319,8 +319,13 @@ const pdfHandler: Handler = {
             return { text: joined, empty: joined.length === 0, truncated }
         } finally {
             // getDocumentProxy exposes pdf.js's loading task; release its worker handler, document
-            // bytes, and page cache on success, early stop, and errors alike.
-            await pdf.loadingTask?.destroy?.()
+            // bytes, and page cache on success, early stop, and errors alike. Cleanup is best-effort:
+            // its rejection must not discard extracted text or replace the primary parse error.
+            try {
+                await pdf.loadingTask?.destroy?.()
+            } catch {
+                // There is no diagnostics channel in the extraction result; preserve the real result.
+            }
         }
     },
 }
@@ -460,6 +465,31 @@ const createWorksheetXmlScan = (): WorksheetXmlScan => {
     const booleanCells = new Set<string>()
     const TAG_CAPTURE_LIMIT = 8 * 1024
 
+    // saxes decodes XML character/entity references before ExcelJS sees attributes. This companion
+    // reads the raw markup, so make the same normalization for the two values it retains. Invalid
+    // references can stay untouched: ExcelJS's SAX parser rejects that XML independently.
+    const decodeAttribute = (value: string): string =>
+        value.replace(/&(?:#(\d+)|#x([0-9a-f]+)|amp|lt|gt|apos|quot);/gi, (entity, decimal, hexadecimal) => {
+            if (decimal !== undefined || hexadecimal !== undefined) {
+                const codePoint = Number.parseInt(decimal ?? hexadecimal, hexadecimal === undefined ? 10 : 16)
+                return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity
+            }
+            switch (entity) {
+                case '&amp;':
+                    return '&'
+                case '&lt;':
+                    return '<'
+                case '&gt;':
+                    return '>'
+                case '&apos;':
+                    return "'"
+                case '&quot;':
+                    return '"'
+                default:
+                    return entity
+            }
+        })
+
     const finishTag = (): void => {
         const body = tag.slice(1, tag.endsWith('>') ? -1 : undefined).trim()
         if (body.startsWith('/')) {
@@ -471,9 +501,11 @@ const createWorksheetXmlScan = (): WorksheetXmlScan => {
             depth++
         }
         if (/^c(?:\s|\/|$)/.test(body)) {
-            const type = /(?:^|\s)t\s*=\s*(["'])b\1/.exec(body)
+            const type = /(?:^|\s)t\s*=\s*(["'])([^"']*)\1/.exec(body)
             const address = /(?:^|\s)r\s*=\s*(["'])([^"']+)\1/.exec(body)
-            if (type && address) booleanCells.add(address[2])
+            if (type && address && decodeAttribute(type[2]) === 'b') {
+                booleanCells.add(decodeAttribute(address[2]))
+            }
         }
         tag = ''
         quote = ''
@@ -2019,9 +2051,9 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
 
     parser.on('opentag', (tag) => {
         // A direct port of mammoth's convertName (xml/reader.js:53-66): mapped URI -> `w:t`,
-        // unmapped -> `{uri}local`, no namespace -> the bare local name. Only the first form can
-        // match a table, so the other two exist to guarantee a miss — but they keep the stack
-        // readable in a debugger, and they are what makes an unmapped namespace fail closed.
+        // unmapped -> `{uri}local`, an explicitly empty default namespace -> the bare local name.
+        // With no default declaration saxes asks resolvePrefix(''), which returns the unbound URI
+        // above. Only a mapped name can match a table; every other form deliberately misses.
         const uri = tag.uri ?? ''
         const prefix = Object.prototype.hasOwnProperty.call(OOXML_PREFIXES, uri) ? OOXML_PREFIXES[uri] : undefined
         const name = uri === '' ? tag.local : prefix === undefined ? `{${uri}}${tag.local}` : `${prefix}:${tag.local}`
@@ -2409,17 +2441,18 @@ export const extractAttachment = async (
         return { status: 'skipped', reason: type ? `unsupported type ${type}` : 'unrecognized attachment' }
     }
 
-    // Zip bombs: measure the real decompressed size before either OOXML handler inflates anything.
-    // The preflight also decides which refusal this is — over budget skips, malformed fails.
-    // (pdf/doc/text aren't zips.)
-    if (kind === 'docx' || kind === 'xlsx') {
-        const check = await checkDecompressionBudget(input.content, MAX_UNCOMPRESSED_BYTES)
-        if (!check.ok) return { status: check.status, reason: check.reason }
-    }
-
     const maxOutputChars = resolveCap(options.maxOutputChars)
 
     try {
+        // Zip bombs: measure the real decompressed size before either OOXML handler inflates
+        // anything. This intentionally precedes (and is not charged to) the handler timeout, but it
+        // must remain inside the never-throws boundary: an unexpected zlib rejection is a labeled
+        // failure, just like a parser rejection.
+        if (kind === 'docx' || kind === 'xlsx') {
+            const check = await checkDecompressionBudget(input.content, MAX_UNCOMPRESSED_BYTES)
+            if (!check.ok) return { status: check.status, reason: check.reason }
+        }
+
         const output = await withTimeout(
             handler.extract({
                 content: input.content,
