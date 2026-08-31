@@ -594,6 +594,55 @@ describe('docx — the cap and the deadline stop the read', () => {
         expect(whole.extraction!.startsWith(partial.extraction!)).toBe(true)
     })
 
+    it('keeps table truncation before deferred picture text as a prefix', async () => {
+        const cell = (value: string) => `<w:tc>${text(value)}</w:tc>`
+        const table = `<w:tbl><w:tr>${cell('AAAA')}</w:tr><w:tr>${cell('BBBB')}</w:tr></w:tbl>`
+        const body =
+            `<w:p><w:r><w:pict><v:shape><v:textbox><w:txbxContent>${text('BOXX')}</w:txbxContent>` +
+            `</v:textbox></v:shape></w:pict></w:r>${table}</w:p>`
+        const whole = await extract(body)
+        const partial = await extract(body, { maxOutputChars: 7 })
+
+        expect(partial).toMatchObject({ status: 'extracted', truncated: true })
+        expect(whole.extraction!.startsWith(partial.extraction ?? '')).toBe(true)
+        for (let cap = 1; cap < whole.extraction!.length; cap++) {
+            const swept = await extract(body, { maxOutputChars: cap })
+            expect(whole.extraction!.startsWith(swept.extraction ?? '')).toBe(true)
+        }
+    })
+
+    it('drains the enclosing paragraph when the cap crosses inside a table-cell picture', async () => {
+        const body =
+            `<w:tbl><w:tr><w:tc><w:p><w:r><w:t>START</w:t></w:r>` +
+            `<w:r><w:pict><v:shape><v:textbox><w:txbxContent>${text('BOXX')}</w:txbxContent>` +
+            `</v:textbox></v:shape></w:pict></w:r><w:r><w:t>AFTER</w:t></w:r></w:p></w:tc></w:tr></w:tbl>`
+        const whole = await extract(body)
+        const partial = await extract(body, { maxOutputChars: 7 })
+
+        expect(partial).toMatchObject({ status: 'extracted', truncated: true })
+        expect(whole.extraction!.startsWith(partial.extraction ?? '')).toBe(true)
+        for (let cap = 1; cap < whole.extraction!.length; cap++) {
+            const swept = await extract(body, { maxOutputChars: cap })
+            expect(whole.extraction!.startsWith(swept.extraction ?? '')).toBe(true)
+        }
+    })
+
+    it('does not let a final deleted stash replace the prefix after a table cap', async () => {
+        const deleted = '<w:p><w:pPr><w:rPr><w:del/></w:rPr></w:pPr><w:r><w:t>ZZZZ</w:t></w:r></w:p>'
+        const body = `<w:tbl><w:tr><w:tc>${deleted}<w:t>AAAA</w:t></w:tc></w:tr></w:tbl>`
+        const whole = await extract(body)
+        const partial = await extract(body, { maxOutputChars: 3 })
+
+        expect(whole.extraction).toBe('AAAAZZZZ')
+        const complete = whole.extraction!
+        expect(partial).toMatchObject({ status: 'extracted', truncated: true })
+        expect(complete.startsWith(partial.extraction ?? '')).toBe(true)
+        for (let cap = 1; cap < complete.length; cap++) {
+            const swept = await extract(body, { maxOutputChars: cap })
+            expect(complete.startsWith(swept.extraction ?? '')).toBe(true)
+        }
+    })
+
     // saxes resolves namespaces by scanning its open-tag stack. Without an explicit depth ceiling,
     // a tiny deeply nested document turns that into quadratic synchronous CPU and blocks the timer
     // that is supposed to contain it.
@@ -753,5 +802,18 @@ describe('docx — archive-level reads', () => {
                 `<w:r><w:t>KEEP</w:t></w:r></w:p>`
         )
         expect(r.extraction).toBe('KEEP\n\n')
+    })
+
+    it('extracts a document whose main part differs only in ASCII case', async () => {
+        const zip = await JSZip.loadAsync(await buildDocx(text('CASE')))
+        const document = await zip.file('word/document.xml')!.async('nodebuffer')
+        zip.remove('word/document.xml')
+        zip.file('word/Document.xml', document)
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: DOCX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: 'CASE\n\n', truncated: false })
     })
 })

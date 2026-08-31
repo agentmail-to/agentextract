@@ -825,6 +825,33 @@ describe('attachment — xlsx handler', () => {
         expect(r).toMatchObject({ status: 'extracted', extraction: '=== Rich ===\nAlpha & Beta', truncated: false })
     })
 
+    it('ignores worksheet-shaped cells in foreign extension namespaces', async () => {
+        const mutate = async (value: ExcelJS.CellValue, payload: string) => {
+            const workbook = new ExcelJS.Workbook()
+            workbook.addWorksheet('Scoped').getCell('A1').value = value
+            const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+            const name = 'xl/worksheets/sheet1.xml'
+            const xml = await zip.file(name)!.async('string')
+            zip.file(
+                name,
+                xml.replace(
+                    '</sheetData>',
+                    `</sheetData><extLst><ext uri="probe"><foreign xmlns="urn:foreign">${payload}</foreign></ext></extLst>`
+                )
+            )
+            return extractAttachment({ content: await zip.generateAsync({ type: 'nodebuffer' }), contentType: XLSX_TYPE })
+        }
+
+        const inline = await mutate(
+            'REAL',
+            '<row><c r="A1" t="inlineStr"><is><t>FORGED</t></is></c></row>'
+        )
+        const boolean = await mutate({ formula: '1+0', result: 1 }, '<row><c r="A1" t="b"/></row>')
+
+        expect(inline.extraction).toBe('=== Scoped ===\nREAL')
+        expect(boolean.extraction).toBe('=== Scoped ===\n1')
+    })
+
     it('ignores ExcelJS null row events outside sheetData', async () => {
         const workbook = new ExcelJS.Workbook()
         const sheet = workbook.addWorksheet('Rows')
@@ -929,6 +956,20 @@ describe('attachment — xlsx handler', () => {
         expect(detectRoute(input).kind).toBe('xlsx')
         const r = await extractAttachment(input)
         expect(r.status).toBe('extracted')
+    })
+
+    it('routes and extracts an xlsx whose workbook root differs only in ASCII case', async () => {
+        const zip = await JSZip.loadAsync(fixture('sample.xlsx'))
+        const workbook = await zip.file('xl/workbook.xml')!.async('nodebuffer')
+        zip.remove('xl/workbook.xml')
+        zip.file('xl/Workbook.xml', workbook)
+        const content = await zip.generateAsync({ type: 'nodebuffer' })
+
+        expect(detectRoute({ content, contentType: XLSX_TYPE }).kind).toBe('xlsx')
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('=== Q1 ===')
+        expect(r.extraction).toContain('West\t4200')
     })
 
     // A generic (non-OOXML) zip has no docx/xlsx part, so it stays unrouted — not mis-claimed.

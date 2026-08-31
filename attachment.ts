@@ -345,7 +345,7 @@ const docxHandler: Handler = {
         // proofs load-bearing.
         const entries = zipEntries(content)
         if (!entries) throw new Error('docx central directory could not be read for streaming')
-        const part = entries.find((entry) => entry.name === DOCX_MAIN_PART)
+        const part = entries.find((entry) => asciiFold(entry.name) === DOCX_MAIN_PART)
         if (!part) throw new Error(`docx archive has no ${DOCX_MAIN_PART} entry`)
 
         const reader = await createDocxReader(maxOutputChars)
@@ -444,11 +444,10 @@ interface ExcelJsInternalReader {
 }
 
 // ExcelJS's worksheet parser already rejects malformed XML as it receives it, but never calls
-// saxes.close() at natural EOF. A second SAX parser used to close that one hole at nearly the cost
-// of parsing every worksheet twice. This lexical companion enforces the common depth ceiling and
-// records the two facts ExcelJS throws away: whether the root actually closed, and which in-row
-// formula cells declare a boolean result. It understands XML comments/CDATA/PIs so a
-// closing-tag-shaped string cannot spoof completion.
+// saxes.close() at natural EOF. This lexical companion enforces the common depth ceiling and records
+// whether the root actually closed. It understands XML comments/CDATA/PIs so a closing-tag-shaped
+// string cannot spoof completion. Worksheet value metadata is collected separately by the
+// namespace-aware companion below.
 interface ExcelXmlScan {
     booleanCells: Set<string>
     inlineCells?: Map<string, string>
@@ -456,7 +455,7 @@ interface ExcelXmlScan {
     complete: () => boolean
 }
 
-const createXmlScan = (booleanCellLimit = 0): ExcelXmlScan => {
+const createXmlScan = (): ExcelXmlScan => {
     type Mode = 'text' | 'tag' | 'comment' | 'cdata' | 'pi' | 'declaration'
     let mode: Mode = 'text'
     let tag = ''
@@ -466,55 +465,19 @@ const createXmlScan = (booleanCellLimit = 0): ExcelXmlScan => {
     let declarationDepth = 0
     let rootClosed = false
     let depth = 0
-    const openIsRow: boolean[] = []
     const booleanCells = new Set<string>()
     const TAG_CAPTURE_LIMIT = 8 * 1024
-
-    // saxes decodes XML character/entity references before ExcelJS sees attributes. This companion
-    // reads the raw markup, so make the same normalization for the two values it retains. Invalid
-    // references can stay untouched: ExcelJS's SAX parser rejects that XML independently.
-    const decodeAttribute = (value: string): string =>
-        value.replace(/&(?:#(\d+)|#x([0-9a-f]+)|amp|lt|gt|apos|quot);/gi, (entity, decimal, hexadecimal) => {
-            if (decimal !== undefined || hexadecimal !== undefined) {
-                const codePoint = Number.parseInt(decimal ?? hexadecimal, hexadecimal === undefined ? 10 : 16)
-                return codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : entity
-            }
-            switch (entity) {
-                case '&amp;':
-                    return '&'
-                case '&lt;':
-                    return '<'
-                case '&gt;':
-                    return '>'
-                case '&apos;':
-                    return "'"
-                case '&quot;':
-                    return '"'
-                default:
-                    return entity
-            }
-        })
 
     const finishTag = (): void => {
         const body = tag.slice(1, tag.endsWith('>') ? -1 : undefined).trim()
         const closing = body.startsWith('/')
-        const inRow = openIsRow[openIsRow.length - 1] === true
         if (closing) {
             depth = Math.max(0, depth - 1)
-            openIsRow.pop()
             if (depth === 0) rootClosed = true
         } else if (body.endsWith('/') || lastUnquoted === '/') {
             if (depth === 0) rootClosed = true
         } else {
             assertXmlDepth(++depth)
-            openIsRow.push(/^row(?:\s|\/|$)/.test(body))
-        }
-        if (!closing && inRow && booleanCells.size < booleanCellLimit && /^c(?:\s|\/|$)/.test(body)) {
-            const type = /(?:^|\s)t\s*=\s*(["'])([^"']*)\1/.exec(body)
-            const address = /(?:^|\s)r\s*=\s*(["'])([^"']+)\1/.exec(body)
-            if (type && address && decodeAttribute(type[2]) === 'b') {
-                booleanCells.add(decodeAttribute(address[2]))
-            }
         }
         tag = ''
         quote = ''
@@ -728,15 +691,15 @@ const xlsxHandler: Handler = {
         internal._parseStyles = (entry) => parseStyles(decodeEntry(entry))
         const worksheetScans: ExcelXmlScan[] = []
         const createWorksheetScan = (): ExcelXmlScan => {
-            const base = createXmlScan(booleanCellLimit)
+            const base = createXmlScan()
+            const booleanCells = new Set<string>()
             const inlineCells = new Map<string, string>()
             // Keep only enough scan-order metadata to produce the capped output. The extra 1,024
             // cells in booleanCellLimit cover sparse/empty inline strings without making this map
             // grow with worksheet size.
             const inlineTextLimit = booleanCellLimit
             let inlineChars = 0
-            let depth = 0
-            let rowDepth = -1
+            const open: { uri: string; local: string }[] = []
             let cell:
                 | {
                       depth: number
@@ -744,46 +707,67 @@ const xlsxHandler: Handler = {
                       inline: boolean
                       text: string
                       textDepth?: number
-                      phoneticDepth?: number
                   }
                 | undefined
-            const inline = new SaxesParser()
-            const localName = (name: string): string => name.slice(name.lastIndexOf(':') + 1)
-            const attribute = (
-                attributes: Record<string, string | { value: string }>,
-                name: string
-            ): string | undefined => {
-                const value = attributes[name]
-                return typeof value === 'string' ? value : value?.value
-            }
+            const inline = new SaxesParser<{ xmlns: true }>({ xmlns: true })
+            const isSpreadsheet = (element: { uri: string; local: string } | undefined, local: string): boolean =>
+                element !== undefined && SPREADSHEETML_NS.has(element.uri) && element.local === local
             inline.on('opentag', (tag) => {
-                depth++
-                const name = localName(tag.name)
-                if (name === 'row' && rowDepth < 0) rowDepth = depth
-                else if (name === 'c' && rowDepth === depth - 1 && cell === undefined) {
+                assertXmlDepth(open.length + 1)
+                const isCell =
+                    SPREADSHEETML_NS.has(tag.uri) &&
+                    tag.local === 'c' &&
+                    open.length === 3 &&
+                    isSpreadsheet(open[0], 'worksheet') &&
+                    isSpreadsheet(open[1], 'sheetData') &&
+                    isSpreadsheet(open[2], 'row')
+                open.push({ uri: tag.uri, local: tag.local })
+                if (isCell && cell === undefined) {
+                    const address = tag.attributes.r?.value ?? ''
+                    const type = tag.attributes.t?.value
                     cell = {
-                        depth,
-                        address: attribute(tag.attributes, 'r') ?? '',
-                        inline: attribute(tag.attributes, 't') === 'inlineStr',
+                        depth: open.length,
+                        address,
+                        inline: type === 'inlineStr',
                         text: '',
                     }
-                } else if (name === 'rPh' && cell?.inline) cell.phoneticDepth = depth
-                else if (name === 't' && cell?.inline && cell.phoneticDepth === undefined) {
-                    cell.textDepth = depth
+                    if (type === 'b' && address !== '' && booleanCells.size < booleanCellLimit) {
+                        booleanCells.add(address)
+                    }
+                } else if (cell?.inline && SPREADSHEETML_NS.has(tag.uri) && tag.local === 't') {
+                    const cellElement = open[cell.depth - 1]
+                    const direct =
+                        open.length === cell.depth + 2 &&
+                        isSpreadsheet(cellElement, 'c') &&
+                        isSpreadsheet(open[open.length - 2], 'is')
+                    const rich =
+                        open.length === cell.depth + 3 &&
+                        isSpreadsheet(cellElement, 'c') &&
+                        isSpreadsheet(open[open.length - 3], 'is') &&
+                        isSpreadsheet(open[open.length - 2], 'r')
+                    if (direct || rich) cell.textDepth = open.length
                 }
             })
             const appendInline = (text: string): void => {
-                if (!cell?.inline || cell.textDepth === undefined) return
+                if (!cell?.inline || cell.textDepth !== open.length) return
                 const room = inlineTextLimit - inlineChars - cell.text.length
                 if (room > 0) cell.text += text.slice(0, room)
             }
             inline.on('text', appendInline)
             inline.on('cdata', appendInline)
             inline.on('closetag', (tag) => {
-                const name = localName(tag.name)
-                if (cell?.textDepth === depth && name === 't') cell.textDepth = undefined
-                if (cell?.phoneticDepth === depth && name === 'rPh') cell.phoneticDepth = undefined
-                if (cell?.depth === depth && name === 'c') {
+                if (
+                    cell?.textDepth === open.length &&
+                    SPREADSHEETML_NS.has(tag.uri) &&
+                    tag.local === 't'
+                ) {
+                    cell.textDepth = undefined
+                }
+                if (
+                    cell?.depth === open.length &&
+                    SPREADSHEETML_NS.has(tag.uri) &&
+                    tag.local === 'c'
+                ) {
                     if (
                         cell.inline &&
                         cell.address !== '' &&
@@ -795,11 +779,10 @@ const xlsxHandler: Handler = {
                     }
                     cell = undefined
                 }
-                if (rowDepth === depth && name === 'row') rowDepth = -1
-                depth--
+                open.pop()
             })
             return {
-                booleanCells: base.booleanCells,
+                booleanCells,
                 inlineCells,
                 write: (chunk) => {
                     base.write(chunk)
@@ -996,15 +979,21 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
     // scan gets fooled by storage order, while a root-entry match doesn't.
     const names = zipEntryNames(content)
     if (names) {
-        const hasDocx = names.includes('word/document.xml')
-        const hasXlsx = names.includes('xl/workbook.xml')
+        const folded = new Set(names.map(asciiFold))
+        const hasDocx = folded.has('word/document.xml')
+        const hasXlsx = folded.has('xl/workbook.xml')
         if (hasDocx) return 'docx' // a real word/document.xml root part wins (docx may embed a workbook)
         if (hasXlsx) return 'xlsx'
         return undefined // OOXML zip with neither root part (pptx, jar, plain archive)
     }
     // Fallback (archive not walkable): raw-bytes scan, earlier main-part marker wins.
-    const d = content.indexOf(DOCX_PART)
-    const x = content.indexOf(XLSX_PART)
+    // Fold one bounded copy rather than comparing every byte against both needles in nested loops.
+    const folded = Buffer.from(content)
+    for (let i = 0; i < folded.length; i++) {
+        if (folded[i] >= 0x41 && folded[i] <= 0x5a) folded[i] += 0x20
+    }
+    const d = folded.indexOf(DOCX_PART)
+    const x = folded.indexOf(XLSX_PART)
     if (d === -1 && x === -1) return undefined
     if (x === -1) return 'docx'
     if (d === -1) return 'xlsx'
@@ -2142,6 +2131,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     let pendingDeletedChars = 0
     let capExceeded = false
     let drainUntil: DocxFrame | undefined
+    let drainAncestors: Set<DocxFrame> | undefined
     let drainPendingDeletedContent = false
     let discardDeferredText = false
     let discardTableText = false
@@ -2157,11 +2147,26 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         frame: DocxFrame,
         field: 'value' | 'extra' | 'claimedExtra',
         text: string,
-        preserve = false
+        options: { source?: DocxFrame; deferred?: boolean } = {}
     ): void => {
-        if (discardTableText && !preserve && frames.some((candidate) => candidate.kind === 'table')) return
-        if (discardDeferredText && !preserve) {
-            if (field !== 'value' || frames.some((candidate) => candidate.kind === 'picture')) return
+        // A frame close must still move text retained before the cap into its parent. Carrying the
+        // source separately from fresh appends prevents body-final stashes and newly generated
+        // separators from using that privilege. Deferred commits are retained only on the picture
+        // drain path; a table drain drops them because missing table text sorts before every extra.
+        // Once the drain boundary closes, only frames that were already open at that boundary may
+        // finish propagating their retained prefix through those same ancestors. Elements parsed
+        // later in the same SAX chunk cannot append either fresh text or frame-close separators.
+        if (
+            drainAncestors &&
+            (options.source === undefined || !drainAncestors.has(options.source) || !drainAncestors.has(frame))
+        ) {
+            return
+        }
+        if (discardTableText && (options.source === undefined || options.deferred)) return
+        if (discardDeferredText && options.source === undefined) {
+            if (options.deferred || field !== 'value' || frames.some((candidate) => candidate.kind === 'picture')) {
+                return
+            }
         }
         appendRaw(frame, field, text)
         if (frame.kind === 'table' && field === 'value') appendRaw(frame, 'allValue', text)
@@ -2186,8 +2191,16 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
                 // speculative until table close but remains cap-bearing, preventing nested frames
                 // from multiplying retention by XML depth.
                 capExceeded = true
-                drainUntil = frames.find((frame) => frame.kind === 'table')
-                discardTableText = drainUntil !== undefined
+                const picture = frames.findIndex((frame) => frame.kind === 'picture')
+                if (picture > 0) {
+                    drainUntil = [...frames.slice(0, picture)]
+                        .reverse()
+                        .find((frame) => frame.kind === 'paragraph')
+                    discardDeferredText = true
+                } else {
+                    drainUntil = frames.find((frame) => frame.kind === 'table')
+                    discardTableText = drainUntil !== undefined
+                }
             }
             return
         }
@@ -2200,11 +2213,10 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         const picture = frames.findIndex((frame) => frame.kind === 'picture')
         if (picture > 0) {
             drainUntil = [...frames.slice(0, picture)].reverse().find((frame) => frame.kind === 'paragraph')
-            // Picture text is deferred until after the enclosing paragraph. Once it alone crosses
-            // the output cap, keeping cap-sized strings on every nested picture/paragraph frame can
-            // multiply retention by XML depth while we drain for later paragraph text that sorts
-            // before it. Dropping all deferred text still returns a valid prefix: the paragraph and
-            // its break precede every one of these extras in Mammoth's output order.
+            // Picture text is deferred until after the enclosing paragraph. Once it crosses the
+            // output cap, stop accepting more deferred text while the paragraph drains for direct
+            // text that sorts before it. Already-bounded frame content can still propagate at close
+            // and supply the useful prefix of the first text box.
             discardDeferredText = true
         } else {
             // Table output is withheld until the table closes because a later non-row/non-cell
@@ -2542,7 +2554,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             // a final deleted-mark paragraph because nothing claims its stash; attachment
             // extraction keeps its plain text. Extras remain deferred and therefore absent.
             if (pendingDeletedValue !== '') {
-                append(top, 'value', pendingDeletedValue, true)
+                append(top, 'value', pendingDeletedValue)
                 charge(pendingDeletedValue.length)
                 pendingDeletedValue = ''
                 pendingDeletedExtra = ''
@@ -2592,10 +2604,13 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
                 frames.pop()
                 top = frames[frames.length - 1]
                 const value = table.mergeBailout ? table.frame.allValue ?? '' : table.frame.value
-                append(top, 'value', value, true)
-                append(top, 'extra', table.frame.extra, true)
+                append(top, 'value', value, { source: table.frame })
+                append(top, 'extra', table.frame.extra, { source: table.frame, deferred: true })
                 if (table.mergeBailout) charge(table.deferredChars)
-                if (drainUntil === table.frame) drainUntil = undefined
+                if (drainUntil === table.frame) {
+                    drainUntil = undefined
+                    drainAncestors = new Set(frames)
+                }
             }
             return
         }
@@ -2613,8 +2628,8 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             // already carried. It reaches the output only if some ancestor w:p reinserts it.
             // These strings were retained before the cap crossed; moving them upward does not add
             // new deferred content, and keeps the useful prefix of the first text box.
-            append(top, 'extra', frame.extra, true)
-            append(top, 'extra', frame.value, true)
+            append(top, 'extra', frame.extra, { source: frame, deferred: true })
+            append(top, 'extra', frame.value, { source: frame, deferred: true })
         } else {
             const wasDeleted = deleted.pop() ?? false
             closedDeleted = wasDeleted
@@ -2629,16 +2644,17 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
                 pendingDeletedExtra = `${frame.claimedExtra}${frame.extra}`.slice(0, storageLimit)
                 pendingDeletedChars = deferredChars
             } else {
-                append(top, 'value', frame.value, true)
-                append(top, 'value', '\n\n', true)
-                append(top, 'value', frame.claimedExtra, true)
-                append(top, 'value', frame.extra, true)
+                append(top, 'value', frame.value, { source: frame })
+                append(top, 'value', '\n\n', discardDeferredText ? { source: frame } : undefined)
+                append(top, 'value', frame.claimedExtra, { source: frame, deferred: true })
+                append(top, 'value', frame.extra, { source: frame, deferred: true })
                 charge(2)
             }
         }
 
         if (drainUntil === frame) {
             drainUntil = undefined
+            drainAncestors = new Set(frames)
             if (closedDeleted) drainPendingDeletedContent = true
         }
     })
