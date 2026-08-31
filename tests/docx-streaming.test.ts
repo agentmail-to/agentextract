@@ -244,6 +244,22 @@ describe('docx — the whitelist drops unrecognised subtrees', () => {
         expect(r.extraction).toBe('before\n\nTRAILING')
     })
 
+    it('carries deleted-paragraph text out of a suppressed vertical-merge cell', async () => {
+        const restart = '<w:tcPr><w:vMerge w:val="restart"/></w:tcPr>'
+        const continuation = '<w:tcPr><w:vMerge/></w:tcPr>'
+        const deleted = '<w:p><w:pPr><w:rPr><w:del/></w:rPr></w:pPr><w:r><w:t>DELETED </w:t></w:r></w:p>'
+        const body =
+            `<w:tbl><w:tr><w:tc>${restart}${text('MASTER')}</w:tc></w:tr>` +
+            `<w:tr><w:tc>${continuation}${deleted}</w:tc></w:tr></w:tbl>${text('NEXT')}`
+        const r = await extract(body)
+
+        expect(r.extraction).toBe('MASTER\n\nDELETED NEXT\n\n')
+
+        const partial = await extract(body, { maxOutputChars: 12 })
+        expect(partial).toMatchObject({ status: 'extracted', truncated: true })
+        expect(r.extraction!.startsWith(partial.extraction!)).toBe(true)
+    })
+
     // Same marker, one level out: a deleted table row takes the whole row with it.
     it('drops a table row marked deleted, keeping the rows around it', async () => {
         const r = await extract(
@@ -714,6 +730,27 @@ describe('docx — archive-level reads', () => {
             `<w:tbl><w:tr><w:tc>` +
                 `<w:tcPr><w:t>LEAK</w:t></w:tcPr>` +
                 `${text('KEEP')}</w:tc></w:tr></w:tbl>`
+        )
+        expect(r.extraction).toBe('KEEP\n\n')
+    })
+
+    it('does not let a row nested inside a cell mutate the enclosing table state', async () => {
+        const cell = (body: string, properties = '') => `<w:tc>${properties}${body}</w:tc>`
+        const restart = '<w:tcPr><w:vMerge w:val="restart"/></w:tcPr>'
+        const continuation = '<w:tcPr><w:vMerge/></w:tcPr>'
+        const nestedRow = `<w:tr>${cell(text('NESTED'))}</w:tr>`
+        const first = `<w:tr>${cell(text('A'))}${cell(nestedRow)}${cell(text('MASTER'), restart)}</w:tr>`
+        const second = `<w:tr>${cell(text('B'))}${cell(text('C'))}${cell(text('HIDDEN'), continuation)}</w:tr>`
+
+        const r = await extract(`<w:tbl>${first}${second}</w:tbl>`)
+        expect(r.extraction).toBe('A\n\nNESTED\n\nMASTER\n\nB\n\nC\n\n')
+    })
+
+    it('drops selector content that is not owned by sdt or AlternateContent', async () => {
+        const r = await extract(
+            `<w:p><w:sdtContent><w:r><w:t>SDT-LEAK</w:t></w:r></w:sdtContent>` +
+                `<mc:Fallback><w:r><w:t>MC-LEAK</w:t></w:r></mc:Fallback>` +
+                `<w:r><w:t>KEEP</w:t></w:r></w:p>`
         )
         expect(r.extraction).toBe('KEEP\n\n')
     })

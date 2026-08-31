@@ -842,7 +842,7 @@ const xlsxHandler: Handler = {
                 // other way round from how this once read. The normalization stays anyway: exceljs
                 // documents the batched shape, which is why the wrong version of this was believable,
                 // and it costs one predicate to be right under either.
-                const batchRows = (Array.isArray(batch) ? batch : [batch]) as StreamedRow[]
+                const batchRows = (Array.isArray(batch) ? batch : [batch]) as Array<StreamedRow | null | undefined>
                 for (const row of batchRows) {
                     // ABOVE the empty-row skip: a contentless row is `continue`d, and a sheet of them
                     // trips no cap either, so a check below would never run. This loop awaits, so
@@ -852,6 +852,11 @@ const xlsxHandler: Handler = {
                         truncated = true
                         break
                     }
+                    // ExcelJS emits a row event at every </row>, even outside sheetData, but its
+                    // current row is null there. The full-workbook reader ignored those events;
+                    // preserve that behavior instead of turning one stray extension element into
+                    // total extraction failure.
+                    if (!row) continue
                     const cells: string[] = []
                     // cell.text = the shown value (formula result, formatted date), not the raw formula.
                     row.eachCell({ includeEmpty: false }, (cell) => {
@@ -1430,11 +1435,12 @@ const partFallbackName = (part: string): string => `Sheet${/(\d+)\.xml$/.exec(as
 // this is a memory class the read did not previously have, not one it already paid.
 //
 // 4 MB because a real workbook.xml is kilobytes — thousands of sheets plus their defined names still
-// land far under it — so the cap can only be reached by a part padded to reach it. Over the cap is
-// treated as unreadable, which degrades to archiveWorksheets rather than failing.
+// land far under it — so the cap can only be reached by a part padded to reach it. An unreadable
+// workbook/rels pair degrades to archiveWorksheets. Unreadable content types become an unknown
+// authorization signal; a present custom target still survives through its worksheet relationship.
 const MAX_METADATA_BYTES = 4 * 1024 * 1024
 
-// Inflate one entry, bounded. Only ever called on the two parts above. undefined = unreadable or
+// Inflate one entry, bounded. Only called on the three metadata parts above. undefined = unreadable or
 // over the cap, which the caller treats as "the workbook did not tell us" rather than as an error.
 const inflateEntry = (entry: ZipEntry): Promise<Buffer | undefined> => {
     // Stored: output === input, and the subarray is a view on bytes already resident.
@@ -1527,13 +1533,14 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
     rels.on('closetag', () => void relsDepth--)
     rels.write(relsXml).close()
 
-    // A non-conventional worksheet path needs two declarations to agree: its relationship type and
-    // its package content type. Requiring both keeps a forged worksheet relationship aimed at
-    // styles.xml from making that unrelated part replace real rows. Conventional sheetN.xml parts
-    // retain the compatibility fallback and do not depend on this metadata.
+    // When readable, package content types corroborate a worksheet relationship before a custom
+    // target is accepted. Missing/malformed/over-cap metadata is unknown rather than a negative:
+    // the relationship can retain its present target, and the rescue below keeps conventional parts
+    // too, so an untrusted declaration cannot silently replace their rows.
     const worksheetParts = new Set<string>()
     const worksheetExtensions = new Set<string>()
     const overriddenParts = new Set<string>()
+    let contentTypesKnown = false
     if (contentTypesXml !== undefined) {
         const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
         const contentTypes = new SaxesParser<{ xmlns: true }>({ xmlns: true })
@@ -1561,10 +1568,20 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
             }
         })
         contentTypes.on('closetag', () => void contentTypesDepth--)
-        contentTypes.write(contentTypesXml).close()
+        try {
+            contentTypes.write(contentTypesXml).close()
+            contentTypesKnown = true
+        } catch {
+            // Workbook relationships remain usable when this optional authorization source is
+            // malformed. Discard any declarations observed before the parse error so partial
+            // metadata cannot be mistaken for a complete negative answer.
+            worksheetParts.clear()
+            worksheetExtensions.clear()
+            overriddenParts.clear()
+        }
     }
 
-    return { declared, targets, worksheetParts, worksheetExtensions, overriddenParts }
+    return { declared, targets, worksheetParts, worksheetExtensions, overriddenParts, contentTypesKnown }
 }
 
 // A Target is relative to the rels part's base — xl/ — but may legally be an absolute package path
@@ -1682,7 +1699,8 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
                     extension !== undefined &&
                     parsed.worksheetExtensions.has(extension)))
         // A conventional worksheet path remains recoverable under a missing/unknown type. Outside
-        // that convention, require the exact worksheet relationship identity and content type.
+        // that convention, require the exact worksheet relationship identity and, when the content-
+        // type table was readable, its authorization.
         // Reader-control parts are never eligible even when both declarations are forged together:
         // if styles.xml became the resolved sheet, the real sheetN.xml would otherwise be dropped as
         // an orphan and this same central record would be written twice by the rebuild.
@@ -1690,7 +1708,7 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
             part === undefined ||
             (!isWorksheetPart(part) &&
                 (!WORKSHEET_REL.has(rel.type) ||
-                    !authorizedByContentType ||
+                    (parsed.contentTypesKnown && !authorizedByContentType) ||
                     XLSX_READER_CONTROL_PARTS.has(part)))
         ) {
             hasUnplaced = true
@@ -1997,9 +2015,7 @@ const DOCX_CONTAINERS = new Set([
     'w:tr',
     'w:tc',
     'w:sdt',
-    'w:sdtContent',
     'mc:AlternateContent',
-    'mc:Fallback',
     'w:object',
     'w:drawing',
     'w:txbxContent',
@@ -2118,13 +2134,15 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     let sawBody = false
     let inBody = false
     let chars = 0
-    // mammoth holds a deleted-mark paragraph until the following paragraph is read. Its value
+    // Mammoth holds a deleted-mark paragraph until the following paragraph is read. Its value
     // merges into that paragraph, while any text-box `extra` still follows the completed merged
-    // paragraph. Keep only the deferred extra here; the value can stream straight into `top.value`.
+    // paragraph. Both stay bounded here because the next paragraph may cross a suppressed cell.
+    let pendingDeletedValue = ''
     let pendingDeletedExtra = ''
+    let pendingDeletedChars = 0
     let capExceeded = false
     let drainUntil: DocxFrame | undefined
-    let drainPendingDeletedExtra = false
+    let drainPendingDeletedContent = false
     let discardDeferredText = false
     let discardTableText = false
     const storageLimit = maxOutputChars + 2
@@ -2195,6 +2213,12 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             drainUntil = frames.find((frame) => frame.kind === 'table')
             discardTableText = drainUntil !== undefined
         }
+    }
+
+    const uncharge = (length: number): void => {
+        const activeCell = [...tables].reverse().find((table) => table.cell !== undefined)?.cell
+        if (activeCell) activeCell.chars = Math.max(0, activeCell.chars - length)
+        else chars = Math.max(0, chars - length)
     }
 
     const emit = (text: string): void => {
@@ -2330,6 +2354,12 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         // firstOrEmpty semantics are selection, not merely recursion. A malformed producer may put
         // two sdtContent/Fallback children under one parent; Mammoth reads the first and ignores the
         // rest. Non-target siblings (sdtPr/Choice included) are dropped by the same gate.
+        const selector = selectors[selectors.length - 1]
+        const selectedContainer =
+            selector !== undefined &&
+            selector.depth + 1 === stack.length &&
+            selector.target === name &&
+            !selector.selected
         if (!selectorAllows(name)) {
             skip = stack.length - 1
             return
@@ -2358,7 +2388,9 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             })
         } else if (name === 'w:tr') {
             const table = currentTable()
-            if (table) {
+            // A malformed row nested inside a cell is content of that cell, not a new row in the
+            // enclosing table. Let wrapped rows recurse, but only while this table owns no cell.
+            if (table && table.cell === undefined) {
                 table.column = 0
                 table.rowDepth = stack.length
             }
@@ -2430,6 +2462,9 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         // it needs no flag of its own. Deliberately before the container test, so its children —
         // illegal anyway — fall through to the drop below exactly as they do in mammoth.
         if (name === 'w:t') return
+        // These elements recurse only as the selected direct child of their owning selector.
+        // Orphan forms are unknown elements in Mammoth and their entire subtree is dropped.
+        if (selectedContainer) return
         if (name === 'w:sym') {
             emitSymbol(tag.attributes)
             skip = stack.length - 1 // the symbol is attribute-only; illegal children stay ignored
@@ -2444,15 +2479,29 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             return
         }
         if (name === 'w:p' || name === 'w:pict') {
+            const claimedValue = name === 'w:p' ? pendingDeletedValue : ''
             const claimedExtra = name === 'w:p' ? pendingDeletedExtra : ''
-            if (name === 'w:p') pendingDeletedExtra = ''
-            top = { kind: name === 'w:p' ? 'paragraph' : 'picture', value: '', extra: '', claimedExtra }
+            const claimedChars = name === 'w:p' ? pendingDeletedChars : 0
+            if (name === 'w:p') {
+                pendingDeletedValue = ''
+                pendingDeletedExtra = ''
+                pendingDeletedChars = 0
+            }
+            top = {
+                kind: name === 'w:p' ? 'paragraph' : 'picture',
+                value: claimedValue,
+                extra: '',
+                claimedExtra,
+            }
             frames.push(top)
             if (name === 'w:p') {
                 deleted.push(false)
-                if (drainPendingDeletedExtra) {
+                // The deleted paragraph's contents were uncharged from their old container when
+                // stashed. Charge them to the next paragraph's actual cell/global owner now.
+                charge(claimedChars)
+                if (drainPendingDeletedContent) {
                     drainUntil = top
-                    drainPendingDeletedExtra = false
+                    drainPendingDeletedContent = false
                 }
             }
             return
@@ -2484,11 +2533,21 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             }
             if (name === 'w:tr') {
                 const table = currentTable()
-                if (table) table.rowDepth = undefined
+                if (table?.rowDepth === stack.length + 1) table.rowDepth = undefined
             }
             return
         }
         if (name === 'w:body' && stack.length === 1) {
+            // Availability-preserving divergence retained from the previous reader: Mammoth drops
+            // a final deleted-mark paragraph because nothing claims its stash; attachment
+            // extraction keeps its plain text. Extras remain deferred and therefore absent.
+            if (pendingDeletedValue !== '') {
+                append(top, 'value', pendingDeletedValue, true)
+                charge(pendingDeletedValue.length)
+                pendingDeletedValue = ''
+                pendingDeletedExtra = ''
+                pendingDeletedChars = 0
+            }
             inBody = false
             return
         }
@@ -2524,7 +2583,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         }
         if (name === 'w:tr') {
             const table = currentTable()
-            if (table) table.rowDepth = undefined
+            if (table?.rowDepth === stack.length + 1) table.rowDepth = undefined
             return
         }
         if (name === 'w:tbl') {
@@ -2560,12 +2619,15 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             const wasDeleted = deleted.pop() ?? false
             closedDeleted = wasDeleted
             if (wasDeleted) {
-                // The paragraph mark was deleted, so there is no paragraph break here: this text
-                // runs straight into the next paragraph. Appending now matches mammoth whenever
-                // another paragraph follows. If this is the final paragraph, mammoth drops its
-                // stashed text; this reader keeps it — an availability-preserving divergence.
-                append(top, 'value', frame.value, true)
+                // Mammoth stashes the paragraph's XML children globally, then prepends them to the
+                // next paragraph even when it crosses a table-cell boundary. Holding the rendered
+                // pair does the same for raw text and prevents a vMerge continuation from deleting
+                // content that belongs to the following visible paragraph.
+                const deferredChars = frame.value.length + frame.claimedExtra.length + frame.extra.length
+                uncharge(deferredChars)
+                pendingDeletedValue = frame.value
                 pendingDeletedExtra = `${frame.claimedExtra}${frame.extra}`.slice(0, storageLimit)
+                pendingDeletedChars = deferredChars
             } else {
                 append(top, 'value', frame.value, true)
                 append(top, 'value', '\n\n', true)
@@ -2577,7 +2639,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
 
         if (drainUntil === frame) {
             drainUntil = undefined
-            if (closedDeleted) drainPendingDeletedExtra = true
+            if (closedDeleted) drainPendingDeletedContent = true
         }
     })
 
@@ -2585,7 +2647,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         write: (chunk) => void parser.write(chunk),
         chars: () => chars,
         overCap: () => capExceeded,
-        shouldStop: () => capExceeded && drainUntil === undefined && !drainPendingDeletedExtra,
+        shouldStop: () => capExceeded && drainUntil === undefined && !drainPendingDeletedContent,
         end: (tail) => {
             parser.write(tail).close() // close() is the well-formedness check: it throws on an unclosed element
             return sawBody

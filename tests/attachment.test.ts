@@ -825,6 +825,27 @@ describe('attachment — xlsx handler', () => {
         expect(r).toMatchObject({ status: 'extracted', extraction: '=== Rich ===\nAlpha & Beta', truncated: false })
     })
 
+    it('ignores ExcelJS null row events outside sheetData', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Rows')
+        sheet.addRow(['first'])
+        sheet.addRow(['second'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(name, xml.replace('</sheetData>', '</sheetData><extLst><ext uri="probe"><row r="99"/></ext></extLst>'))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({
+            status: 'extracted',
+            extraction: '=== Rows ===\nfirst\nsecond',
+            truncated: false,
+        })
+    })
+
     it.each([
         ['worksheet', 'xl/worksheets/sheet1.xml'],
         ['shared strings', 'xl/sharedStrings.xml'],
@@ -2457,6 +2478,30 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         expect(r.status).toBe('extracted')
         expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
         expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
+    })
+
+    it('retains a custom worksheet when content-type metadata exceeds the resolver cap', async () => {
+        const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/custom/data.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', 'custom/data.xml'))
+
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file(
+                '[Content_Types].xml',
+                types
+                    .replace('/xl/worksheets/sheet1.xml', '/xl/custom/data.xml')
+                    .replace('</Types>', `<!--${'x'.repeat(4 * 1024 * 1024)}--></Types>`)
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== S1 ===\ns1r1\t1\ns1r2\t2', truncated: false })
     })
 
     it('matches a UTF-8 flagged non-ASCII worksheet part name to its relationship target', async () => {
