@@ -233,6 +233,32 @@ describe('docx — the whitelist drops unrecognised subtrees', () => {
         expect(r.extraction).toBe('DELTEXTNEXT\n\nDEL-BOX\n\nNEXT-BOX\n\n')
     })
 
+    it('preserves a deleted paragraph side effect inside an otherwise orphaned text box', async () => {
+        const deleted =
+            '<w:p><w:pPr><w:rPr><w:del/></w:rPr></w:pPr>' +
+            '<w:r><w:pict><v:shape><v:textbox><w:txbxContent>' +
+            `${text('T5')}</w:txbxContent></v:textbox></v:shape></w:pict></w:r></w:p>`
+        const orphan =
+            '<w:r><w:pict><v:shape><v:textbox><w:txbxContent>' +
+            `${deleted}</w:txbxContent></v:textbox></v:shape></w:pict></w:r>`
+
+        const r = await extract(`${orphan}<w:p/>`)
+        expect(r).toMatchObject({ status: 'extracted', extraction: '\n\nT5\n\n', truncated: false })
+    })
+
+    it('queues a nested deleted paragraph behind the deleted paragraph that contains it', async () => {
+        const deleted = (inner: string) =>
+            `<w:p><w:pPr><w:rPr><w:del/></w:rPr></w:pPr>${inner}</w:p>`
+        const nested = deleted('<w:r><w:t>B</w:t></w:r>')
+        const box =
+            '<w:r><w:pict><v:shape><v:textbox><w:txbxContent>' +
+            `${nested}</w:txbxContent></v:textbox></v:shape></w:pict></w:r>`
+        const body = deleted(`<w:r><w:t>A</w:t></w:r>${box}`) + text('T5') + text('T6')
+
+        const r = await extract(body)
+        expect(r).toMatchObject({ status: 'extracted', extraction: 'AT5\n\nBT6\n\n', truncated: false })
+    })
+
     // ACCEPTED DIVERGENCE. mammoth stashes a deleted-mark paragraph for the next paragraph and
     // drops that text when there is no next one. The streaming reader emits as it goes and keeps the
     // trailing text. This is the safer direction for attachment extraction, but it is not exact
@@ -573,6 +599,42 @@ describe('docx — the cap and the deadline stop the read', () => {
         })
     })
 
+    it('does not charge a nested table inside a suppressed vertical-merge continuation', async () => {
+        const restart = '<w:tcPr><w:vMerge w:val="restart"/></w:tcPr>'
+        const continuation = '<w:tcPr><w:vMerge/></w:tcPr>'
+        const hidden = `<w:tbl><w:tr><w:tc>${text('x'.repeat(500))}</w:tc></w:tr></w:tbl>`
+        const body =
+            `<w:tbl><w:tr><w:tc>${restart}${text('MASTER')}</w:tc></w:tr>` +
+            `<w:tr><w:tc>${continuation}${hidden}</w:tc></w:tr></w:tbl>${text('AFTER')}`
+
+        const r = await extract(body, { maxOutputChars: 100 })
+        expect(r).toMatchObject({ status: 'extracted', extraction: 'MASTER\n\nAFTER\n\n', truncated: false })
+    })
+
+    it('preserves cap prefixes across vMerge, nested tables, and nested text boxes together', async () => {
+        const picture = (inner: string) =>
+            `<w:pict><v:shape><v:textbox><w:txbxContent>${inner}</w:txbxContent></v:textbox></v:shape></w:pict>`
+        const wrapTable = (inner: string) => `<w:tbl><w:tr><w:tc>${inner}</w:tc></w:tr></w:tbl>`
+        for (const depth of [1, 2, 4]) {
+            let hidden = picture(text(`HIDDEN-${depth}`))
+            for (let i = 0; i < depth; i++) hidden = wrapTable(hidden)
+            const body =
+                `<w:tbl><w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr>${text('MASTER')}</w:tc></w:tr>` +
+                `<w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr>${hidden}</w:tc></w:tr></w:tbl>` +
+                `<w:p><w:r><w:t>AFTER</w:t></w:r>${picture(text('BOX'))}</w:p>`
+            const whole = await extract(body, { maxOutputChars: 1_000 })
+            expect(whole).toMatchObject({
+                status: 'extracted',
+                extraction: 'MASTER\n\nAFTER\n\nBOX\n\n',
+                truncated: false,
+            })
+            for (let cap = 1; cap <= whole.extraction!.length; cap++) {
+                const partial = await extract(body, { maxOutputChars: cap })
+                expect(whole.extraction!.startsWith(partial.extraction ?? '')).toBe(true)
+            }
+        }
+    })
+
     it('treats a malformed nested table cell as content of the active cell without leaking its frame', async () => {
         const nested = `<w:tc>${text('INNER')}</w:tc>`
         const body = `<w:tbl><w:tr><w:tc>${text('OUTER1')}${nested}${text('OUTER2')}</w:tc></w:tr></w:tbl>${text('AFTER')}`
@@ -592,6 +654,18 @@ describe('docx — the cap and the deadline stop the read', () => {
         expect(whole.extraction).toBe('ONE\n\nOUT\n\nINNER\n\nAFTER\n\n')
         expect(partial.extraction).toBe('ONE\n\nOUT\n')
         expect(whole.extraction!.startsWith(partial.extraction!)).toBe(true)
+    })
+
+    it('keeps direct nested text-box text that sorts before the picture crossing the cap', async () => {
+        const picture = (inner: string) =>
+            `<w:pict><v:shape><v:textbox><w:txbxContent>${inner}</w:txbxContent></v:textbox></v:shape></w:pict>`
+        const body = `<w:p>${picture(`<w:p><w:r><w:tab/></w:r>${picture(text('T0T1'))}</w:p>`)}</w:p>`
+        const whole = await extract(body, { maxOutputChars: 100 })
+        const partial = await extract(body, { maxOutputChars: 6 })
+
+        expect(whole.extraction).toBe('\n\n\t\n\nT0T1\n\n')
+        expect(partial).toMatchObject({ status: 'extracted', truncated: true })
+        expect(partial.extraction).toBe(whole.extraction!.slice(0, 6))
     })
 
     it('keeps table truncation before deferred picture text as a prefix', async () => {

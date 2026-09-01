@@ -345,7 +345,10 @@ const docxHandler: Handler = {
         // proofs load-bearing.
         const entries = zipEntries(content)
         if (!entries) throw new Error('docx central directory could not be read for streaming')
-        const part = entries.find((entry) => asciiFold(entry.name) === DOCX_MAIN_PART)
+        // JSZip (and therefore Mammoth's previous reader) resolves duplicate names to the final
+        // central-directory record. Preserve that compatibility rather than silently switching the
+        // extracted document when an ambiguous archive reaches this lower-level ZIP reader.
+        const part = entries.findLast((entry) => asciiFold(entry.name) === DOCX_MAIN_PART)
         if (!part) throw new Error(`docx archive has no ${DOCX_MAIN_PART} entry`)
 
         const reader = await createDocxReader(maxOutputChars)
@@ -563,7 +566,7 @@ const streamedFormula = (cell: StreamedCell): { result: unknown; text: string } 
     if (typeof cell.value !== 'object' || cell.value === null) return undefined
     const shared = cell.value as { formula?: unknown; result?: unknown }
     if (shared.formula !== '') return undefined
-    return { result: shared.result, text: shared.result ? String(shared.result) : '' }
+    return { result: shared.result, text: shared.result == null ? '' : String(shared.result) }
 }
 
 const excelFormulaText = (cell: StreamedCell, booleanCells: Set<string>): string => {
@@ -709,7 +712,12 @@ const xlsxHandler: Handler = {
                       textDepth?: number
                   }
                 | undefined
-            const inline = new SaxesParser<{ xmlns: true }>({ xmlns: true })
+            const inline = new SaxesParser({
+                xmlns: true,
+                // ExcelJS's non-namespace parser tolerated undeclared extension prefixes. Treat
+                // them as foreign markup instead of failing every worksheet in the attachment.
+                resolvePrefix: () => UNBOUND_NAMESPACE,
+            })
             const isSpreadsheet = (element: { uri: string; local: string } | undefined, local: string): boolean =>
                 element !== undefined && SPREADSHEETML_NS.has(element.uri) && element.local === local
             inline.on('opentag', (tag) => {
@@ -1425,8 +1433,8 @@ const partFallbackName = (part: string): string => `Sheet${/(\d+)\.xml$/.exec(as
 //
 // 4 MB because a real workbook.xml is kilobytes — thousands of sheets plus their defined names still
 // land far under it — so the cap can only be reached by a part padded to reach it. An unreadable
-// workbook/rels pair degrades to archiveWorksheets. Unreadable content types become an unknown
-// authorization signal; a present custom target still survives through its worksheet relationship.
+// workbook/rels pair degrades to archive order augmented by whichever relationship/content-type
+// declarations remain readable. Unreadable content types become an unknown authorization signal.
 const MAX_METADATA_BYTES = 4 * 1024 * 1024
 
 // Inflate one entry, bounded. Only called on the three metadata parts above. undefined = unreadable or
@@ -1452,9 +1460,9 @@ const inflateEntry = (entry: ZipEntry): Promise<Buffer | undefined> => {
 // the genuine declaration was skipped as already claimed. Element identity is (namespace, local
 // name), and the parent has to be <sheets> — the only place ECMA-376 12.3.2 puts a tab declaration.
 //
-// The cost is that saxes with xmlns on treats an UNDECLARED prefix as fatal. That is contained: the
-// caller catches the throw and degrades to archiveWorksheets, the same answer it already gives for a
-// workbook it cannot read, and exceljs's own parse of those bytes fails too.
+// Namespace mode would normally make an undeclared extension prefix fatal. The parsers below map
+// only such unclaimed prefixes to UNBOUND_NAMESPACE, so foreign extension markup remains foreign
+// and cannot impersonate a SpreadsheetML declaration while the rest of the workbook stays readable.
 // Both OOXML flavours. ECMA-376 Transitional is what Excel writes by default; ISO/IEC 29500 Strict
 // re-homes the same vocabulary under purl.oclc.org, and "Excel Workbook (Strict Open XML)" is a
 // documented save-as target — so a Strict workbook is a legal .xlsx, not a curiosity. Recognizing
@@ -1491,7 +1499,7 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
     // resolved, but the caller has to know the workbook DECLARED something it could not place —
     // dropping them here would make an unresolvable sheet indistinguishable from an orphan part.
     const declared: { name: string; rId?: string }[] = []
-    const workbook = new SaxesParser<{ xmlns: true }>({ xmlns: true })
+    const workbook = new SaxesParser({ xmlns: true, resolvePrefix: () => UNBOUND_NAMESPACE })
     // Parent tracking, so <sheet> counts only as a child of <sheets>.
     const open: { uri: string; local: string }[] = []
     workbook.on('opentag', (tag) => {
@@ -1509,7 +1517,7 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
     workbook.write(workbookXml).close()
 
     const targets = new Map<string, WorkbookRel>()
-    const rels = new SaxesParser<{ xmlns: true }>({ xmlns: true })
+    const rels = new SaxesParser({ xmlns: true, resolvePrefix: () => UNBOUND_NAMESPACE })
     let relsDepth = 0
     rels.on('opentag', (tag) => {
         assertXmlDepth(++relsDepth)
@@ -1532,7 +1540,10 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
     let contentTypesKnown = false
     if (contentTypesXml !== undefined) {
         const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
-        const contentTypes = new SaxesParser<{ xmlns: true }>({ xmlns: true })
+        const contentTypes = new SaxesParser({
+            xmlns: true,
+            resolvePrefix: () => UNBOUND_NAMESPACE,
+        })
         let contentTypesDepth = 0
         contentTypes.on('opentag', (tag) => {
             assertXmlDepth(++contentTypesDepth)
@@ -1600,6 +1611,97 @@ const resolveRelTarget = (target: string): string | undefined => {
     return path.length > 0 ? path.join('/') : undefined
 }
 
+// When workbook.xml or its relationships exceed the resolver's materialization ceiling, retain the
+// archive-order fallback but augment it with custom worksheet parts identified by whichever OPC
+// metadata remains readable. A valid custom part is declared by an exact worksheet relationship,
+// an exact worksheet content type, or both; conventional xl/worksheets parts remain the baseline.
+const metadataFallbackWorksheets = async (
+    entries: ZipEntry[],
+    relsXml?: Buffer,
+    contentTypesXml?: Buffer
+): Promise<WorkbookSheet[]> => {
+    const { SaxesParser } = await import('saxes')
+    const candidateNames = new Set(worksheetEntries(entries).map((entry) => asciiFold(entry.name)))
+    const relationshipCandidates = new Set<string>()
+    const contentTypeCandidates = new Set<string>()
+    const worksheetExtensions = new Set<string>()
+    let contentTypesKnown = false
+
+    if (relsXml !== undefined) {
+        const rels = new SaxesParser({ xmlns: true, resolvePrefix: () => UNBOUND_NAMESPACE })
+        let depth = 0
+        rels.on('opentag', (tag) => {
+            assertXmlDepth(++depth)
+            if (tag.uri !== PACKAGE_RELS_NS || tag.local !== 'Relationship') return
+            const type = tag.attributes.Type?.value
+            const target = tag.attributes.Target?.value
+            if (!type || !target || tag.attributes.TargetMode?.value === 'External' || !WORKSHEET_REL.has(type)) return
+            const resolved = resolveRelTarget(target)
+            if (resolved !== undefined) relationshipCandidates.add(asciiFold(resolved))
+        })
+        rels.on('closetag', () => void depth--)
+        try {
+            rels.write(relsXml.toString('utf8')).close()
+        } catch {
+            relationshipCandidates.clear()
+        }
+    }
+
+    if (contentTypesXml !== undefined) {
+        const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
+        const contentTypes = new SaxesParser({
+            xmlns: true,
+            resolvePrefix: () => UNBOUND_NAMESPACE,
+        })
+        let depth = 0
+        contentTypes.on('opentag', (tag) => {
+            assertXmlDepth(++depth)
+            if (tag.uri !== CONTENT_TYPES_NS) return
+            const contentType = tag.attributes.ContentType?.value?.trim().toLowerCase()
+            if (!contentType || !WORKSHEET_CONTENT_TYPE.has(contentType)) return
+            if (tag.local === 'Override') {
+                const name = tag.attributes.PartName?.value
+                if (!name) return
+                try {
+                    contentTypeCandidates.add(asciiFold(decodeURIComponent(name).replace(/^\/+/, '')))
+                } catch {
+                    // Ignore only this malformed declaration.
+                }
+            } else if (tag.local === 'Default') {
+                const extension = tag.attributes.Extension?.value?.replace(/^\./, '')
+                if (extension) worksheetExtensions.add(asciiFold(extension))
+            }
+        })
+        contentTypes.on('closetag', () => void depth--)
+        try {
+            contentTypes.write(contentTypesXml.toString('utf8')).close()
+            contentTypesKnown = true
+        } catch {
+            contentTypeCandidates.clear()
+            worksheetExtensions.clear()
+        }
+    }
+
+    for (const entry of entries) {
+        const name = asciiFold(entry.name)
+        if (XLSX_READER_CONTROL_PARTS.has(name)) continue
+        const dot = name.lastIndexOf('.')
+        const slash = name.lastIndexOf('/')
+        const extension = dot > slash ? name.slice(dot + 1) : ''
+        const contentTyped = contentTypeCandidates.has(name) || worksheetExtensions.has(extension)
+        if (
+            contentTypeCandidates.has(name) ||
+            (relationshipCandidates.has(name) && (!contentTypesKnown || contentTyped))
+        ) {
+            candidateNames.add(name)
+        }
+    }
+
+    return entries
+        .filter((entry) => candidateNames.has(asciiFold(entry.name)))
+        .map((entry) => ({ entry, name: partFallbackName(entry.name) }))
+}
+
 // The workbook's own worksheets, in tab order. undefined when it cannot say — a missing or unreadable
 // workbook.xml / rels part. Deliberately not an error: the streaming reader degrades on exactly that
 // input (it never sets this.workbookRels, so every sheet takes the spool path) yet still reads to
@@ -1622,7 +1724,13 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
         inflateEntry(relsEntry),
         contentTypesEntry ? inflateEntry(contentTypesEntry) : undefined,
     ])
-    if (!workbookXml || !relsXml) return undefined
+    if (!workbookXml || !relsXml) {
+        const fallback = await metadataFallbackWorksheets(entries, relsXml, contentTypesXml)
+        if (fallback.length === 0) {
+            throw new Error('xlsx metadata exceeded the resolver cap and no worksheet parts could be identified')
+        }
+        return fallback
+    }
 
     let parsed: Awaited<ReturnType<typeof parseWorkbookParts>>
     try {
@@ -2071,6 +2179,7 @@ interface DocxFrame {
     // ownership on that frame prevents a nested text-box paragraph from stealing them on close.
     claimedExtra: string
     allValue?: string
+    orphanPicture?: boolean
 }
 
 interface DocxTableCell {
@@ -2096,6 +2205,12 @@ interface DocxTable {
     deferredChars: number
     rowDepth?: number
     cell?: DocxTableCell
+}
+
+interface PendingDeletedParagraph {
+    value: string
+    extra: string
+    chars: number
 }
 
 interface DocxReader {
@@ -2126,14 +2241,17 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     // Mammoth holds a deleted-mark paragraph until the following paragraph is read. Its value
     // merges into that paragraph, while any text-box `extra` still follows the completed merged
     // paragraph. Both stay bounded here because the next paragraph may cross a suppressed cell.
-    let pendingDeletedValue = ''
-    let pendingDeletedExtra = ''
-    let pendingDeletedChars = 0
+    let pendingDeleted: PendingDeletedParagraph = { value: '', extra: '', chars: 0 }
+    // Descendant deleted paragraphs are parsed eagerly here, while Mammoth sees them only after an
+    // outer deleted paragraph is claimed. Preserve that delayed order: closing the outer paragraph
+    // puts its stash first and queues the descendant state for the paragraph after the claimant.
+    const pendingDeletedQueue: PendingDeletedParagraph[] = []
     let capExceeded = false
     let drainUntil: DocxFrame | undefined
     let drainAncestors: Set<DocxFrame> | undefined
     let drainPendingDeletedContent = false
     let discardDeferredText = false
+    let deferredFreshFrames: Set<DocxFrame> | undefined
     let discardTableText = false
     const storageLimit = maxOutputChars + 2
 
@@ -2164,7 +2282,10 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         }
         if (discardTableText && (options.source === undefined || options.deferred)) return
         if (discardDeferredText && options.source === undefined) {
-            if (options.deferred || field !== 'value' || frames.some((candidate) => candidate.kind === 'picture')) {
+            // A nested picture may cross the cap before direct text that appears ahead of it after
+            // Mammoth hoists the picture. Retain fresh value only on frames that were ancestors of
+            // that exact picture at the crossing; later/sibling frames remain bounded away.
+            if (options.deferred || field !== 'value' || !deferredFreshFrames?.has(frame)) {
                 return
             }
         }
@@ -2173,17 +2294,21 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     }
 
     const charge = (length: number): void => {
+        // Mammoth still walks an orphan picture, so a deleted paragraph inside it can affect the
+        // next body paragraph, but the picture's own output is unreachable until that happens.
+        if (frames.some((frame) => frame.orphanPicture)) return
         const activeCell = [...tables].reverse().find((table) => table.cell !== undefined)?.cell
         if (activeCell) {
             activeCell.chars += length
-            const speculative = tables.reduce(
-                (total, table) =>
-                    total +
-                    (table.cell === undefined || (table.cell.suppressed && !table.mergeBailout)
-                        ? 0
-                        : table.cell.chars),
-                chars
-            )
+            let hiddenBySuppressedAncestor = false
+            const speculative = tables.reduce((total, table) => {
+                if (hiddenBySuppressedAncestor || table.cell === undefined) return total
+                if (table.cell.suppressed && !table.mergeBailout) {
+                    hiddenBySuppressedAncestor = true
+                    return total
+                }
+                return total + table.cell.chars
+            }, chars)
             if (!capExceeded && speculative > maxOutputChars) {
                 // A valid continuation is already known to be hidden once tcPr closes, so it is
                 // excluded above. If later structure triggers mergeBailout, its deferred count is
@@ -2191,9 +2316,11 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
                 // speculative until table close but remains cap-bearing, preventing nested frames
                 // from multiplying retention by XML depth.
                 capExceeded = true
-                const picture = frames.findIndex((frame) => frame.kind === 'picture')
-                if (picture > 0) {
-                    drainUntil = [...frames.slice(0, picture)]
+                const outerPicture = frames.findIndex((frame) => frame.kind === 'picture')
+                if (outerPicture > 0) {
+                    const innerPicture = frames.findLastIndex((frame) => frame.kind === 'picture')
+                    deferredFreshFrames = new Set(frames.slice(0, innerPicture))
+                    drainUntil = [...frames.slice(0, outerPicture)]
                         .reverse()
                         .find((frame) => frame.kind === 'paragraph')
                     discardDeferredText = true
@@ -2210,9 +2337,11 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         // Text inside a picture is not output where it is read: the picture is hoisted behind the
         // enclosing paragraph. Continue only until that paragraph closes, so the cap returns the
         // box text in its real output position without reading the rest of the document.
-        const picture = frames.findIndex((frame) => frame.kind === 'picture')
-        if (picture > 0) {
-            drainUntil = [...frames.slice(0, picture)].reverse().find((frame) => frame.kind === 'paragraph')
+        const outerPicture = frames.findIndex((frame) => frame.kind === 'picture')
+        if (outerPicture > 0) {
+            const innerPicture = frames.findLastIndex((frame) => frame.kind === 'picture')
+            deferredFreshFrames = new Set(frames.slice(0, innerPicture))
+            drainUntil = [...frames.slice(0, outerPicture)].reverse().find((frame) => frame.kind === 'paragraph')
             // Picture text is deferred until after the enclosing paragraph. Once it crosses the
             // output cap, stop accepting more deferred text while the paragraph drains for direct
             // text that sorts before it. Already-bounded frame content can still propagate at close
@@ -2228,6 +2357,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     }
 
     const uncharge = (length: number): void => {
+        if (frames.some((frame) => frame.orphanPicture)) return
         const activeCell = [...tables].reverse().find((table) => table.cell !== undefined)?.cell
         if (activeCell) activeCell.chars = Math.max(0, activeCell.chars - length)
         else chars = Math.max(0, chars - length)
@@ -2483,27 +2613,20 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             return
         }
 
-        if (name === 'w:pict' && !frames.some((frame) => frame.kind === 'paragraph')) {
-            // A picture's text can reach mammoth's output only through an enclosing paragraph.
-            // Dropping an orphan at entry also keeps unreachable text out of both memory and the
-            // incremental cap instead of accumulating it in root.extra and falsely truncating.
-            skip = stack.length - 1
-            return
-        }
         if (name === 'w:p' || name === 'w:pict') {
-            const claimedValue = name === 'w:p' ? pendingDeletedValue : ''
-            const claimedExtra = name === 'w:p' ? pendingDeletedExtra : ''
-            const claimedChars = name === 'w:p' ? pendingDeletedChars : 0
+            const claimedValue = name === 'w:p' ? pendingDeleted.value : ''
+            const claimedExtra = name === 'w:p' ? pendingDeleted.extra : ''
+            const claimedChars = name === 'w:p' ? pendingDeleted.chars : 0
             if (name === 'w:p') {
-                pendingDeletedValue = ''
-                pendingDeletedExtra = ''
-                pendingDeletedChars = 0
+                pendingDeleted = pendingDeletedQueue.shift() ?? { value: '', extra: '', chars: 0 }
             }
             top = {
                 kind: name === 'w:p' ? 'paragraph' : 'picture',
                 value: claimedValue,
                 extra: '',
                 claimedExtra,
+                orphanPicture:
+                    name === 'w:pict' && !frames.some((frame) => frame.kind === 'paragraph' || frame.orphanPicture),
             }
             frames.push(top)
             if (name === 'w:p') {
@@ -2553,12 +2676,11 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             // Availability-preserving divergence retained from the previous reader: Mammoth drops
             // a final deleted-mark paragraph because nothing claims its stash; attachment
             // extraction keeps its plain text. Extras remain deferred and therefore absent.
-            if (pendingDeletedValue !== '') {
-                append(top, 'value', pendingDeletedValue)
-                charge(pendingDeletedValue.length)
-                pendingDeletedValue = ''
-                pendingDeletedExtra = ''
-                pendingDeletedChars = 0
+            if (pendingDeleted.value !== '') {
+                append(top, 'value', pendingDeleted.value)
+                charge(pendingDeleted.value.length)
+                pendingDeleted = { value: '', extra: '', chars: 0 }
+                pendingDeletedQueue.length = 0
             }
             inBody = false
             return
@@ -2628,8 +2750,10 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             // already carried. It reaches the output only if some ancestor w:p reinserts it.
             // These strings were retained before the cap crossed; moving them upward does not add
             // new deferred content, and keeps the useful prefix of the first text box.
-            append(top, 'extra', frame.extra, { source: frame, deferred: true })
-            append(top, 'extra', frame.value, { source: frame, deferred: true })
+            if (!frame.orphanPicture) {
+                append(top, 'extra', frame.extra, { source: frame, deferred: true })
+                append(top, 'extra', frame.value, { source: frame, deferred: true })
+            }
         } else {
             const wasDeleted = deleted.pop() ?? false
             closedDeleted = wasDeleted
@@ -2640,9 +2764,14 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
                 // content that belongs to the following visible paragraph.
                 const deferredChars = frame.value.length + frame.claimedExtra.length + frame.extra.length
                 uncharge(deferredChars)
-                pendingDeletedValue = frame.value
-                pendingDeletedExtra = `${frame.claimedExtra}${frame.extra}`.slice(0, storageLimit)
-                pendingDeletedChars = deferredChars
+                if (pendingDeleted.value !== '' || pendingDeleted.extra !== '' || pendingDeleted.chars > 0) {
+                    pendingDeletedQueue.unshift(pendingDeleted)
+                }
+                pendingDeleted = {
+                    value: frame.value,
+                    extra: `${frame.claimedExtra}${frame.extra}`.slice(0, storageLimit),
+                    chars: deferredChars,
+                }
             } else {
                 append(top, 'value', frame.value, { source: frame })
                 append(top, 'value', '\n\n', discardDeferredText ? { source: frame } : undefined)

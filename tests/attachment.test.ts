@@ -729,6 +729,20 @@ describe('attachment — xlsx handler', () => {
         expect(r.extraction).not.toContain('{"formula"')
     })
 
+    it('keeps a zero-valued shared-formula continuation result', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Shared zero')
+        sheet.getCell('A1').value = 1
+        sheet.fillFormula('B1:B2', 'A1-1', [1, 0])
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toBe('=== Shared zero ===\n1\t1\n0')
+    })
+
     it('preserves boolean and date result types for streamed formula cells', async () => {
         const workbook = new ExcelJS.Workbook()
         workbook.properties.date1904 = true
@@ -850,6 +864,21 @@ describe('attachment — xlsx handler', () => {
 
         expect(inline.extraction).toBe('=== Scoped ===\nREAL')
         expect(boolean.extraction).toBe('=== Scoped ===\n1')
+    })
+
+    it('tolerates an undeclared extension prefix without losing the worksheet', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Extensions').getCell('A1').value = 'REAL'
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(name, xml.replace('</worksheet>', '<extLst><ext uri="probe"><xr:extra/></ext></extLst></worksheet>'))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Extensions ===\nREAL', truncated: false })
     })
 
     it('ignores ExcelJS null row events outside sheetData', async () => {
@@ -2871,6 +2900,26 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         for (let s = 1; s <= 2; s++) expect(r.extraction).toContain(`s${s}r1`)
     })
 
+    it('retains a custom worksheet when workbook metadata exceeds the resolver cap', async () => {
+        const padded = await rebuild(await workbookWith(1, 2), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/custom/data.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', 'custom/data.xml'))
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file('[Content_Types].xml', types.replace('/xl/worksheets/sheet1.xml', '/xl/custom/data.xml'))
+            const workbook = await part(zip, 'xl/workbook.xml')
+            zip.file('xl/workbook.xml', workbook.replace('<sheets>', `<!--${'x'.repeat(5 * 1024 * 1024)}--><sheets>`))
+        })
+
+        const r = await extractAttachment({ content: padded, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Sheet ===\ns1r1\t1\ns1r2\t2', truncated: false })
+    })
+
     // parseWorkbookParts uses saxes with namespaces enabled, whose prefix resolution scans every
     // open tag. The depth guard must make this fallback quickly; without it 20k nested elements take
     // several seconds synchronously and the handler timeout cannot fire while the event loop is held.
@@ -2937,6 +2986,22 @@ describe('attachment — the rebuild cannot amplify what the budget measured', (
         end.writeUInt32LE(offset, 16)
         return Buffer.concat([...locals, directory, end])
     }
+
+    it('matches Mammoth by selecting the last duplicate DOCX main part', async () => {
+        const document = (value: string) =>
+            buf(
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' +
+                    `<w:p><w:r><w:t>${value}</w:t></w:r></w:p></w:body></w:document>`
+            )
+        const content = buildZip([
+            { name: '[Content_Types].xml', data: buf('<Types/>') },
+            { name: 'word/document.xml', data: document('FIRST') },
+            { name: 'word/document.xml', data: document('LAST') },
+        ])
+
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', extraction: 'LAST\n\n', truncated: false })
+    })
 
     // What checkDecompressionBudget counts: every central-directory record's uncompressed size, once.
     const budgetMeasures = (buf: Buffer) => {
