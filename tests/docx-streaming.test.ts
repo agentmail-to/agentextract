@@ -668,6 +668,22 @@ describe('docx — the cap and the deadline stop the read', () => {
         expect(partial.extraction).toBe(whole.extraction!.slice(0, 6))
     })
 
+    it('does not emit a paragraph break after dropping that paragraph text at the cap', async () => {
+        const picture = (inner: string) =>
+            `<w:pict><v:shape><v:textbox><w:txbxContent>${inner}</w:txbxContent></v:textbox></v:shape></w:pict>`
+        const body =
+            `<w:p>${picture(
+                text('A'.repeat(20)) + picture(text('BOX')) + text('DROPPED')
+            )}</w:p>`
+        const whole = await extract(body, { maxOutputChars: 1_000 })
+        const partial = await extract(body, { maxOutputChars: 5 })
+
+        expect(whole.extraction).toBe('\n\nBOX\n\nAAAAAAAAAAAAAAAAAAAA\n\nDROPPED\n\n')
+        expect(partial).toMatchObject({ status: 'extracted', truncated: true })
+        expect(partial.extraction).toBeUndefined()
+        expect(whole.extraction!.startsWith(partial.extraction ?? '')).toBe(true)
+    })
+
     it('keeps table truncation before deferred picture text as a prefix', async () => {
         const cell = (value: string) => `<w:tc>${text(value)}</w:tc>`
         const table = `<w:tbl><w:tr>${cell('AAAA')}</w:tr><w:tr>${cell('BBBB')}</w:tr></w:tbl>`
@@ -855,6 +871,16 @@ describe('docx — archive-level reads', () => {
                 `${text('KEEP')}</w:tc></w:tr></w:tbl>`
         )
         expect(r.extraction).toBe('KEEP\n\n')
+    })
+
+    it('drops a nested table inside tcPr before it can replace the enclosing table state', async () => {
+        const nested = `<w:tbl><w:tr><w:tc>${text('LEAK')}</w:tc></w:tr></w:tbl>`
+        const body =
+            `<w:tbl><w:tr><w:tc><w:tcPr>${nested}</w:tcPr>${text('CELL')}</w:tc></w:tr></w:tbl>` +
+            text('AFTER')
+        const r = await extract(body)
+
+        expect(r.extraction).toBe('CELL\n\nAFTER\n\n')
     })
 
     it('does not let a row nested inside a cell mutate the enclosing table state', async () => {

@@ -455,7 +455,7 @@ interface ExcelXmlScan {
     booleanCells: Set<string>
     inlineCells?: Map<string, string>
     write: (chunk: string) => void
-    complete: () => boolean
+    complete: (allowRootless?: boolean) => boolean
 }
 
 const createXmlScan = (): ExcelXmlScan => {
@@ -555,7 +555,11 @@ const createXmlScan = (): ExcelXmlScan => {
         }
     }
 
-    return { booleanCells, write, complete: () => mode === 'text' && rootClosed && depth === 0 }
+    return {
+        booleanCells,
+        write,
+        complete: (allowRootless = false) => mode === 'text' && depth === 0 && (rootClosed || allowRootless),
+    }
 }
 
 const isExcelDateFormat = (format?: string): boolean =>
@@ -606,7 +610,7 @@ const xlsxHandler: Handler = {
         if (!rewritten.ok) throw new Error(rewritten.reason)
         // The workbook's worksheets, in tab order — see SHEET IDENTITY. Both the names below and the
         // backstop's count read off this rather than off the archive or the reader.
-        const { content: ordered, sheets: resolved } = rewritten
+        const { content: ordered, sheets: resolved, hadSharedStrings } = rewritten
         const reader = new ExcelJS.stream.xlsx.WorkbookReader(Readable.from(ordered), {
             worksheets: 'emit',
             sharedStrings: 'cache', // the only mode that resolves t="s" cells to their text
@@ -629,7 +633,7 @@ const xlsxHandler: Handler = {
         }
         let truncated = false
         const booleanCellLimit = 2 * maxOutputChars + 1_024
-        const decodeEntry = (entry: ExcelXmlEntry, guardDepth = true): ExcelXmlEntry => {
+        const decodeEntry = (entry: ExcelXmlEntry, guardDepth = true, allowRootless = false): ExcelXmlEntry => {
             entry.setEncoding('utf8') // Node streams use StringDecoder internally across chunks.
             if (!guardDepth) return entry
             const scan = createXmlScan()
@@ -646,7 +650,7 @@ const xlsxHandler: Handler = {
                     done(null, chunk)
                 },
                 flush(done) {
-                    if (!scan.complete()) {
+                    if (!scan.complete(allowRootless)) {
                         done(new Error('unclosed XLSX control XML'))
                         return
                     }
@@ -691,7 +695,7 @@ const xlsxHandler: Handler = {
         const parseSharedStrings = hook('_parseSharedStrings')
         internal._parseSharedStrings = (entry) => parseSharedStrings(decodeEntry(entry))
         const parseStyles = hook('_parseStyles')
-        internal._parseStyles = (entry) => parseStyles(decodeEntry(entry))
+        internal._parseStyles = (entry) => parseStyles(decodeEntry(entry, true, true))
         const worksheetScans: ExcelXmlScan[] = []
         const createWorksheetScan = (): ExcelXmlScan => {
             const base = createXmlScan()
@@ -733,6 +737,9 @@ const xlsxHandler: Handler = {
                 if (isCell && cell === undefined) {
                     const address = tag.attributes.r?.value ?? ''
                     const type = tag.attributes.t?.value
+                    if (type === 's' && !hadSharedStrings) {
+                        throw new Error('xlsx cell references a missing shared-string table')
+                    }
                     cell = {
                         depth: open.length,
                         address,
@@ -1309,8 +1316,9 @@ const XLSX_READER_CONTROL_PARTS = new Set(XLSX_CANONICAL_CONTROL_PARTS.keys())
 
 // A workbook with no strings has no xl/sharedStrings.xml, so this.sharedStrings is never set and
 // ordering alone cannot lift it out of the spool branch (measured: 35 of 50 reads dropped sheets).
-// Injecting an empty table sets the flag and changes no cell — a workbook omitting the part has no
-// `t="s"` cell to resolve through it. Handed to the reader only, never written back.
+// Injecting an empty table sets the flag and changes no valid cell. The worksheet companion rejects
+// any `t="s"` reference when the original archive omitted this part; otherwise ExcelJS can silently
+// erase values and even whole row-only sheets. Handed to the reader only, never written back.
 const EMPTY_SHARED_STRINGS = Buffer.from(
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
         '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>',
@@ -1625,6 +1633,7 @@ const metadataFallbackWorksheets = async (
     const relationshipCandidates = new Set<string>()
     const contentTypeCandidates = new Set<string>()
     const worksheetExtensions = new Set<string>()
+    const overriddenParts = new Set<string>()
     let contentTypesKnown = false
 
     if (relsXml !== undefined) {
@@ -1658,16 +1667,18 @@ const metadataFallbackWorksheets = async (
             assertXmlDepth(++depth)
             if (tag.uri !== CONTENT_TYPES_NS) return
             const contentType = tag.attributes.ContentType?.value?.trim().toLowerCase()
-            if (!contentType || !WORKSHEET_CONTENT_TYPE.has(contentType)) return
             if (tag.local === 'Override') {
                 const name = tag.attributes.PartName?.value
                 if (!name) return
                 try {
-                    contentTypeCandidates.add(asciiFold(decodeURIComponent(name).replace(/^\/+/, '')))
+                    const part = asciiFold(decodeURIComponent(name).replace(/^\/+/, ''))
+                    overriddenParts.add(part)
+                    if (contentType && WORKSHEET_CONTENT_TYPE.has(contentType)) contentTypeCandidates.add(part)
                 } catch {
                     // Ignore only this malformed declaration.
                 }
             } else if (tag.local === 'Default') {
+                if (!contentType || !WORKSHEET_CONTENT_TYPE.has(contentType)) return
                 const extension = tag.attributes.Extension?.value?.replace(/^\./, '')
                 if (extension) worksheetExtensions.add(asciiFold(extension))
             }
@@ -1679,6 +1690,7 @@ const metadataFallbackWorksheets = async (
         } catch {
             contentTypeCandidates.clear()
             worksheetExtensions.clear()
+            overriddenParts.clear()
         }
     }
 
@@ -1688,7 +1700,8 @@ const metadataFallbackWorksheets = async (
         const dot = name.lastIndexOf('.')
         const slash = name.lastIndexOf('/')
         const extension = dot > slash ? name.slice(dot + 1) : ''
-        const contentTyped = contentTypeCandidates.has(name) || worksheetExtensions.has(extension)
+        const contentTyped =
+            contentTypeCandidates.has(name) || (!overriddenParts.has(name) && worksheetExtensions.has(extension))
         if (
             contentTypeCandidates.has(name) ||
             (relationshipCandidates.has(name) && (!contentTypesKnown || contentTyped))
@@ -1868,7 +1881,9 @@ const archiveWorksheets = (entries: ZipEntry[]): WorkbookSheet[] =>
 // than falling back to the original bytes (see DECOMPRESSION BUDGET), and says WHICH refusal: a
 // directory we could not read and a rewrite we declined to produce are different facts, and only the
 // first is unreachable — the entry-count bail below has a test driving it.
-type Reorder = { ok: true; content: Buffer; sheets: WorkbookSheet[] } | { ok: false; reason: string }
+type Reorder =
+    | { ok: true; content: Buffer; sheets: WorkbookSheet[]; hadSharedStrings: boolean }
+    | { ok: false; reason: string }
 
 const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     const entries = zipEntries(buf)
@@ -1891,6 +1906,7 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
         }
         seenControls.add(folded)
     }
+    const hadSharedStrings = seenControls.has(asciiFold('xl/sharedStrings.xml'))
 
     // OPC part names compare ASCII-case-insensitively; exceljs's streaming dispatch does not. Give
     // the first case-variant control part its canonical name in the private copy, just as worksheets
@@ -2015,7 +2031,7 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     end.writeUInt16LE(ordered.length, 10)
     end.writeUInt32LE(directory.length, 12)
     end.writeUInt32LE(offset, 16)
-    return { ok: true, content: Buffer.concat([...locals, directory, end]), sheets }
+    return { ok: true, content: Buffer.concat([...locals, directory, end]), sheets, hadSharedStrings }
 }
 
 /////////////////////////////////////////////////////////////
@@ -2180,6 +2196,8 @@ interface DocxFrame {
     claimedExtra: string
     allValue?: string
     orphanPicture?: boolean
+    discardedValue?: boolean
+    capCrossedBeforeDeferredExtra?: boolean
 }
 
 interface DocxTableCell {
@@ -2283,9 +2301,16 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         if (discardTableText && (options.source === undefined || options.deferred)) return
         if (discardDeferredText && options.source === undefined) {
             // A nested picture may cross the cap before direct text that appears ahead of it after
-            // Mammoth hoists the picture. Retain fresh value only on frames that were ancestors of
-            // that exact picture at the crossing; later/sibling frames remain bounded away.
-            if (options.deferred || field !== 'value' || !deferredFreshFrames?.has(frame)) {
+            // Mammoth hoists the picture. Retain fresh value on frames that were ancestors of that
+            // exact picture, plus direct paragraph text parsed after the picture closes but before
+            // its enclosing paragraph closes. That direct text also sorts before the picture.
+            const directParagraphPrefix =
+                frame.kind === 'paragraph' &&
+                drainUntil?.kind === 'paragraph' &&
+                frames.includes(drainUntil) &&
+                !frames.some((candidate) => candidate.kind === 'picture')
+            if (options.deferred || field !== 'value' || (!deferredFreshFrames?.has(frame) && !directParagraphPrefix)) {
+                if (field === 'value' && text.length > 0) frame.discardedValue = true
                 return
             }
         }
@@ -2319,6 +2344,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
                 const outerPicture = frames.findIndex((frame) => frame.kind === 'picture')
                 if (outerPicture > 0) {
                     const innerPicture = frames.findLastIndex((frame) => frame.kind === 'picture')
+                    frames[innerPicture].capCrossedBeforeDeferredExtra = true
                     deferredFreshFrames = new Set(frames.slice(0, innerPicture))
                     drainUntil = [...frames.slice(0, outerPicture)]
                         .reverse()
@@ -2340,6 +2366,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         const outerPicture = frames.findIndex((frame) => frame.kind === 'picture')
         if (outerPicture > 0) {
             const innerPicture = frames.findLastIndex((frame) => frame.kind === 'picture')
+            frames[innerPicture].capCrossedBeforeDeferredExtra = true
             deferredFreshFrames = new Set(frames.slice(0, innerPicture))
             drainUntil = [...frames.slice(0, outerPicture)].reverse().find((frame) => frame.kind === 'paragraph')
             // Picture text is deferred until after the enclosing paragraph. Once it crosses the
@@ -2517,6 +2544,21 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             }
         }
 
+        const enclosingCell = openTable?.cell
+        if (
+            enclosingCell?.tcPrDepth !== undefined &&
+            stack.length === enclosingCell.tcPrDepth + 1 &&
+            parent === 'w:tcPr' &&
+            name !== 'w:gridSpan' &&
+            name !== 'w:vMerge'
+        ) {
+            // Test against the enclosing table captured before any structural branch can push a
+            // nested table and replace currentTable(). tcPr is metadata-only; every direct child
+            // except the two properties above is dropped with its entire subtree.
+            skip = stack.length - 1
+            return
+        }
+
         if (name === 'w:tbl') {
             const frame: DocxFrame = { kind: 'table', value: '', allValue: '', extra: '', claimedExtra: '' }
             top = frame
@@ -2588,18 +2630,6 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             return
         }
 
-        const activeTableCell = currentTable()?.cell
-        if (
-            activeTableCell?.tcPrDepth !== undefined &&
-            stack.length === activeTableCell.tcPrDepth + 1 &&
-            parent === 'w:tcPr'
-        ) {
-            // Mammoth reads gridSpan/vMerge from tcPr as metadata, then drops that element as an
-            // ignored subtree. No other child — including a malformed w:t — contributes text.
-            skip = stack.length - 1
-            return
-        }
-
         // w:t is the ONE text-bearing element; the text handler recognizes it off the stack top, so
         // it needs no flag of its own. Deliberately before the container test, so its children —
         // illegal anyway — fall through to the drop below exactly as they do in mammoth.
@@ -2614,6 +2644,19 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         }
 
         if (name === 'w:p' || name === 'w:pict') {
+            if (name === 'w:pict') {
+                // A picture opened after an enclosing picture crossed the cap will be hoisted
+                // ahead of that enclosing picture's retained value. Since fresh deferred text is
+                // no longer accepted, emitting the retained value alone would create a hole.
+                for (const [index, frame] of frames.entries()) {
+                    const hasOpenParagraph = frames
+                        .slice(index + 1)
+                        .some((candidate) => candidate.kind === 'paragraph')
+                    if (frame.kind === 'picture' && frame.capCrossedBeforeDeferredExtra && !hasOpenParagraph) {
+                        frame.discardedValue = true
+                    }
+                }
+            }
             const claimedValue = name === 'w:p' ? pendingDeleted.value : ''
             const claimedExtra = name === 'w:p' ? pendingDeleted.extra : ''
             const claimedChars = name === 'w:p' ? pendingDeleted.chars : 0
@@ -2750,7 +2793,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             // already carried. It reaches the output only if some ancestor w:p reinserts it.
             // These strings were retained before the cap crossed; moving them upward does not add
             // new deferred content, and keeps the useful prefix of the first text box.
-            if (!frame.orphanPicture) {
+            if (!frame.orphanPicture && !frame.discardedValue) {
                 append(top, 'extra', frame.extra, { source: frame, deferred: true })
                 append(top, 'extra', frame.value, { source: frame, deferred: true })
             }
@@ -2773,11 +2816,17 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
                     chars: deferredChars,
                 }
             } else {
-                append(top, 'value', frame.value, { source: frame })
-                append(top, 'value', '\n\n', discardDeferredText ? { source: frame } : undefined)
-                append(top, 'value', frame.claimedExtra, { source: frame, deferred: true })
-                append(top, 'value', frame.extra, { source: frame, deferred: true })
-                charge(2)
+                // Once direct paragraph text was discarded, its break and extras are later in
+                // document order and cannot be emitted. Nor can its retained value: a nested
+                // picture parsed later may be hoisted ahead of that value, so exposing the value
+                // alone would still create a hole. Earlier completed paragraphs remain available.
+                if (!frame.discardedValue) {
+                    append(top, 'value', frame.value, { source: frame })
+                    append(top, 'value', '\n\n', discardDeferredText ? { source: frame } : undefined)
+                    append(top, 'value', frame.claimedExtra, { source: frame, deferred: true })
+                    append(top, 'value', frame.extra, { source: frame, deferred: true })
+                    charge(2)
+                }
             }
         }
 

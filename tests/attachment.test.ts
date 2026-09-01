@@ -707,6 +707,39 @@ describe('attachment — xlsx handler', () => {
         expect(r.extraction).toContain('Ada Lovelace')
     })
 
+    it.each([
+        ['empty', ''],
+        ['declaration-only', '<?xml version="1.0"?>'],
+        ['comment-only', '<!-- optional styles omitted -->'],
+    ])('accepts an %s styles part without losing worksheet rows', async (_label, styles) => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Styles').addRow(['KEEP'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        zip.file('xl/styles.xml', styles)
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Styles ===\nKEEP', truncated: false })
+    })
+
+    it('fails explicitly when cells reference a missing shared-string table', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('S').addRow(['Alpha', 42])
+        workbook.addWorksheet('T').addRow(['Beta'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        zip.remove('xl/sharedStrings.xml')
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.extraction).toBeUndefined()
+        expect(r.reason).toMatch(/missing shared-string table/i)
+    })
+
     // A formula cell must extract its computed VALUE, not the "=SUM(...)" formula string.
     it('extracts the computed value of a formula, not the formula text', async () => {
         const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
@@ -2918,6 +2951,40 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
 
         const r = await extractAttachment({ content: padded, contentType: XLSX_TYPE })
         expect(r).toMatchObject({ status: 'extracted', extraction: '=== Sheet ===\ns1r1\t1\ns1r2\t2', truncated: false })
+    })
+
+    it('keeps an Override from inheriting a worksheet Default in metadata fallback', async () => {
+        const content = await rebuild(await workbookWith(1, 1), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/custom/data.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', 'custom/data.xml'))
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file(
+                '[Content_Types].xml',
+                types
+                    .replace(
+                        'Extension="xml" ContentType="application/xml"',
+                        'Extension="xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"'
+                    )
+                    .replace('/xl/worksheets/sheet1.xml', '/xl/custom/data.xml')
+                    .replace(
+                        'PartName="/xl/custom/data.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"',
+                        'PartName="/xl/custom/data.xml" ContentType="application/xml"'
+                    )
+            )
+            const workbook = await part(zip, 'xl/workbook.xml')
+            zip.file('xl/workbook.xml', workbook.replace('<sheets>', `<!--${'x'.repeat(5 * 1024 * 1024)}--><sheets>`))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('failed')
+        expect(r.extraction).toBeUndefined()
+        expect(r.reason).toMatch(/no worksheet parts could be identified/i)
     })
 
     // parseWorkbookParts uses saxes with namespaces enabled, whose prefix resolution scans every
