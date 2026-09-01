@@ -724,6 +724,118 @@ describe('attachment — xlsx handler', () => {
         expect(r).toMatchObject({ status: 'extracted', extraction: '=== Styles ===\nKEEP', truncated: false })
     })
 
+    it('accepts an empty optional shared-string part when no cell references it', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Numbers').addRow([42])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        zip.file('xl/sharedStrings.xml', '')
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Numbers ===\n42', truncated: false })
+    })
+
+    it('keeps an explicitly empty shared-string cell in its row position', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Shared').addRow(['A', 'B', 'C'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const shared = await zip.file('xl/sharedStrings.xml')!.async('string')
+        zip.file('xl/sharedStrings.xml', shared.replace('<t>B</t>', '<t></t>'))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Shared ===\nA\t\tC', truncated: false })
+    })
+
+    it('does not revive blank rows or trailing columns from empty shared strings', async () => {
+        const blank = new ExcelJS.Workbook()
+        const blankSheet = blank.addWorksheet('Blank')
+        blankSheet.addRow(['A', 'B'])
+        blankSheet.addRow(['A', 'B'])
+        const blankZip = await JSZip.loadAsync(await blank.xlsx.writeBuffer())
+        const shared = await blankZip.file('xl/sharedStrings.xml')!.async('string')
+        blankZip.file('xl/sharedStrings.xml', shared.replace(/<t>[AB]<\/t>/g, '<t></t>'))
+        const blankResult = await extractAttachment({
+            content: await blankZip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(blankResult).toMatchObject({ status: 'extracted', truncated: false })
+        expect(blankResult.extraction).toBeUndefined()
+
+        const trailing = new ExcelJS.Workbook()
+        trailing.addWorksheet('Trailing').addRow(['KEEP', 'DROP'])
+        const trailingZip = await JSZip.loadAsync(await trailing.xlsx.writeBuffer())
+        const trailingShared = await trailingZip.file('xl/sharedStrings.xml')!.async('string')
+        trailingZip.file('xl/sharedStrings.xml', trailingShared.replace('<t>DROP</t>', '<t></t>'))
+        const trailingResult = await extractAttachment({
+            content: await trailingZip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(trailingResult).toMatchObject({
+            status: 'extracted',
+            extraction: '=== Trailing ===\nKEEP',
+            truncated: false,
+        })
+    })
+
+    it('matches ExcelJS decimal parseInt semantics for shared-string indexes', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Indexes').addRow(['ZERO', 'ONE', 'TWO', 'THREE'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const sheet = await zip.file('xl/worksheets/sheet1.xml')!.async('string')
+        zip.file(
+            'xl/worksheets/sheet1.xml',
+            sheet
+                .replace('<c r="A1" t="s"><v>0</v></c>', '<c r="A1" t="s"><v>1e3</v></c>')
+                .replace('<c r="B1" t="s"><v>1</v></c>', '<c r="B1" t="s"><v>1.5</v></c>')
+                .replace('<c r="C1" t="s"><v>2</v></c>', '<c r="C1" t="s"><v>1abc</v></c>')
+                .replace('<c r="D1" t="s"><v>3</v></c>', '<c r="D1" t="s"><v>0x10</v></c>')
+        )
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({
+            status: 'extracted',
+            extraction: '=== Indexes ===\nONE\tONE\tONE\tZERO',
+            truncated: false,
+        })
+    })
+
+    it('ignores a shared-string cell with no index instead of treating it as index zero', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Missing index').addRow(['ZERO', 42])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const sheet = await zip.file('xl/worksheets/sheet1.xml')!.async('string')
+        zip.file('xl/worksheets/sheet1.xml', sheet.replace('<c r="A1" t="s"><v>0</v></c>', '<c r="A1" t="s"/>'))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Missing index ===\n42', truncated: false })
+    })
+
+    it('bounds a hostile shared-string index instead of accumulating its digits', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Index').addRow(['VALUE'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const sheet = await zip.file('xl/worksheets/sheet1.xml')!.async('string')
+        zip.file('xl/worksheets/sheet1.xml', sheet.replace('<v>0</v>', `<v>${'9'.repeat(100_000)}</v>`))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/shared-string index exceeds/i)
+    })
+
     it('fails explicitly when cells reference a missing shared-string table', async () => {
         const workbook = new ExcelJS.Workbook()
         workbook.addWorksheet('S').addRow(['Alpha', 42])
@@ -2985,6 +3097,24 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         expect(r.status).toBe('failed')
         expect(r.extraction).toBeUndefined()
         expect(r.reason).toMatch(/no worksheet parts could be identified/i)
+    })
+
+    it('resolves escaped OPC worksheet paths without decoding them away from the ZIP item', async () => {
+        const content = await rebuild(await workbookWith(1, 1), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/worksheets/custom%20sheet.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', 'worksheets/custom%20sheet.xml'))
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file('[Content_Types].xml', types.replace('/xl/worksheets/sheet1.xml', '/xl/worksheets/custom%20sheet.xml'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== S1 ===\ns1r1\t1', truncated: false })
     })
 
     // parseWorkbookParts uses saxes with namespaces enabled, whose prefix resolution scans every

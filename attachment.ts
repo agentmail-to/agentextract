@@ -348,7 +348,7 @@ const docxHandler: Handler = {
         // JSZip (and therefore Mammoth's previous reader) resolves duplicate names to the final
         // central-directory record. Preserve that compatibility rather than silently switching the
         // extracted document when an ambiguous archive reaches this lower-level ZIP reader.
-        const part = entries.findLast((entry) => asciiFold(entry.name) === DOCX_MAIN_PART)
+        const part = entries.findLast((entry) => opcKey(entry.name) === DOCX_MAIN_PART)
         if (!part) throw new Error(`docx archive has no ${DOCX_MAIN_PART} entry`)
 
         const reader = await createDocxReader(maxOutputChars)
@@ -429,6 +429,7 @@ interface StreamedCell {
 }
 
 interface StreamedRow {
+    number?: number
     eachCell: (options: { includeEmpty: boolean }, callback: (cell: StreamedCell) => void) => void
 }
 
@@ -438,6 +439,7 @@ interface ExcelXmlEntry {
     pipe: (destination: ExcelXmlEntry) => ExcelXmlEntry
 }
 interface ExcelJsInternalReader {
+    sharedStrings?: unknown[]
     _parseRels?: (entry: ExcelXmlEntry) => Promise<void>
     _parseWorkbook?: (entry: ExcelXmlEntry) => Promise<void>
     _parseSharedStrings?: (entry: ExcelXmlEntry) => AsyncIterable<unknown>
@@ -454,6 +456,7 @@ interface ExcelJsInternalReader {
 interface ExcelXmlScan {
     booleanCells: Set<string>
     inlineCells?: Map<string, string>
+    emptySharedCells?: Map<number, Set<number>>
     write: (chunk: string) => void
     complete: (allowRootless?: boolean) => boolean
 }
@@ -588,6 +591,15 @@ const excelFormulaText = (cell: StreamedCell, booleanCells: Set<string>): string
     return formula?.text ?? cell.text ?? ''
 }
 
+const excelCellPosition = (address: string): { row: number; column: number } | undefined => {
+    const match = /^([A-Za-z]+)(\d+)$/.exec(address)
+    if (!match) return undefined
+    let column = 0
+    for (const char of match[1].toUpperCase()) column = column * 26 + char.charCodeAt(0) - 64
+    const row = Number(match[2])
+    return Number.isSafeInteger(row) && row > 0 ? { row, column } : undefined
+}
+
 // XLSX — modern Excel. Each sheet flattened to text for search/indexing.
 const xlsxHandler: Handler = {
     kind: 'xlsx',
@@ -610,7 +622,7 @@ const xlsxHandler: Handler = {
         if (!rewritten.ok) throw new Error(rewritten.reason)
         // The workbook's worksheets, in tab order — see SHEET IDENTITY. Both the names below and the
         // backstop's count read off this rather than off the archive or the reader.
-        const { content: ordered, sheets: resolved, hadSharedStrings } = rewritten
+        const { content: ordered, sheets: resolved } = rewritten
         const reader = new ExcelJS.stream.xlsx.WorkbookReader(Readable.from(ordered), {
             worksheets: 'emit',
             sharedStrings: 'cache', // the only mode that resolves t="s" cells to their text
@@ -693,7 +705,7 @@ const xlsxHandler: Handler = {
         const parseWorkbook = hook('_parseWorkbook')
         internal._parseWorkbook = (entry) => parseWorkbook(decodeEntry(entry, false))
         const parseSharedStrings = hook('_parseSharedStrings')
-        internal._parseSharedStrings = (entry) => parseSharedStrings(decodeEntry(entry))
+        internal._parseSharedStrings = (entry) => parseSharedStrings(decodeEntry(entry, true, true))
         const parseStyles = hook('_parseStyles')
         internal._parseStyles = (entry) => parseStyles(decodeEntry(entry, true, true))
         const worksheetScans: ExcelXmlScan[] = []
@@ -701,6 +713,8 @@ const xlsxHandler: Handler = {
             const base = createXmlScan()
             const booleanCells = new Set<string>()
             const inlineCells = new Map<string, string>()
+            const emptySharedCells = new Map<number, Set<number>>()
+            let emptySharedCount = 0
             // Keep only enough scan-order metadata to produce the capped output. The extra 1,024
             // cells in booleanCellLimit cover sparse/empty inline strings without making this map
             // grow with worksheet size.
@@ -712,8 +726,13 @@ const xlsxHandler: Handler = {
                       depth: number
                       address: string
                       inline: boolean
+                      shared: boolean
                       text: string
                       textDepth?: number
+                      sharedIndexState: 'leading' | 'sign' | 'digits' | 'done' | 'invalid' | 'overflow'
+                      sharedIndexValue: number
+                      sharedIndexSign: 1 | -1
+                      valueDepth?: number
                   }
                 | undefined
             const inline = new SaxesParser({
@@ -737,17 +756,23 @@ const xlsxHandler: Handler = {
                 if (isCell && cell === undefined) {
                     const address = tag.attributes.r?.value ?? ''
                     const type = tag.attributes.t?.value
-                    if (type === 's' && !hadSharedStrings) {
-                        throw new Error('xlsx cell references a missing shared-string table')
-                    }
                     cell = {
                         depth: open.length,
                         address,
                         inline: type === 'inlineStr',
+                        shared: type === 's',
                         text: '',
+                        sharedIndexState: 'leading',
+                        sharedIndexValue: 0,
+                        sharedIndexSign: 1,
                     }
                     if (type === 'b' && address !== '' && booleanCells.size < booleanCellLimit) {
                         booleanCells.add(address)
+                    }
+                } else if (cell?.shared && SPREADSHEETML_NS.has(tag.uri) && tag.local === 'v') {
+                    const cellElement = open[cell.depth - 1]
+                    if (open.length === cell.depth + 1 && isSpreadsheet(cellElement, 'c')) {
+                        cell.valueDepth = open.length
                     }
                 } else if (cell?.inline && SPREADSHEETML_NS.has(tag.uri) && tag.local === 't') {
                     const cellElement = open[cell.depth - 1]
@@ -768,8 +793,57 @@ const xlsxHandler: Handler = {
                 const room = inlineTextLimit - inlineChars - cell.text.length
                 if (room > 0) cell.text += text.slice(0, room)
             }
-            inline.on('text', appendInline)
-            inline.on('cdata', appendInline)
+            const appendSharedIndex = (text: string): void => {
+                if (!cell?.shared || cell.valueDepth !== open.length) return
+                for (const char of text) {
+                    if (
+                        cell.sharedIndexState === 'done' ||
+                        cell.sharedIndexState === 'invalid' ||
+                        cell.sharedIndexState === 'overflow'
+                    ) {
+                        return
+                    }
+                    if (cell.sharedIndexState === 'leading') {
+                        if (/\s/u.test(char)) continue
+                        if (char === '+' || char === '-') {
+                            cell.sharedIndexSign = char === '-' ? -1 : 1
+                            cell.sharedIndexState = 'sign'
+                            continue
+                        }
+                        if (char < '0' || char > '9') {
+                            cell.sharedIndexState = 'invalid'
+                            return
+                        }
+                        cell.sharedIndexState = 'digits'
+                    } else if (cell.sharedIndexState === 'sign') {
+                        if (char < '0' || char > '9') {
+                            cell.sharedIndexState = 'invalid'
+                            return
+                        }
+                        cell.sharedIndexState = 'digits'
+                    } else if (char < '0' || char > '9') {
+                        // parseInt stops at the first non-decimal character: 1e3, 1.5 and 1abc
+                        // all mean index 1, while 0x10 means index 0 under radix 10.
+                        cell.sharedIndexState = 'done'
+                        return
+                    }
+                    cell.sharedIndexValue = cell.sharedIndexValue * 10 + char.charCodeAt(0) - 48
+                    if (cell.sharedIndexValue > 10_000_000) {
+                        // The decompression ceiling cannot hold this many <si> records. Stop reading
+                        // digits now rather than retaining an attacker-sized value string.
+                        cell.sharedIndexState = 'overflow'
+                        return
+                    }
+                }
+            }
+            inline.on('text', (text) => {
+                appendInline(text)
+                appendSharedIndex(text)
+            })
+            inline.on('cdata', (text) => {
+                appendInline(text)
+                appendSharedIndex(text)
+            })
             inline.on('closetag', (tag) => {
                 if (
                     cell?.textDepth === open.length &&
@@ -777,6 +851,13 @@ const xlsxHandler: Handler = {
                     tag.local === 't'
                 ) {
                     cell.textDepth = undefined
+                }
+                if (
+                    cell?.valueDepth === open.length &&
+                    SPREADSHEETML_NS.has(tag.uri) &&
+                    tag.local === 'v'
+                ) {
+                    cell.valueDepth = undefined
                 }
                 if (
                     cell?.depth === open.length &&
@@ -792,6 +873,26 @@ const xlsxHandler: Handler = {
                         inlineCells.set(cell.address, cell.text)
                         inlineChars += cell.text.length
                     }
+                    if (cell.shared) {
+                        const hasIndex = cell.sharedIndexState === 'digits' || cell.sharedIndexState === 'done'
+                        const index = cell.sharedIndexSign * cell.sharedIndexValue
+                        const sharedStrings = internal.sharedStrings ?? []
+                        if (cell.sharedIndexState === 'overflow') {
+                            throw new Error('xlsx shared-string index exceeds the supported range')
+                        }
+                        if (hasIndex && (index < 0 || index >= sharedStrings.length)) {
+                            throw new Error('xlsx cell references a missing shared-string table')
+                        }
+                        if (hasIndex && sharedStrings[index] == null) {
+                            const position = excelCellPosition(cell.address)
+                            if (position && emptySharedCount < inlineTextLimit) {
+                                const columns = emptySharedCells.get(position.row) ?? new Set<number>()
+                                if (!columns.has(position.column)) emptySharedCount++
+                                columns.add(position.column)
+                                emptySharedCells.set(position.row, columns)
+                            }
+                        }
+                    }
                     cell = undefined
                 }
                 open.pop()
@@ -799,6 +900,7 @@ const xlsxHandler: Handler = {
             return {
                 booleanCells,
                 inlineCells,
+                emptySharedCells,
                 write: (chunk) => {
                     base.write(chunk)
                     inline.write(chunk)
@@ -855,16 +957,37 @@ const xlsxHandler: Handler = {
                     // preserve that behavior instead of turning one stray extension element into
                     // total extraction failure.
                     if (!row) continue
-                    const cells: string[] = []
+                    const cells: { column: number; text: string }[] = []
+                    const seenColumns = new Set<number>()
                     // cell.text = the shown value (formula result, formatted date), not the raw formula.
                     row.eachCell({ includeEmpty: false }, (cell) => {
                         const inline = worksheetScan?.inlineCells?.get(cell.address)
                         if (inline !== undefined) worksheetScan?.inlineCells?.delete(cell.address)
-                        cells.push(inline ?? excelFormulaText(cell, booleanCells))
+                        const position = excelCellPosition(cell.address)
+                        const column = position?.column ?? cells.length + 1
+                        seenColumns.add(column)
+                        cells.push({ column, text: inline ?? excelFormulaText(cell, booleanCells) })
                     })
+                    const rowNumber = row.number
+                    const emptyShared = rowNumber === undefined ? undefined : worksheetScan?.emptySharedCells?.get(rowNumber)
+                    // An explicit empty shared string matters only as a separator between real
+                    // cells. Blank-only rows stay absent, and leading/trailing placeholders do not
+                    // manufacture whitespace-only output or consume the cap.
+                    if (emptyShared && rowNumber !== undefined && cells.length > 1) {
+                        const columns = cells.map((cell) => cell.column)
+                        const first = Math.min(...columns)
+                        const last = Math.max(...columns)
+                        for (const column of emptyShared) {
+                            if (column > first && column < last && !seenColumns.has(column)) {
+                                cells.push({ column, text: '' })
+                            }
+                        }
+                        worksheetScan?.emptySharedCells?.delete(rowNumber)
+                    }
                     // Drop empty cells/rows so a sparse sheet doesn't flatten into runs of empty tabs.
                     if (cells.length === 0) continue
-                    const line = cells.join('\t')
+                    cells.sort((a, b) => a.column - b.column)
+                    const line = cells.map((cell) => cell.text).join('\t')
                     length +=
                         rows.length === 0
                             ? (sheets.length === 0 ? 0 : 2) + header.length + line.length
@@ -879,6 +1002,7 @@ const xlsxHandler: Handler = {
             }
             worksheetScan?.booleanCells.clear()
             worksheetScan?.inlineCells?.clear()
+            worksheetScan?.emptySharedCells?.clear()
             // Positional, and sound because the rebuild laid out exactly `resolved` and nothing else
             // this reader dispatches as a worksheet, in this order. Reading worksheet.name instead is
             // what produced "Sheet1" for a legal absolute rel Target: exceljs matches rel.Target
@@ -994,7 +1118,7 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
     // scan gets fooled by storage order, while a root-entry match doesn't.
     const names = zipEntryNames(content)
     if (names) {
-        const folded = new Set(names.map(asciiFold))
+        const folded = new Set(names.flatMap((name) => opcKey(name) ?? []))
         const hasDocx = folded.has('word/document.xml')
         const hasXlsx = folded.has('xl/workbook.xml')
         if (hasDocx) return 'docx' // a real word/document.xml root part wins (docx may embed a workbook)
@@ -1311,6 +1435,35 @@ const XLSX_LEADING_ENTRIES = [
 // merges distinct legal names such as Ä.xml and ä.xml, so it cannot be used for any OPC identity.
 const asciiFold = (value: string): string => value.replace(/[A-Z]/g, (char) => char.toLowerCase())
 
+// OPC part names are URI paths, and the ZIP item name is that canonical escaped path without its
+// leading slash. Decode only percent-encoded UNRESERVED ASCII (the URI-equivalent spellings); keep
+// escapes such as %20 and %2F as part of the item name. URL supplies dot-segment resolution and
+// escapes raw spaces/non-ASCII consistently for relationships, content types, and ZIP entries.
+const canonicalOpcPartName = (value: string, base = ''): string | undefined => {
+    const trimmed = value.trim()
+    if (trimmed === '' || trimmed.includes('\\')) return undefined
+    try {
+        const root = new URL('https://agentextract.invalid/')
+        const baseUrl = new URL(base, root)
+        const resolved = new URL(trimmed, baseUrl)
+        if (resolved.origin !== root.origin || resolved.search !== '' || resolved.hash !== '') return undefined
+        const path = resolved.pathname
+            .slice(1)
+            .replace(/%([0-9a-f]{2})/gi, (escape, hex: string) => {
+                const char = String.fromCharCode(Number.parseInt(hex, 16))
+                return /^[A-Za-z0-9._~-]$/.test(char) ? char : escape.toUpperCase()
+            })
+        return path === '' ? undefined : path
+    } catch {
+        return undefined
+    }
+}
+
+const opcKey = (value: string, base = ''): string | undefined => {
+    const canonical = canonicalOpcPartName(value, base)
+    return canonical === undefined ? undefined : asciiFold(canonical)
+}
+
 const XLSX_CANONICAL_CONTROL_PARTS = new Map(XLSX_LEADING_ENTRIES.map((name) => [asciiFold(name), name]))
 const XLSX_READER_CONTROL_PARTS = new Set(XLSX_CANONICAL_CONTROL_PARTS.keys())
 
@@ -1349,7 +1502,10 @@ const ZIP_VERSION = 20 // 2.0 — the floor for deflate, which is all we re-emit
 // recognizes a stored xl/Worksheets/Sheet2.xml. The rebuild canonicalizes every resolved sheet before
 // exceljs sees it because exceljs's streaming dispatch below is case-sensitive.
 const WORKSHEET_PART = /^xl\/worksheets\/sheet\d+\.xml$/
-const isWorksheetPart = (name: string): boolean => WORKSHEET_PART.test(asciiFold(name))
+const isWorksheetPart = (name: string): boolean => {
+    const key = opcKey(name)
+    return key !== undefined && WORKSHEET_PART.test(key)
+}
 
 // What EXCELJS treats as a worksheet: the same shape, UNANCHORED (workbook-reader.js:311). So it
 // dispatches xl/worksheets/sheet1.xml.bak, or a copy nested under any prefix, where WORKSHEET_PART
@@ -1427,7 +1583,8 @@ const worksheetEntries = (entries: ZipEntry[]): ZipEntry[] => entries.filter((en
 
 // A worksheet part the workbook does not name. sheetN.xml's own number is the most stable label
 // available, and is what the reader's own fallback produced for these.
-const partFallbackName = (part: string): string => `Sheet${/(\d+)\.xml$/.exec(asciiFold(part))?.[1] ?? ''}`
+const partFallbackName = (part: string): string =>
+    `Sheet${/(\d+)\.xml$/.exec(asciiFold(canonicalOpcPartName(part) ?? part))?.[1] ?? ''}`
 
 // A ceiling on the two metadata parts, which is NOT the decompression budget. The budget bounds the
 // whole archive at 50 MB, and letting one part spend all of it here costs ~2x that in peak: the
@@ -1559,14 +1716,11 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
             if (tag.local === 'Override') {
                 const partName = tag.attributes.PartName?.value
                 if (!partName) return
-                try {
-                    const part = asciiFold(decodeURIComponent(partName).replace(/^\/+/, ''))
-                    overriddenParts.add(part)
-                    const contentType = tag.attributes.ContentType?.value?.trim().toLowerCase()
-                    if (contentType && WORKSHEET_CONTENT_TYPE.has(contentType)) worksheetParts.add(part)
-                } catch {
-                    // A malformed escape makes this declaration unusable, not the workbook unreadable.
-                }
+                const part = opcKey(partName)
+                if (part === undefined) return
+                overriddenParts.add(part)
+                const contentType = tag.attributes.ContentType?.value?.trim().toLowerCase()
+                if (contentType && WORKSHEET_CONTENT_TYPE.has(contentType)) worksheetParts.add(part)
             } else if (tag.local === 'Default') {
                 const contentType = tag.attributes.ContentType?.value?.trim().toLowerCase()
                 if (!contentType || !WORKSHEET_CONTENT_TYPE.has(contentType)) return
@@ -1596,27 +1750,7 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
 // or climb out with '..'. exceljs compares the raw string against one form and misses every other;
 // this maps all of them onto the archive's entry name. undefined = it escapes the package.
 const resolveRelTarget = (target: string): string | undefined => {
-    const trimmed = target.trim()
-    if (trimmed === '') return undefined
-    // OPC targets are URI references, so any character in one may legally be percent-encoded —
-    // "worksheets/sheet%32.xml" names sheet2.xml. Decoding is what matches those to the entry rather
-    // than missing it. A malformed escape throws; that target is simply unresolvable.
-    let decoded: string
-    try {
-        decoded = decodeURIComponent(trimmed)
-    } catch {
-        return undefined
-    }
-    const path: string[] = []
-    for (const segment of (decoded.startsWith('/') ? decoded.slice(1) : `xl/${decoded}`).split('/')) {
-        if (segment === '' || segment === '.') continue
-        if (segment === '..') {
-            if (path.pop() === undefined) return undefined
-            continue
-        }
-        path.push(segment)
-    }
-    return path.length > 0 ? path.join('/') : undefined
+    return canonicalOpcPartName(target, 'xl/')
 }
 
 // When workbook.xml or its relationships exceed the resolver's materialization ceiling, retain the
@@ -1629,7 +1763,12 @@ const metadataFallbackWorksheets = async (
     contentTypesXml?: Buffer
 ): Promise<WorkbookSheet[]> => {
     const { SaxesParser } = await import('saxes')
-    const candidateNames = new Set(worksheetEntries(entries).map((entry) => asciiFold(entry.name)))
+    const candidateNames = new Set(
+        worksheetEntries(entries).flatMap((entry) => {
+            const key = opcKey(entry.name)
+            return key === undefined ? [] : [key]
+        })
+    )
     const relationshipCandidates = new Set<string>()
     const contentTypeCandidates = new Set<string>()
     const worksheetExtensions = new Set<string>()
@@ -1670,13 +1809,10 @@ const metadataFallbackWorksheets = async (
             if (tag.local === 'Override') {
                 const name = tag.attributes.PartName?.value
                 if (!name) return
-                try {
-                    const part = asciiFold(decodeURIComponent(name).replace(/^\/+/, ''))
-                    overriddenParts.add(part)
-                    if (contentType && WORKSHEET_CONTENT_TYPE.has(contentType)) contentTypeCandidates.add(part)
-                } catch {
-                    // Ignore only this malformed declaration.
-                }
+                const part = opcKey(name)
+                if (part === undefined) return
+                overriddenParts.add(part)
+                if (contentType && WORKSHEET_CONTENT_TYPE.has(contentType)) contentTypeCandidates.add(part)
             } else if (tag.local === 'Default') {
                 if (!contentType || !WORKSHEET_CONTENT_TYPE.has(contentType)) return
                 const extension = tag.attributes.Extension?.value?.replace(/^\./, '')
@@ -1695,7 +1831,8 @@ const metadataFallbackWorksheets = async (
     }
 
     for (const entry of entries) {
-        const name = asciiFold(entry.name)
+        const name = opcKey(entry.name)
+        if (name === undefined) continue
         if (XLSX_READER_CONTROL_PARTS.has(name)) continue
         const dot = name.lastIndexOf('.')
         const slash = name.lastIndexOf('/')
@@ -1711,7 +1848,10 @@ const metadataFallbackWorksheets = async (
     }
 
     return entries
-        .filter((entry) => candidateNames.has(asciiFold(entry.name)))
+        .filter((entry) => {
+            const key = opcKey(entry.name)
+            return key !== undefined && candidateNames.has(key)
+        })
         .map((entry) => ({ entry, name: partFallbackName(entry.name) }))
 }
 
@@ -1723,8 +1863,8 @@ const metadataFallbackWorksheets = async (
 const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] | undefined> => {
     const metadata = new Map<string, ZipEntry>()
     for (const entry of entries) {
-        const folded = asciiFold(entry.name)
-        if (!metadata.has(folded)) metadata.set(folded, entry)
+        const key = opcKey(entry.name)
+        if (key !== undefined && !metadata.has(key)) metadata.set(key, entry)
     }
     const workbookEntry = entries.find((entry) => entry.name === WORKBOOK_PART) ?? metadata.get(asciiFold(WORKBOOK_PART))
     const relsEntry = entries.find((entry) => entry.name === WORKBOOK_RELS_PART) ?? metadata.get(asciiFold(WORKBOOK_RELS_PART))
@@ -1855,7 +1995,9 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
     const rescued = worksheets.filter(
         (entry) =>
             !placed.has(entry) &&
-            (hasUnplaced || placedNonConventional || claimedNames.has(asciiFold(entry.name)))
+            (hasUnplaced ||
+                placedNonConventional ||
+                claimedNames.has(opcKey(entry.name) ?? ''))
     )
     // Zero worksheets is a real answer for a chartsheet-only workbook — but only from a workbook that
     // told us something. A <sheets> we could not read one declaration out of is not that answer, and
@@ -1881,9 +2023,7 @@ const archiveWorksheets = (entries: ZipEntry[]): WorkbookSheet[] =>
 // than falling back to the original bytes (see DECOMPRESSION BUDGET), and says WHICH refusal: a
 // directory we could not read and a rewrite we declined to produce are different facts, and only the
 // first is unreachable — the entry-count bail below has a test driving it.
-type Reorder =
-    | { ok: true; content: Buffer; sheets: WorkbookSheet[]; hadSharedStrings: boolean }
-    | { ok: false; reason: string }
+type Reorder = { ok: true; content: Buffer; sheets: WorkbookSheet[] } | { ok: false; reason: string }
 
 const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     const entries = zipEntries(buf)
@@ -1898,7 +2038,8 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     // identity (ASCII case-folding), catching exact duplicates and case aliases alike.
     const seenControls = new Set<string>()
     for (const entry of entries) {
-        const folded = asciiFold(entry.name)
+        const folded = opcKey(entry.name)
+        if (folded === undefined) continue
         if (!XLSX_READER_CONTROL_PARTS.has(folded)) continue
         if (seenControls.has(folded)) {
             const canonical = XLSX_CANONICAL_CONTROL_PARTS.get(folded) ?? entry.name
@@ -1906,8 +2047,6 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
         }
         seenControls.add(folded)
     }
-    const hadSharedStrings = seenControls.has(asciiFold('xl/sharedStrings.xml'))
-
     // OPC part names compare ASCII-case-insensitively; exceljs's streaming dispatch does not. Give
     // the first case-variant control part its canonical name in the private copy, just as worksheets
     // below are canonicalized. If an exact spelling already exists, leave any invalid case-duplicate
@@ -1915,7 +2054,7 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     const exactControls = new Set(entries.map((entry) => entry.name))
     const canonicalized = new Set<string>()
     const complete = entries.map((entry) => {
-        const canonical = XLSX_CANONICAL_CONTROL_PARTS.get(asciiFold(entry.name))
+        const canonical = XLSX_CANONICAL_CONTROL_PARTS.get(opcKey(entry.name) ?? '')
         if (!canonical || entry.name === canonical || exactControls.has(canonical) || canonicalized.has(canonical)) {
             return entry
         }
@@ -2031,7 +2170,7 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     end.writeUInt16LE(ordered.length, 10)
     end.writeUInt32LE(directory.length, 12)
     end.writeUInt32LE(offset, 16)
-    return { ok: true, content: Buffer.concat([...locals, directory, end]), sheets, hadSharedStrings }
+    return { ok: true, content: Buffer.concat([...locals, directory, end]), sheets }
 }
 
 /////////////////////////////////////////////////////////////
@@ -2325,36 +2464,10 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         const activeCell = [...tables].reverse().find((table) => table.cell !== undefined)?.cell
         if (activeCell) {
             activeCell.chars += length
-            let hiddenBySuppressedAncestor = false
-            const speculative = tables.reduce((total, table) => {
-                if (hiddenBySuppressedAncestor || table.cell === undefined) return total
-                if (table.cell.suppressed && !table.mergeBailout) {
-                    hiddenBySuppressedAncestor = true
-                    return total
-                }
-                return total + table.cell.chars
-            }, chars)
-            if (!capExceeded && speculative > maxOutputChars) {
-                // A valid continuation is already known to be hidden once tcPr closes, so it is
-                // excluded above. If later structure triggers mergeBailout, its deferred count is
-                // restored on the next charge or when the table closes. Other active cell text is
-                // speculative until table close but remains cap-bearing, preventing nested frames
-                // from multiplying retention by XML depth.
-                capExceeded = true
-                const outerPicture = frames.findIndex((frame) => frame.kind === 'picture')
-                if (outerPicture > 0) {
-                    const innerPicture = frames.findLastIndex((frame) => frame.kind === 'picture')
-                    frames[innerPicture].capCrossedBeforeDeferredExtra = true
-                    deferredFreshFrames = new Set(frames.slice(0, innerPicture))
-                    drainUntil = [...frames.slice(0, outerPicture)]
-                        .reverse()
-                        .find((frame) => frame.kind === 'paragraph')
-                    discardDeferredText = true
-                } else {
-                    drainUntil = frames.find((frame) => frame.kind === 'table')
-                    discardTableText = drainUntil !== undefined
-                }
-            }
+            // A cell is speculative until it closes: a deleted paragraph can uncharge its text,
+            // and vertical-merge suppression can remove the entire cell. Latching truncation here
+            // loses later document text even when neither candidate survives. The cell-close path
+            // charges only the committed variant; tables are cap-clipped while that decision waits.
             return
         }
         chars += length
@@ -2663,13 +2776,20 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             if (name === 'w:p') {
                 pendingDeleted = pendingDeletedQueue.shift() ?? { value: '', extra: '', chars: 0 }
             }
+            const orphanPicture =
+                name === 'w:pict' &&
+                !frames.some((frame) => frame.kind === 'paragraph' || frame.orphanPicture)
             top = {
                 kind: name === 'w:p' ? 'paragraph' : 'picture',
                 value: claimedValue,
                 extra: '',
                 claimedExtra,
-                orphanPicture:
-                    name === 'w:pict' && !frames.some((frame) => frame.kind === 'paragraph' || frame.orphanPicture),
+                orphanPicture,
+                // Fresh paragraph output opened after a picture cap is later than retained output
+                // whose propagation is still draining. Mark even an empty paragraph now; otherwise
+                // its close-only separator can survive text that was already discarded.
+                discardedValue:
+                    name === 'w:p' && discardDeferredText && frames.some((frame) => frame.kind === 'picture'),
             }
             frames.push(top)
             if (name === 'w:p') {
@@ -2744,6 +2864,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             if (table && cell) {
                 frames.pop()
                 top = frames[frames.length - 1]
+                if (cell.frame.discardedValue) table.frame.discardedValue = true
                 appendRaw(table.frame, 'allValue', cell.frame.value)
                 if (cell.suppressed) table.deferredChars += cell.chars
                 else {
@@ -2768,6 +2889,14 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             if (table) {
                 frames.pop()
                 top = frames[frames.length - 1]
+                if (table.frame.discardedValue) {
+                    if (top.kind !== 'root') top.discardedValue = true
+                    if (drainUntil === table.frame) {
+                        drainUntil = undefined
+                        drainAncestors = new Set(frames)
+                    }
+                    return
+                }
                 const value = table.mergeBailout ? table.frame.allValue ?? '' : table.frame.value
                 append(top, 'value', value, { source: table.frame })
                 append(top, 'extra', table.frame.extra, { source: table.frame, deferred: true })
@@ -2815,18 +2944,24 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
                     extra: `${frame.claimedExtra}${frame.extra}`.slice(0, storageLimit),
                     chars: deferredChars,
                 }
+            } else if (frame.discardedValue) {
+                // A missing child is a hole before this paragraph's own separator. Carry that fact
+                // through same-order containers. A picture is the ordering boundary: it drops its
+                // output without invalidating direct text that precedes it in the parent paragraph.
+                if (top.kind !== 'root' && top.kind !== 'picture') top.discardedValue = true
+            } else if (
+                frames.some((candidate) => candidate.orphanPicture) &&
+                !deleted.some((candidate) => candidate)
+            ) {
+                // This paragraph is reachable only through an orphan picture. Keep parsing for the
+                // deleted-paragraph side effect above, but do not copy ordinary text into every
+                // open picture frame — none of those values can reach document output.
             } else {
-                // Once direct paragraph text was discarded, its break and extras are later in
-                // document order and cannot be emitted. Nor can its retained value: a nested
-                // picture parsed later may be hoisted ahead of that value, so exposing the value
-                // alone would still create a hole. Earlier completed paragraphs remain available.
-                if (!frame.discardedValue) {
-                    append(top, 'value', frame.value, { source: frame })
-                    append(top, 'value', '\n\n', discardDeferredText ? { source: frame } : undefined)
-                    append(top, 'value', frame.claimedExtra, { source: frame, deferred: true })
-                    append(top, 'value', frame.extra, { source: frame, deferred: true })
-                    charge(2)
-                }
+                append(top, 'value', frame.value, { source: frame })
+                append(top, 'value', '\n\n', discardDeferredText ? { source: frame } : undefined)
+                append(top, 'value', frame.claimedExtra, { source: frame, deferred: true })
+                append(top, 'value', frame.extra, { source: frame, deferred: true })
+                charge(2)
             }
         }
 

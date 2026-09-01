@@ -599,6 +599,27 @@ describe('docx — the cap and the deadline stop the read', () => {
         })
     })
 
+    it('does not latch the cap on deleted speculative text in a merged table cell', async () => {
+        const before = 'A'.repeat(5_000)
+        const hidden = 'X'.repeat(300_000)
+        const after = 'B'.repeat(5_000)
+        const deleted =
+            '<w:p><w:pPr><w:rPr><w:del/></w:rPr></w:pPr>' +
+            `<w:r><w:t>${hidden}</w:t></w:r></w:p>`
+        const table =
+            '<w:tbl><w:tr><w:tc><w:tcPr><w:vMerge w:val="restart"/></w:tcPr>' +
+            `${deleted}</w:tc></w:tr><w:tr><w:tc><w:tcPr><w:vMerge/></w:tcPr>` +
+            '<w:p/></w:tc></w:tr></w:tbl>'
+
+        const r = await extract(text(before) + table + text(after))
+
+        expect(r).toMatchObject({
+            status: 'extracted',
+            extraction: `${before}\n\n${after}\n\n`,
+            truncated: false,
+        })
+    })
+
     it('does not charge a nested table inside a suppressed vertical-merge continuation', async () => {
         const restart = '<w:tcPr><w:vMerge w:val="restart"/></w:tcPr>'
         const continuation = '<w:tcPr><w:vMerge/></w:tcPr>'
@@ -682,6 +703,42 @@ describe('docx — the cap and the deadline stop the read', () => {
         expect(partial).toMatchObject({ status: 'extracted', truncated: true })
         expect(partial.extraction).toBeUndefined()
         expect(whole.extraction!.startsWith(partial.extraction ?? '')).toBe(true)
+    })
+
+    it('propagates a discarded nested paragraph before emitting ancestor separators', async () => {
+        const run = (value: string) => `<w:r><w:t>${value}</w:t></w:r>`
+        const picture = (inner: string) =>
+            `<w:pict><v:shape><v:textbox><w:txbxContent>${inner}</w:txbxContent></v:textbox></v:shape></w:pict>`
+        const nested = `<w:p>${run('CCCC')}${run('DDDD')}${run('EEEE')}</w:p>`
+        const body = `<w:p>${run('AAAAZZZZ')}${picture(`<w:p>${run('BBBB')}${nested}</w:p>`)}</w:p>`
+        const whole = await extract(body, { maxOutputChars: 1_000 })
+        const partial = await extract(body, { maxOutputChars: 15 })
+
+        expect(whole.extraction).toBe('AAAAZZZZ\n\nBBBBCCCCDDDDEEEE\n\n\n\n')
+        expect(partial).toMatchObject({ status: 'extracted', truncated: true })
+        expect(whole.extraction!.startsWith(partial.extraction ?? '')).toBe(true)
+    })
+
+    it('keeps malformed nested picture/table separators on the full-output prefix', async () => {
+        const run = (value: string) => `<w:r><w:t>${value}</w:t></w:r>`
+        const paragraph = (inner = '') => `<w:p>${inner}</w:p>`
+        const picture = (inner: string) =>
+            `<w:pict><v:shape><v:textbox><w:txbxContent>${inner}</w:txbxContent></v:textbox></v:shape></w:pict>`
+        const nested = picture(paragraph(run('T5') + run('T6') + run('T7')))
+        const trailing = picture(paragraph())
+        const table = `<w:tbl><w:tr><w:tc>${paragraph()}${paragraph(run('T2') + nested + trailing)}</w:tc></w:tr></w:tbl>`
+        const directContainer =
+            `<w:tbl><w:txbxContent>${paragraph(run('DIRECT'))}</w:txbxContent>` +
+            `${picture(paragraph(run('BOX')))}</w:tbl>`
+        const bodies = [paragraph(picture(table)), paragraph(picture(directContainer))]
+
+        for (const body of bodies) {
+            const whole = await extract(body, { maxOutputChars: 1_000 })
+            for (let cap = 1; cap < (whole.extraction?.length ?? 0); cap++) {
+                const partial = await extract(body, { maxOutputChars: cap })
+                expect(whole.extraction!.startsWith(partial.extraction ?? '')).toBe(true)
+            }
+        }
     })
 
     it('keeps table truncation before deferred picture text as a prefix', async () => {

@@ -119,8 +119,9 @@ guards reduce blast radius; they are **not** a sandbox.
 - **`.docx`** — `word/document.xml` is located in the archive's central directory, inflated on its
   own, and read with a streaming SAX parser (`saxes`) rather than loaded into a DOM. Parser memory
   tracks one inflate chunk plus bounded retained text; deferred text-box frames stop retaining new
-  text once the output cap is crossed, and tables retain at most two cap-clipped merge variants, so
-  nesting depth cannot multiply the output allowance.
+  text once the output cap is crossed, tables retain at most two cap-clipped merge variants, and
+  paragraphs reachable only through orphan text boxes are discarded instead of copied through each
+  enclosing frame. The XML depth ceiling separately bounds the remaining frame overhead.
   Measured at a 1024 MB heap on a 45 MB `document.xml` inside a 3.65 MB archive, against the previous
   DOM-based reader:
 
