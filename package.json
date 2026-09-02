@@ -1,7 +1,7 @@
 {
   "name": "agentextract",
-  "version": "0.3.0",
-  "description": "Email quote & signature extractor \u2014 strips quoted history and boilerplate, keeping the sender's new content. Pure regex: no DOM parser, no ML.",
+  "version": "0.4.0",
+  "description": "Email quote & signature extractor — strips quoted history and boilerplate, keeping the sender's new content. Pure regex: no DOM parser, no ML.",
   "license": "MIT",
   "author": {
     "name": "AgentMail",
@@ -53,6 +53,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "prepack": "npm run build",
     "prepublishOnly": "npm run test"
@@ -61,20 +62,19 @@
     "@types/html-to-text": "^9.0.4",
     "@types/node": "^22.20.0",
     "@types/word-extractor": "^1.0.6",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.12.0",
     "typescript": "^6.0.3",
     "vitest": "^4.1.2"
   },
   "dependencies": {
-    "exceljs": "^4.4.0",
-    "html-to-text": "^10.0.0",
+    "dingbat-to-unicode": "^1.0.1",
+    "exceljs": "4.4.0",
+    "html-to-text": "^10.0.1",
     "iconv-lite": "^0.7.2",
     "jschardet": "^3.1.4",
-    "mammoth": "^1.12.0",
+    "saxes": "^5.0.1",
     "unpdf": "^1.6.2",
     "word-extractor": "^1.0.4"
-  },
-  "overrides": {
-    "uuid": ">=11.1.1",
-    "deepmerge-ts": ">=8.0.0"
   }
 }

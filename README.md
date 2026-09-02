@@ -54,12 +54,28 @@ const result = await extractAttachment({
 })
 // result.status === 'extracted'
 // result.extraction === 'Q3 revenue …'
+// result.truncated === false
 ```
 
-The heavy parsers (`unpdf`, `mammoth`, `exceljs`, …) are lazy-loaded per handler, so importing
+The heavy parsers (`unpdf`, `exceljs`, `saxes`, …) are lazy-loaded per handler, so importing
 `extractAttachment` costs nothing until you actually call it on a matching attachment. It's also
 available on its own subpath — `import { extractAttachment } from 'agentextract/attachment'` — if
 you want to reach it without touching the body-extraction entry point.
+
+An optional second argument tunes the extraction. Both fields are optional and omitting them
+reproduces the default behaviour exactly:
+
+```ts
+const result = await extractAttachment(input, {
+  maxOutputChars: 50_000, // tighten the output cap; clamped to MAX_OUTPUT_CHARS, never loosened
+  trailer: '\n[truncated — the source document continues past this point.]',
+})
+```
+
+`trailer` is appended to `extraction` only when the text was actually cut, and sits **outside** cap
+accounting — the cap bounds extracted text, so the returned string may exceed it by the trailer's
+length. `result.truncated` reports the same fact programmatically, whether or not a trailer was
+supplied, so a consumer never has to parse the text to find out.
 
 ### Resource limits & the safety boundary
 
@@ -70,16 +86,110 @@ guards reduce blast radius; they are **not** a sandbox.
 
 - **Input size** — attachments over `MAX_INPUT_BYTES` (10 MB) are skipped before any decode or parse.
 - **Decompression** — OOXML (`.docx`/`.xlsx`) archives are stream-inflated and **measured**; one that
-  actually expands past `MAX_UNCOMPRESSED_BYTES` (50 MB) is skipped before the parser loads. Malformed
-  or ZIP64 metadata is treated as over-budget (fail-closed), not trusted.
-- **Output** — extracted text is capped at `MAX_OUTPUT_CHARS` (250k). The `.xlsx` and PDF handlers
-  apply this **incrementally** as they build, so a huge sheet/PDF never materializes in full. The
-  `.docx` (mammoth) and HTML (html-to-text) handlers return a complete string that is then trimmed —
-  there the cap is **post-materialization**, so peak memory follows the whole document.
-- **Timeout** — `HANDLER_TIMEOUT_MS` (10 s) stops *awaiting* a slow async parse, but cannot cancel
-  synchronous CPU already running inside a parser.
+  actually expands past `MAX_UNCOMPRESSED_BYTES` (50 MB) is skipped before the parser loads. ZIP64 or
+  out-of-range metadata is likewise `skipped`; malformed metadata is `failed`. This archive-wide
+  preflight runs before the handler timeout starts. Its work is still bounded by the 10 MB input gate, the ZIP
+  entry-count ceiling and the 50 MB inflate ceiling, but a maximal 65k-entry directory can spend time
+  there that is not charged to `HANDLER_TIMEOUT_MS`.
+- **XML nesting** — DOCX, streamed XLSX worksheets/control tables, and namespace-aware XLSX identity
+  parsing refuse trees deeper than 256 elements. `saxes` namespace resolution scans the open-tag
+  stack, so this converts otherwise-quadratic attacker-controlled nesting into a fixed bound while
+  leaving room for legitimately nested Word tables. After identity fallback, ExcelJS may reparse
+  `workbook.xml` and its relationships without namespace resolution; that linear path is not depth-
+  capped. The parser work inside one chunk is synchronous, so the deadline cannot replace the
+  structural ceiling where namespace mode is used.
+- **Output** — extracted text is capped at `MAX_OUTPUT_CHARS` (250k), or lower via `maxOutputChars`.
+  Cutting sets `truncated` on the result, so a partial extraction is never mistaken for a complete
+  one. The PDF, `.docx` and `.xlsx` handlers apply the cap **incrementally** as they build and stop at
+  the next format-safe boundary. DOCX may drain an enclosing text box or table whose output order is
+  not known until it closes, but retains only cap-clipped variants while doing so. None materializes
+  the full document. Only the HTML handler (html-to-text) returns a complete string that is then
+  trimmed, so for that one the cap is **post-materialization** and peak memory follows the whole
+  document.
+- **Timeout** — `HANDLER_TIMEOUT_MS` (10 s) stops *awaiting* a slow async parse. It cannot cancel
+  synchronous CPU already running inside a parser, so handlers that yield between units of work (PDF
+  per page, `.docx` per inflate chunk, `.xlsx` per row) also check the deadline themselves and stop;
+  the HTML, `.doc` and text handlers cannot. Their
+  deadline sits `HANDLER_DEADLINE_MARGIN_MS` (1 s) *inside* the timeout, which is the window a handler
+  has to return what it read — so a self-stopped parse comes back `extracted` with `truncated` set
+  rather than being raced to `failed`. A single page, inflate chunk or row that overruns the margin
+  still times out.
 - **PDF** — page count and accumulated output are bounded (`MAX_PDF_PAGES`, `MAX_OUTPUT_CHARS`), but
   pdf.js's internal per-page decompression is **not** bounded in-library (no hook exists).
+- **`.docx`** — `word/document.xml` is located in the archive's central directory, inflated on its
+  own, and read with a streaming SAX parser (`saxes`) rather than loaded into a DOM. Parser memory
+  tracks one inflate chunk plus bounded retained text; deferred text-box frames stop retaining new
+  text once the output cap is crossed, tables retain at most two cap-clipped merge variants, and
+  paragraphs reachable only through orphan text boxes are discarded instead of copied through each
+  enclosing frame. The XML depth ceiling separately bounds the remaining frame overhead.
+  Measured at a 1024 MB heap on a 45 MB `document.xml` inside a 3.65 MB archive, against the previous
+  DOM-based reader:
+
+  | concurrency | before | after |
+  |---|---|---|
+  | 1 | 812 ms / 607 MB | **68 ms / 175 MB** |
+  | 2 | 1552 ms / 970 MB | **59 ms / 164 MB** |
+  | 4 | 3512 ms / 1217 MB | **58 ms / 168 MB** |
+
+  The old reader built 43.4M characters and kept 250k. The sharpest case is not the large archive: a
+  0.41 MB attachment holding one 43 MB `<w:t>` peaked the old reader at 1270 MB, against 199 MB here.
+  Two residual bounds, stated rather than glossed: peak is not independent of *input* size (the API
+  takes a `Buffer`), and `saxes` buffers one text node whole, so a single enormous run still costs
+  about twice its own size. Malformed XML is also stricter than before — a document the old reader
+  silently half-read now comes back either `truncated` or `failed`.
+- **`.docx` scope** — text comes from `word/document.xml` only. **Footnote, endnote and comment
+  bodies are not extracted** (they are separate zip parts), and neither are headers or footers.
+  **Table structure is not preserved**: each cell's paragraphs are emitted in reading order with the
+  same blank-line separator as body paragraphs, so a 2×2 table is indistinguishable from four
+  consecutive paragraphs. List bullets and numbers are dropped; the item text remains. Vertical-
+  merge continuation cells are omitted as they were by the previous reader. These are compatibility
+  targets rather than a claim of byte-for-byte identity for every malformed OOXML tree; intentional
+  recovery differences are pinned in the DOCX streaming tests. A consumer reading an invoice or a
+  contract should still know the column a figure sat in is gone.
+- **`.xlsx`** — read row-by-row through `exceljs`'s streaming reader rather than loaded whole, so
+  peak memory tracks the shared-string table plus one row instead of a live object per cell
+  (measured: 294 MB → 171 MB, and 3.7x faster, on a 5 MB / 38 MB-uncompressed workbook). It is not
+  independent of document size — a workbook with a very large string table still costs — so `.xlsx`
+  remains the format most likely to reach the host's memory limit.
+  That reader loses zip entries unless `xl/sharedStrings.xml` and `xl/_rels/workbook.xml.rels` are
+  parsed before the first worksheet ([exceljs #2790](https://github.com/exceljs/exceljs/issues/2790),
+  [#3064](https://github.com/exceljs/exceljs/issues/3064)), so the archive's entry order is rewritten
+  in memory first; when either control part is legitimately absent, the reader-only copy supplies an
+  empty equivalent so `exceljs` never falls into its temporary-file spool path. See
+  `reorderForStreaming`. That rewrite is also what keeps the decompression
+  budget binding on this format: the streaming reader walks local file headers, not the central
+  directory the budget measured, and only the rebuilt copy is guaranteed to carry exactly the
+  measured entries — so an archive that cannot be rebuilt is `failed`, never streamed as it arrived.
+  Behind that, a workbook read to completion that yields fewer worksheets than the workbook declares
+  returns `failed` rather than a partial workbook reported as `extracted` — silent partial output is
+  the one outcome worth failing over, since a caller can retry a failure but cannot tell a truncated
+  document from a complete one.
+- **`.xlsx` sheet identity** — which sheets exist, in what order, and under what names comes from
+  `xl/workbook.xml` and its relationships, not from the archive's layout. Sheets are emitted in tab
+  order (which a dragged tab changes without moving any `sheetN.xml`), named as the workbook names
+  them (`exceljs` matches relationship targets against a single spelling and silently fails to name a
+  sheet whose target is written as an absolute package path), and worksheet parts the workbook does
+  not reference are dropped rather than emitted as sheets of their own. Dropping is the narrow case,
+  though — a part is an orphan only when the workbook placed every sheet it declared and none of them
+  claimed this part's name. If any declaration could not be placed, or the part shares its name with
+  one that was, it ships under a fallback name having lost only its tab position. What a declaration
+  points at must be agreed on by the relationship's *type* and its target: neither is trusted alone,
+  since the target's path is a string the producing application chose and a type contradicted by its
+  target is not a resolution. Both OOXML flavours are recognized, Transitional and ISO Strict, and
+  targets are matched case-insensitively as OPC requires. A workbook whose sheet list cannot be read
+  at all — one from which not a single declaration parses, or whose workbook part is too large to
+  read whole — falls back to the archive's own parts, in entry order, named `Sheet1`, `Sheet2`, ….
+  The rule throughout is that a sheet may lose its position or its name, never its rows.
+
+### Accepted dependency advisory
+
+ExcelJS 4.4.0 requires `uuid@^8.3.0`, so consumers currently install `uuid@8.3.2`, which npm flags
+under [GHSA-w5hq-g745-h8pq](https://github.com/advisories/GHSA-w5hq-g745-h8pq). The affected APIs are
+UUID v3/v5/v6 writes into caller-provided buffers. ExcelJS loads UUID v4 for its conditional-formatting
+write transform; AgentExtract only exercises the streaming read path, and never calls the affected
+APIs. The advisory is therefore accepted until ExcelJS publishes a compatible dependency update.
+An `overrides` entry would only alter this repository's root install and would not protect consumers,
+so the published dependency graph is left honest rather than making local audit output misleading.
 
 ## What it does that off-the-shelf engines don't
 

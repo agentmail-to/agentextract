@@ -1,0 +1,115 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`docx fidelity — our reader against mammoth > comments.docx 1`] = `
+"Ouch.
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > embedded-style-map.docx 1`] = `
+"Walking on imported air
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > empty.docx 1`] = `null`;
+
+exports[`docx fidelity — our reader against mammoth > endnotes.docx 1`] = `
+"Ouch.
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > external-picture.docx 1`] = `null`;
+
+exports[`docx fidelity — our reader against mammoth > fixtures/empty.docx 1`] = `null`;
+
+exports[`docx fidelity — our reader against mammoth > fixtures/image.docx 1`] = `
+"Report
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > fixtures/sample.docx 1`] = `
+"First paragraph of the sample document.
+
+
+
+Second paragraph with more words here.
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > footnote-hyperlink.docx 1`] = `null`;
+
+exports[`docx fidelity — our reader against mammoth > footnotes.docx 1`] = `
+"Ouch.
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > simple-list.docx 1`] = `
+"Apple
+
+Banana
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > single-paragraph.docx 1`] = `
+"Walking on imported air
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > strict-format.docx 1`] = `
+"Test
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > strikethrough.docx 1`] = `
+"Today's Special: Salmon Sold out
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > tables.docx 1`] = `
+"Above
+
+Top left
+
+Top right
+
+Bottom left
+
+Bottom right
+
+Below
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > text-box.docx 1`] = `
+"
+
+Datum plane
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > tiny-picture.docx 1`] = `null`;
+
+exports[`docx fidelity — our reader against mammoth > tiny-picture-target-base-relative.docx 1`] = `null`;
+
+exports[`docx fidelity — our reader against mammoth > underline.docx 1`] = `
+"The Sunset Tree
+
+"
+`;
+
+exports[`docx fidelity — our reader against mammoth > utf8-bom.docx 1`] = `
+"This XML has a byte order mark.
+
+"
+`;

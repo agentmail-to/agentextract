@@ -13,11 +13,13 @@ import {
     HANDLER_TIMEOUT_MS,
     MAX_INPUT_BYTES,
     MAX_OUTPUT_CHARS,
+    MAX_PDF_PAGES,
     MAX_UNCOMPRESSED_BYTES,
 } from '../attachment'
 
-// NOTE: result shape is { status, extraction?, reason? }; `extraction` is omitted (never '') when a
-// handler runs but produces no text. Nested emails (.eml) are out of scope in this version and skip.
+// NOTE: result shape is { status, extraction?, reason?, truncated? }; `extraction` is omitted (never
+// '') when a handler runs but produces no text, and `truncated` says whether the document continues
+// past it. Nested emails (.eml) are out of scope in this version and skip.
 
 // Real fixtures generated once with macOS textutil (.docx) and cupsfilter (.pdf), and exceljs (.xlsx).
 // vitest runs from the repo root, so resolve against cwd.
@@ -25,12 +27,25 @@ const fixture = (name: string) => readFileSync(join(process.cwd(), 'tests', 'fix
 const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
+const stubExcelReaderHooks = (reader: object, omit?: string) => {
+    const hooks: Record<string, unknown> = {
+        _parseRels: async () => undefined,
+        _parseWorkbook: async () => undefined,
+        _parseSharedStrings: async function* () {},
+        _parseStyles: async () => undefined,
+        _parseWorksheet: () => [],
+        _parseHyperlinks: () => [],
+    }
+    if (omit) delete hooks[omit]
+    Object.assign(reader, hooks)
+}
+
 // ---------------------------------------------------------------------------
 // Synthetic tests for attachment.ts
 // ---------------------------------------------------------------------------
-// The RESULT is deliberately slim: { status, extraction?, reason? }. Routing is NOT on the result —
-// it's a separate concern verified through detectRoute(). So routing-decision assertions here call
-// detectRoute(input) directly; extraction assertions read the slim result.
+// The RESULT is deliberately slim: { status, extraction?, reason?, truncated? }. Routing is NOT on
+// the result — it's a separate concern verified through detectRoute(). So routing-decision
+// assertions here call detectRoute(input) directly; extraction assertions read the slim result.
 
 const buf = (s: string) => Buffer.from(s, 'utf8')
 
@@ -66,17 +81,18 @@ const buildPdf = (pages: string[][]): Buffer => {
 }
 
 // Result-shape guard ---------------------------------------------------------
-// The whole point of the slim contract: the top-level result carries no routing/diagnostic noise,
-// no top-level filename, and no truncation flag. If any of those leak back in, this fails.
+// The whole point of the slim contract: the top-level result carries no routing/diagnostic noise
+// and no top-level filename. If any of that leaks back in, this fails. `truncated` is the one field
+// deliberately allowed back — a partial extraction that reads as complete is worse than a missing one.
 
 describe('attachment — slim result contract', () => {
-    it('returns only the three contract fields, never routing/diagnostic noise', async () => {
+    it('returns only the four contract fields, never routing/diagnostic noise', async () => {
         const r = await extractAttachment({ content: buf('hello'), contentType: 'text/plain', filename: 'hi.txt' })
-        // Every key present must be one of the three contract fields — nothing else.
-        const allowed = ['status', 'extraction', 'reason']
+        // Every key present must be one of the four contract fields — nothing else.
+        const allowed = ['status', 'extraction', 'reason', 'truncated']
         expect(Object.keys(r).every((k) => allowed.includes(k))).toBe(true)
         // The removed fields must be absent (not merely undefined-valued).
-        for (const gone of ['filename', 'byteSize', 'detectedType', 'routedBy', 'charset', 'extractedText', 'truncated', 'children', 'lowTextDensity', 'pageCount', 'emptyPageCount']) {
+        for (const gone of ['filename', 'byteSize', 'detectedType', 'routedBy', 'charset', 'extractedText', 'children', 'lowTextDensity', 'pageCount', 'emptyPageCount']) {
             expect(gone in r).toBe(false)
         }
     })
@@ -373,6 +389,26 @@ describe('attachment — charset-correct decoding', () => {
         expect(r.extraction).toBe('hello world')
     })
 
+    it.each(['ucs-2', 'ucs2', 'utf16le', 'utf16', 'utf16be'])(
+        'accepts the iconv UTF-16 alias %s in Content-Type',
+        async (charset) => {
+            const encoding = charset.endsWith('be') ? 'utf-16be' : 'utf-16le'
+            const content = iconv.encode('hello world', encoding, { addBOM: false })
+            const r = await extractAttachment({ content, contentType: `text/plain; charset=${charset}` })
+            expect(r).toMatchObject({ status: 'extracted', extraction: 'hello world', truncated: false })
+        }
+    )
+
+    // U+FFFD is also a legitimate code point in explicitly declared, BOM-less UTF-16. Its presence
+    // must not activate the latin1 recovery path and expose an interleaved NUL after every character.
+    it('keeps a literal U+FFFD in BOM-less UTF-16 declared by Content-Type', async () => {
+        const content = iconv.encode('before � after', 'utf-16le', { addBOM: false })
+        const r = await extractAttachment({ content, contentType: 'text/plain; charset=utf-16le' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBe('before � after')
+        expect(r.extraction).not.toContain('\u0000')
+    })
+
     // Precedence: an in-band BOM is definitive and must beat a wrong Content-Type charset. A
     // UTF-16 file mislabeled charset=windows-1252 would mojibake under the hint; the BOM wins.
     it('lets a BOM override a contradicting charset hint', async () => {
@@ -486,6 +522,66 @@ describe('attachment — pdf handler', () => {
         expect(r.status).toBe('failed')
         expect(r.reason).toBeDefined()
         expect(r.extraction).toBeUndefined()
+    })
+
+    it('destroys the PDF loading task after both successful and failed page reads', async () => {
+        const destroy = vi.fn(async () => undefined)
+        let fail = false
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => ({
+                numPages: 1,
+                loadingTask: { destroy },
+                getPage: async () => ({
+                    getTextContent: async () => {
+                        if (fail) throw new Error('page failed')
+                        return { items: [{ str: 'page text' }] }
+                    },
+                }),
+            }),
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const input = { content: buf('%PDF-1.4 mock'), contentType: 'application/pdf' }
+            expect((await extract(input)).status).toBe('extracted')
+            fail = true
+            expect((await extract(input)).status).toBe('failed')
+            expect(destroy).toHaveBeenCalledTimes(2)
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
+
+    it('preserves successful output and the primary parse error when PDF teardown rejects', async () => {
+        let fail = false
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => ({
+                numPages: 1,
+                loadingTask: { destroy: async () => Promise.reject(new Error('teardown failed')) },
+                getPage: async () => ({
+                    getTextContent: async () => {
+                        if (fail) throw new Error('page failed')
+                        return { items: [{ str: 'page text' }] }
+                    },
+                }),
+            }),
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const input = { content: buf('%PDF-1.4 mock'), contentType: 'application/pdf' }
+            expect(await extract(input)).toMatchObject({
+                status: 'extracted',
+                extraction: 'page text',
+                truncated: false,
+            })
+            fail = true
+            expect(await extract(input)).toMatchObject({ status: 'failed', reason: 'page failed' })
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
     })
 })
 
@@ -611,11 +707,405 @@ describe('attachment — xlsx handler', () => {
         expect(r.extraction).toContain('Ada Lovelace')
     })
 
+    it.each([
+        ['empty', ''],
+        ['declaration-only', '<?xml version="1.0"?>'],
+        ['comment-only', '<!-- optional styles omitted -->'],
+    ])('accepts an %s styles part without losing worksheet rows', async (_label, styles) => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Styles').addRow(['KEEP'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        zip.file('xl/styles.xml', styles)
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Styles ===\nKEEP', truncated: false })
+    })
+
+    it('accepts an empty optional shared-string part when no cell references it', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Numbers').addRow([42])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        zip.file('xl/sharedStrings.xml', '')
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Numbers ===\n42', truncated: false })
+    })
+
+    it('keeps an explicitly empty shared-string cell in its row position', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Shared').addRow(['A', 'B', 'C'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const shared = await zip.file('xl/sharedStrings.xml')!.async('string')
+        zip.file('xl/sharedStrings.xml', shared.replace('<t>B</t>', '<t></t>'))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Shared ===\nA\t\tC', truncated: false })
+    })
+
+    it('does not revive blank rows or trailing columns from empty shared strings', async () => {
+        const blank = new ExcelJS.Workbook()
+        const blankSheet = blank.addWorksheet('Blank')
+        blankSheet.addRow(['A', 'B'])
+        blankSheet.addRow(['A', 'B'])
+        const blankZip = await JSZip.loadAsync(await blank.xlsx.writeBuffer())
+        const shared = await blankZip.file('xl/sharedStrings.xml')!.async('string')
+        blankZip.file('xl/sharedStrings.xml', shared.replace(/<t>[AB]<\/t>/g, '<t></t>'))
+        const blankResult = await extractAttachment({
+            content: await blankZip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(blankResult).toMatchObject({ status: 'extracted', truncated: false })
+        expect(blankResult.extraction).toBeUndefined()
+
+        const trailing = new ExcelJS.Workbook()
+        trailing.addWorksheet('Trailing').addRow(['KEEP', 'DROP'])
+        const trailingZip = await JSZip.loadAsync(await trailing.xlsx.writeBuffer())
+        const trailingShared = await trailingZip.file('xl/sharedStrings.xml')!.async('string')
+        trailingZip.file('xl/sharedStrings.xml', trailingShared.replace('<t>DROP</t>', '<t></t>'))
+        const trailingResult = await extractAttachment({
+            content: await trailingZip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(trailingResult).toMatchObject({
+            status: 'extracted',
+            extraction: '=== Trailing ===\nKEEP',
+            truncated: false,
+        })
+    })
+
+    it('matches ExcelJS decimal parseInt semantics for shared-string indexes', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Indexes').addRow(['ZERO', 'ONE', 'TWO', 'THREE'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const sheet = await zip.file('xl/worksheets/sheet1.xml')!.async('string')
+        zip.file(
+            'xl/worksheets/sheet1.xml',
+            sheet
+                .replace('<c r="A1" t="s"><v>0</v></c>', '<c r="A1" t="s"><v>1e3</v></c>')
+                .replace('<c r="B1" t="s"><v>1</v></c>', '<c r="B1" t="s"><v>1.5</v></c>')
+                .replace('<c r="C1" t="s"><v>2</v></c>', '<c r="C1" t="s"><v>1abc</v></c>')
+                .replace('<c r="D1" t="s"><v>3</v></c>', '<c r="D1" t="s"><v>0x10</v></c>')
+        )
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({
+            status: 'extracted',
+            extraction: '=== Indexes ===\nONE\tONE\tONE\tZERO',
+            truncated: false,
+        })
+    })
+
+    it('ignores a shared-string cell with no index instead of treating it as index zero', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Missing index').addRow(['ZERO', 42])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const sheet = await zip.file('xl/worksheets/sheet1.xml')!.async('string')
+        zip.file('xl/worksheets/sheet1.xml', sheet.replace('<c r="A1" t="s"><v>0</v></c>', '<c r="A1" t="s"/>'))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Missing index ===\n42', truncated: false })
+    })
+
+    it('bounds a hostile shared-string index instead of accumulating its digits', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Index').addRow(['VALUE'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const sheet = await zip.file('xl/worksheets/sheet1.xml')!.async('string')
+        zip.file('xl/worksheets/sheet1.xml', sheet.replace('<v>0</v>', `<v>${'9'.repeat(100_000)}</v>`))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/shared-string index exceeds/i)
+    })
+
+    it('fails explicitly when cells reference a missing shared-string table', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('S').addRow(['Alpha', 42])
+        workbook.addWorksheet('T').addRow(['Beta'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        zip.remove('xl/sharedStrings.xml')
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.extraction).toBeUndefined()
+        expect(r.reason).toMatch(/missing shared-string table/i)
+    })
+
     // A formula cell must extract its computed VALUE, not the "=SUM(...)" formula string.
     it('extracts the computed value of a formula, not the formula text', async () => {
         const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
         expect(r.extraction).toContain('Total\t7300')
         expect(r.extraction).not.toContain('SUM(')
+    })
+
+    it('extracts shared-formula continuation results instead of their raw value objects', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Shared')
+        sheet.getCell('A1').value = 2
+        sheet.fillFormula('B1:B2', 'A1+1', [3, 6])
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toBe('=== Shared ===\n2\t3\n6')
+        expect(r.extraction).not.toContain('{"formula"')
+    })
+
+    it('keeps a zero-valued shared-formula continuation result', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Shared zero')
+        sheet.getCell('A1').value = 1
+        sheet.fillFormula('B1:B2', 'A1-1', [1, 0])
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toBe('=== Shared zero ===\n1\t1\n0')
+    })
+
+    it('preserves boolean and date result types for streamed formula cells', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.properties.date1904 = true
+        const sheet = workbook.addWorksheet('Typed formulas')
+        const date = new Date(Date.UTC(2024, 0, 2))
+        sheet.getCell('A1').value = { formula: 'DATE(2024,1,2)', result: date }
+        sheet.getCell('A2').value = { formula: '1=1', result: true }
+        sheet.getCell('A3').value = { formula: '1=0', result: false }
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toBe(`=== Typed formulas ===\n${date.toString()}\ntrue\nfalse`)
+    })
+
+    it.each([
+        ['type', (xml: string) => xml.replace('t="b"', 't="&#98;"')],
+        ['address', (xml: string) => xml.replace('r="A1"', 'r="&#x41;1"')],
+    ])('decodes an XML-encoded formula %s attribute before matching the streamed cell', async (_label, encode) => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Encoded').getCell('A1').value = { formula: '1=1', result: true }
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        zip.file(name, encode(await zip.file(name)!.async('string')))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Encoded ===\ntrue', truncated: false })
+    })
+
+    it('does not coerce non-finite formula results into dates or booleans', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Invalid')
+        sheet.getCell('A1').value = { formula: 'DATE(2024,1,2)', result: 45_293 }
+        sheet.getCell('A1').numFmt = 'yyyy-mm-dd'
+        sheet.getCell('B1').value = { formula: '1=1', result: true }
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(
+            name,
+            xml
+                .replace(/(<c r="A1"[^>]*)(>.*?<v>)[^<]*(<\/v>)/, '$1 t="e"$2#N/A$3')
+                .replace(/(<c r="B1"[^>]*t="b"[^>]*>.*?<v>)[^<]*(<\/v>)/, '$1not-a-number$2')
+        )
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).not.toContain('Invalid Date')
+        expect(r.extraction).not.toContain('true')
+    })
+
+    it('ignores boolean-looking cells outside worksheet rows', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Scoped').getCell('A1').value = { formula: '1+0', result: 1 }
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(name, xml.replace('<sheetData>', '<extLst><c r="A1" t="b"/></extLst><sheetData>'))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Scoped ===\n1', truncated: false })
+    })
+
+    it('concatenates visible inline rich-text runs without phonetic guides', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Rich').getCell('A1').value = 'placeholder'
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(
+            name,
+            xml.replace(
+                /<c r="A1"[^>]*>.*?<\/c>/,
+                '<c r="A1" t="inlineStr"><is><r><t>Alpha &amp; </t></r><r><t>Beta</t></r>' +
+                    '<rPh sb="0" eb="1"><t>PHONETIC</t></rPh></is></c>'
+            )
+        )
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Rich ===\nAlpha & Beta', truncated: false })
+    })
+
+    it('ignores worksheet-shaped cells in foreign extension namespaces', async () => {
+        const mutate = async (value: ExcelJS.CellValue, payload: string) => {
+            const workbook = new ExcelJS.Workbook()
+            workbook.addWorksheet('Scoped').getCell('A1').value = value
+            const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+            const name = 'xl/worksheets/sheet1.xml'
+            const xml = await zip.file(name)!.async('string')
+            zip.file(
+                name,
+                xml.replace(
+                    '</sheetData>',
+                    `</sheetData><extLst><ext uri="probe"><foreign xmlns="urn:foreign">${payload}</foreign></ext></extLst>`
+                )
+            )
+            return extractAttachment({ content: await zip.generateAsync({ type: 'nodebuffer' }), contentType: XLSX_TYPE })
+        }
+
+        const inline = await mutate(
+            'REAL',
+            '<row><c r="A1" t="inlineStr"><is><t>FORGED</t></is></c></row>'
+        )
+        const boolean = await mutate({ formula: '1+0', result: 1 }, '<row><c r="A1" t="b"/></row>')
+
+        expect(inline.extraction).toBe('=== Scoped ===\nREAL')
+        expect(boolean.extraction).toBe('=== Scoped ===\n1')
+    })
+
+    it('tolerates an undeclared extension prefix without losing the worksheet', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Extensions').getCell('A1').value = 'REAL'
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(name, xml.replace('</worksheet>', '<extLst><ext uri="probe"><xr:extra/></ext></extLst></worksheet>'))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Extensions ===\nREAL', truncated: false })
+    })
+
+    it('ignores ExcelJS null row events outside sheetData', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Rows')
+        sheet.addRow(['first'])
+        sheet.addRow(['second'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(name, xml.replace('</sheetData>', '</sheetData><extLst><ext uri="probe"><row r="99"/></ext></extLst>'))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({
+            status: 'extracted',
+            extraction: '=== Rows ===\nfirst\nsecond',
+            truncated: false,
+        })
+    })
+
+    it.each([
+        ['worksheet', 'xl/worksheets/sheet1.xml'],
+        ['shared strings', 'xl/sharedStrings.xml'],
+        ['styles', 'xl/styles.xml'],
+    ])('enforces the XML depth ceiling in streamed %s', async (_label, name) => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Deep')
+        sheet.getCell('A1').value = 'text'
+        sheet.getCell('B1').value = 1
+        sheet.getCell('B1').numFmt = '0.00'
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const xml = await zip.file(name)!.async('string')
+        const close = xml.lastIndexOf('</')
+        const nested = '<extLst>'.repeat(300) + '</extLst>'.repeat(300)
+        zip.file(name, xml.slice(0, close) + nested + xml.slice(close))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/XML nesting exceeds 256 elements/)
+    })
+
+    it('rejects an incomplete shared-string table instead of silently dropping later cells', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Data')
+        sheet.addRow(['first'])
+        sheet.addRow(['second'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/sharedStrings.xml'
+        const xml = await zip.file(name)!.async('string')
+        const firstEnd = xml.indexOf('</si>') + '</si>'.length
+        zip.file(name, `${xml.slice(0, firstEnd)}<si><t>second`)
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/unclosed XLSX control XML/)
+    })
+
+    it('rejects an incomplete styles table at natural EOF', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const cell = workbook.addWorksheet('Styled').getCell('A1')
+        cell.value = 1
+        cell.numFmt = '0.00'
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/styles.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(name, xml.slice(0, xml.lastIndexOf('</styleSheet>')))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/unclosed XLSX control XML/)
     })
 
     // A workbook with only empty sheets parses fine but yields no rows: extracted, no extraction.
@@ -640,6 +1130,20 @@ describe('attachment — xlsx handler', () => {
         expect(detectRoute(input).kind).toBe('xlsx')
         const r = await extractAttachment(input)
         expect(r.status).toBe('extracted')
+    })
+
+    it('routes and extracts an xlsx whose workbook root differs only in ASCII case', async () => {
+        const zip = await JSZip.loadAsync(fixture('sample.xlsx'))
+        const workbook = await zip.file('xl/workbook.xml')!.async('nodebuffer')
+        zip.remove('xl/workbook.xml')
+        zip.file('xl/Workbook.xml', workbook)
+        const content = await zip.generateAsync({ type: 'nodebuffer' })
+
+        expect(detectRoute({ content, contentType: XLSX_TYPE }).kind).toBe('xlsx')
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('=== Q1 ===')
+        expect(r.extraction).toContain('West\t4200')
     })
 
     // A generic (non-OOXML) zip has no docx/xlsx part, so it stays unrouted — not mis-claimed.
@@ -940,6 +1444,18 @@ describe('attachment — edge cases (regression)', () => {
         expect(asPdf.extraction).toBeUndefined()
     })
 
+    // That early gate is the one 'extracted' return that never reaches the cap logic, so it is the
+    // one that can forget `truncated`. Asserted as presence, not just value: `undefined === false`
+    // is false either way, and only `'truncated' in r` catches an omitted key.
+    it('reports truncated false on a zero-byte attachment rather than omitting it', async () => {
+        for (const contentType of ['text/plain', 'application/pdf', XLSX_TYPE, undefined]) {
+            const r = await extractAttachment({ content: Buffer.alloc(0), contentType })
+            expect(r.status).toBe('extracted')
+            expect('truncated' in r).toBe(true)
+            expect(r.truncated).toBe(false)
+        }
+    })
+
     // The real guard, end to end. The replica below proves a PROPERTY of the timeout (that the work
     // it abandons keeps running) but executes a copy, so the shipped withTimeout/HandlerTimeoutError
     // were never run by this suite. Here a stubbed parser hangs forever and fake timers jump the
@@ -964,7 +1480,57 @@ describe('attachment — edge cases (regression)', () => {
         }
     })
 
-    // Documented limitation — withTimeout (attachment.ts:781) is not exported, so replicate it
+    // The other side of that race, and the reason HANDLER_DEADLINE_MARGIN_MS exists: a parser slow
+    // enough to pass the handler's deadline but not the timeout must come back as a partial
+    // extraction, NOT as 'failed'. With the two instants equal it never can — handlers stop at
+    // `Date.now() > deadline`, strictly after the moment the timer already fired at — so ten seconds
+    // of successfully read pages are discarded.
+    //
+    // Fake timers are load-bearing here, not a speed trick. The per-handler deadline tests elsewhere
+    // in this file stub Date.now() and leave setTimeout real, which decouples the two clocks and is
+    // exactly why none of them can see this; one synthetic clock driving both is the real
+    // relationship. It also keeps this off the wall clock — a ~9s real-time test is a CI flake
+    // waiting to happen.
+    it('reports a slow yielding handler as truncated, not failed, inside the timeout', async () => {
+        const PAGE_MS = 250
+        const PAGES = 60 // 15s of work — far past the deadline, so the stop is unambiguously its
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => ({
+                numPages: PAGES,
+                // Yields between pages, like the real one: the deadline check sits at the top of the
+                // loop, so the handler can act on it.
+                getPage: (n: number) =>
+                    new Promise((resolve) =>
+                        setTimeout(
+                            () =>
+                                resolve({
+                                    getTextContent: async () => ({ items: [{ str: `page ${n}`, hasEOL: true }] }),
+                                }),
+                            PAGE_MS
+                        )
+                    ),
+            }),
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            vi.useFakeTimers()
+            const pending = extract({ content: buf('%PDF-1.4 slow'), contentType: 'application/pdf' })
+            await vi.advanceTimersByTimeAsync(HANDLER_TIMEOUT_MS + PAGE_MS)
+            const r = await pending
+
+            expect(r.status).toBe('extracted') // 'failed' here is the regression
+            expect(r.truncated).toBe(true)
+            expect(r.extraction).toContain('page 1') // pages read before the stop survive
+            expect(r.extraction).not.toContain(`page ${PAGES}`) // and it really did stop short
+        } finally {
+            vi.useRealTimers()
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
+
+    // Documented limitation — withTimeout is not exported, so replicate it
     // verbatim. Rejecting the wrapper does NOT cancel the underlying handler: its CPU work runs to
     // completion regardless (wasted CPU/memory after we time out). Can't be fixed without a
     // cancellable/off-thread parser.
@@ -1007,15 +1573,14 @@ describe('attachment — edge cases (regression)', () => {
         expect(ranToCompletion).toBe(true) // ...and completes its CPU work anyway
     })
 
-    // ACCEPTED BY DESIGN — the 3-field slim intentionally carries NO truncation signal, so over-cap
-    // output is bounded silently. Asserted positively (a normal green test): if a `truncated` field
-    // is ever added, `not.toHaveProperty` below fails, forcing a conscious update to the contract.
-    it('caps over-limit output silently — the slim contract has no truncation signal (by design)', async () => {
+    // Formerly pinned the opposite, with a note that adding `truncated` must force a conscious
+    // contract update. This is that update.
+    it('reports over-limit output as truncated rather than capping it silently', async () => {
         const content = Buffer.alloc(2 * MAX_OUTPUT_CHARS, 0x41) // 500k "A", under the 10MB input cap
         const r = await extractAttachment({ content, contentType: 'text/plain' })
         expect(r.status).toBe('extracted')
-        expect(r.extraction?.length).toBe(MAX_OUTPUT_CHARS) // capped
-        expect(r).not.toHaveProperty('truncated') // deliberate: no field signals truncation
+        expect(r.extraction?.length).toBe(MAX_OUTPUT_CHARS) // still capped
+        expect(r.truncated).toBe(true) // ...but no longer silently
     })
 })
 
@@ -1073,6 +1638,18 @@ describe('attachextract — OOXML decompression preflight', () => {
         eocd.writeUInt16LE(comment.length, 20) // archive comment length (matches the appended comment bytes)
         return Buffer.concat([localRec, cdh, eocd, comment])
     }
+
+    it('labels an unexpected decompression-preflight rejection instead of throwing', async () => {
+        const createInflate = vi.spyOn(zlib, 'createInflateRaw').mockImplementationOnce(() => {
+            throw new Error('inflate setup failed')
+        })
+        try {
+            const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
+            expect(r).toEqual({ status: 'failed', reason: 'inflate setup failed' })
+        } finally {
+            createInflate.mockRestore()
+        }
+    })
 
     // Content that genuinely inflates past the 50 MB cap (compresses to a few KB on disk).
     const overCapContent = () => Buffer.alloc(MAX_UNCOMPRESSED_BYTES + 10 * 1024 * 1024, 0x41)
@@ -1452,6 +2029,19 @@ describe('attachment — a utf-16 charset claim must be earned by the bytes', ()
         })
     }
 
+    // Every pair of zero bytes is a decoded U+0000. It satisfies surrogate/noncharacter checks and
+    // used to turn an ordinary NUL-filled binary into thousands of invisible "text" characters.
+    it('rejects NUL-filled binary under a utf-16 charset claim', async () => {
+        const content = Buffer.alloc(9_000)
+        const r = await extractAttachment({
+            content,
+            filename: 'payload.bin',
+            contentType: 'text/plain; charset=utf-16',
+        })
+        expect(r.status).toBe('skipped')
+        expect(r.extraction).toBeUndefined()
+    })
+
     // The allowlisted magics keep their stronger behaviour: not merely skipped, but re-sniffed back to
     // the real handler. Guards against a regression that closes the hole by dropping hasKnownBinaryMagic.
     it('still recovers an allowlisted binary (PDF) mislabeled charset=utf-16 via the sniff', async () => {
@@ -1613,5 +2203,1704 @@ describe('attachment — a utf-16 charset claim must be earned by the bytes', ()
         })
         expect(r.status).toBe('extracted')
         expect(r.extraction).toContain('日本語のテキストです。')
+    })
+})
+
+// Extract options: maxOutputChars + trailer ----------------------------------
+// The cap may only tighten, the trailer only appears on a real cut, and omitting both must
+// reproduce pre-options behaviour exactly.
+
+describe('attachment — extract options', () => {
+    // 500k "A" against the 250k ceiling: over-cap under every setting below, so each case isolates
+    // the option under test rather than the input size.
+    const oversized = () => Buffer.alloc(2 * MAX_OUTPUT_CHARS, 0x41)
+    const asText = { contentType: 'text/plain' }
+
+    it('tightens the cap when asked', async () => {
+        const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 100 })
+        expect(r.extraction).toHaveLength(100)
+        expect(r.truncated).toBe(true)
+    })
+
+    it('clamps a cap above the ceiling instead of honouring it', async () => {
+        // The footgun this stops: a streaming handler reads until the cap, so a caller must not be
+        // able to widen how far we read into a document.
+        const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 10 * MAX_OUTPUT_CHARS })
+        expect(r.extraction).toHaveLength(MAX_OUTPUT_CHARS)
+    })
+
+    it('ignores an unusable or negative cap rather than producing an empty extraction', async () => {
+        for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
+            const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: bad })
+            expect(r.extraction).toHaveLength(MAX_OUTPUT_CHARS)
+        }
+        // Negative clamps to 0 — a cap of "no text at all" is coherent, so it is honoured, not
+        // ignored. -Infinity is the same request, so it must land the same place: it used to take
+        // the non-finite fallback and come back as the full 250k, the one non-monotonic seam here.
+        for (const none of [-5, Number.NEGATIVE_INFINITY]) {
+            const zero = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: none })
+            expect(zero.extraction).toBeUndefined() // '' collapses to omitted, per the contract
+            expect(zero.status).toBe('extracted')
+        }
+    })
+
+    it.each(['abc', {}, null, true])('falls back to the ceiling for a non-number JS cap: %j', async (bad) => {
+        const r = await extractAttachment(
+            { content: oversized(), ...asText },
+            { maxOutputChars: bad as never }
+        )
+        expect(r.extraction).toHaveLength(MAX_OUTPUT_CHARS)
+        expect(r.truncated).toBe(true)
+    })
+
+    it('floors a fractional cap', async () => {
+        const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 10.9 })
+        expect(r.extraction).toHaveLength(10)
+    })
+
+    it('appends the trailer only when the text was actually cut', async () => {
+        const trailer = '\n[truncated]'
+        const cut = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 100, trailer })
+        expect(cut.extraction?.endsWith(trailer)).toBe(true)
+
+        const whole = await extractAttachment({ content: buf('short'), ...asText }, { trailer })
+        expect(whole.extraction).toBe('short')
+        expect(whole.truncated).toBe(false)
+    })
+
+    it('keeps the trailer outside cap accounting — the cap bounds text, not the returned string', async () => {
+        // Documented deliberately: a consumer sizing a buffer on maxOutputChars must add the trailer.
+        const trailer = '\n[truncated]'
+        const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 100, trailer })
+        expect(r.extraction).toHaveLength(100 + trailer.length)
+        expect(r.extraction?.slice(0, 100)).toBe('A'.repeat(100))
+    })
+
+    it('reports truncated independently of the trailer, so a consumer need not parse the text', async () => {
+        const r = await extractAttachment({ content: oversized(), ...asText }, { maxOutputChars: 100 })
+        expect(r.truncated).toBe(true)
+        expect(r.extraction?.endsWith('A')).toBe(true) // no trailer supplied, none appended
+    })
+
+    it('omits truncated on skipped and failed — there is no text to have cut', async () => {
+        const skipped = await extractAttachment({ content: Buffer.alloc(MAX_INPUT_BYTES + 1), ...asText })
+        expect(skipped.status).toBe('skipped')
+        expect('truncated' in skipped).toBe(false)
+    })
+
+    it('reproduces pre-options behaviour when both options are omitted', async () => {
+        // AC#6, stated as a test: the default path must be byte-identical to passing nothing.
+        const content = oversized()
+        const bare = await extractAttachment({ content, ...asText })
+        const empty = await extractAttachment({ content, ...asText }, {})
+        expect(bare).toEqual(empty)
+        expect(bare.extraction).toHaveLength(MAX_OUTPUT_CHARS)
+    })
+
+    it('does not split a surrogate pair at a tightened cap boundary', async () => {
+        // The existing surrogate guard has to follow the resolved cap, not the module constant.
+        const content = buf('a' + '😀'.repeat(50)) // 😀 is a surrogate PAIR: cap 2 lands mid-pair
+        const r = await extractAttachment({ content, ...asText }, { maxOutputChars: 2 })
+        expect(r.extraction).toBe('a') // the lone high half was dropped, not emitted as U+FFFD
+        expect(r.extraction).not.toContain('�')
+    })
+})
+
+// xlsx streaming: entry-order workaround --------------------------------------
+// Regressions for reorderForStreaming; the entry-loss bug it works around is documented at its
+// definition. Each asserts over repeated reads because that bug is a race — a single green read
+// proves nothing at a partial failure rate. Before the reorder the multi-sheet case dropped a sheet
+// or threw on most reads; the no-shared-strings case dropped sheets on 35 of 50.
+
+// Shared by the determinism block and the sheet-identity block below, which assert on the same
+// naming convention (S1.., s1r1..) and must not drift apart. exceljs's own writer emits
+// xl/workbook.xml LAST, which is the layout that used to throw.
+const workbookWith = async (sheets: number, rows: number) => {
+    const workbook = new ExcelJS.Workbook()
+    for (let s = 1; s <= sheets; s++) {
+        const sheet = workbook.addWorksheet(`S${s}`)
+        for (let r = 1; r <= rows; r++) sheet.addRow([`s${s}r${r}`, r])
+    }
+    return Buffer.from(await workbook.xlsx.writeBuffer())
+}
+
+describe('attachment — xlsx streaming determinism', () => {
+    const READS = 12 // enough to catch a partial-rate race; the workbooks are tiny
+
+    it('returns every worksheet, on every read', async () => {
+        const content = await workbookWith(5, 10)
+        for (let i = 0; i < READS; i++) {
+            const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+            expect(r.status).toBe('extracted')
+            for (let s = 1; s <= 5; s++) expect(r.extraction).toContain(`=== S${s} ===`)
+        }
+    })
+
+    it('returns byte-identical extraction across repeated reads of the same workbook', async () => {
+        const content = await workbookWith(4, 25)
+        const first = await extractAttachment({ content, contentType: XLSX_TYPE })
+        for (let i = 0; i < READS; i++) {
+            expect(await extractAttachment({ content, contentType: XLSX_TYPE })).toEqual(first)
+        }
+    })
+
+    it('decodes shared strings across inflate chunk boundaries without replacement characters', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Unicode')
+        const values = Array.from({ length: 2_000 }, (_, i) => `row ${i}: café — 東京 😀`)
+        for (const value of values) sheet.addRow([value])
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).not.toContain('\uFFFD')
+        expect(r.extraction).toContain(values[0])
+        expect(r.extraction).toContain(values[999])
+        expect(r.extraction).toContain(values[1_999])
+    })
+
+    it.each([0.9, 0.7, 0.5])('fails a worksheet whose XML stops at %s of its original length', async (ratio) => {
+        const zip = await JSZip.loadAsync(await workbookWith(1, 40))
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('nodebuffer')
+        zip.file(name, xml.subarray(0, Math.floor(xml.length * ratio)))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.extraction).toBeUndefined()
+    })
+
+    it('fails when a truncated later worksheet yields no rows but still counts as emitted', async () => {
+        const zip = await JSZip.loadAsync(await workbookWith(2, 10))
+        const name = 'xl/worksheets/sheet2.xml'
+        const xml = await zip.file(name)!.async('nodebuffer')
+        zip.file(name, xml.subarray(0, Math.floor(xml.length * 0.2)))
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('failed')
+        expect(r.extraction).toBeUndefined()
+    })
+
+    // The ORDINARY case, where tab order and file order agree — so this pins that the reorder does
+    // not scramble a normal workbook, and nothing more. It cannot see where the two authorities
+    // disagree, because exceljs's writer never emits a workbook in which they do: that is what the
+    // sheet-identity block below builds by hand.
+    it('keeps worksheets in workbook order', async () => {
+        const r = await extractAttachment({ content: await workbookWith(4, 3), contentType: XLSX_TYPE })
+        const headers = r.extraction!.match(/^=== .* ===$/gm)
+        expect(headers).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ===', '=== S4 ==='])
+    })
+
+    // No strings means no xl/sharedStrings.xml, so ordering alone cannot set the flag that keeps the
+    // reader off the lossy path — the handler injects an empty table. Numeric-only cells are the
+    // realistic shape of such a workbook.
+    it('returns every worksheet when the workbook has no shared-string table', async () => {
+        const workbook = new ExcelJS.Workbook()
+        for (let s = 1; s <= 3; s++) {
+            const sheet = workbook.addWorksheet(`N${s}`)
+            for (let r = 1; r <= 10; r++) sheet.addRow([s * 1000 + r, r * 2, r * 3])
+        }
+        const content = Buffer.from(await workbook.xlsx.writeBuffer())
+        for (let i = 0; i < READS; i++) {
+            const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+            expect(r.status).toBe('extracted')
+            for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`=== N${s} ===`)
+        }
+    })
+
+    // OPC part names compare ASCII-case-insensitively, while exceljs dispatches this control part by
+    // exact spelling. The private rewrite canonicalizes it so shared-string indices resolve to text.
+    it('preserves text from a case-variant shared-string part', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Data')
+        sheet.addRow(['Alpha Beta'])
+        sheet.addRow(['Gamma', 42])
+        const zip = await JSZip.loadAsync(Buffer.from(await workbook.xlsx.writeBuffer()))
+        const strings = await zip.file('xl/sharedStrings.xml')!.async('nodebuffer')
+        zip.remove('xl/sharedStrings.xml')
+        zip.file('xl/SharedStrings.xml', strings)
+
+        const r = await extractAttachment({
+            content: await zip.generateAsync({ type: 'nodebuffer' }),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(false)
+        expect(r.extraction).toBe('=== Data ===\nAlpha Beta\nGamma\t42')
+    })
+
+    // The two shapes where streaming deliberately does NOT reproduce workbook.xlsx.load(). Pinned so
+    // they stay deliberate: both are improvements for a search index, but both change what a merged
+    // workbook's rows and columns look like against main, and an unpinned improvement is
+    // indistinguishable from an accident.
+    it('emits a merged cell once instead of proxying it into every slave cell', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Merged')
+        sheet.getCell('A1').value = 'TITLE'
+        sheet.mergeCells('A1:C1') // horizontal
+        sheet.getCell('A2').value = 'a'
+        sheet.getCell('B2').value = 'b'
+        sheet.getCell('C2').value = 'c'
+        sheet.getCell('A3').value = 'SIDE'
+        sheet.mergeCells('A3:A5') // vertical
+        sheet.getCell('B3').value = 'x'
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        // load() gave "TITLE\tTITLE\tTITLE" and two trailing "SIDE" rows carrying nothing else.
+        expect(r.extraction).toBe('=== Merged ===\nTITLE\na\tb\tc\nSIDE\tx')
+    })
+
+    it('emits an error-valued formula as empty rather than stringifying the value object', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Err')
+        sheet.getCell('A1').value = { formula: '1/0', result: { error: '#DIV/0!' } } as never
+        sheet.getCell('B1').value = 'ok'
+
+        const r = await extractAttachment({
+            content: Buffer.from(await workbook.xlsx.writeBuffer()),
+            contentType: XLSX_TYPE,
+        })
+        expect(r.extraction).toBe('=== Err ===\n\tok') // load() put "[object Object]" in that cell
+        expect(r.extraction).not.toContain('[object Object]')
+    })
+
+    // The reorder rewrites the archive before the parser sees it, so it must not disturb the values.
+    it('preserves cell values, formula results and sheet names through the reorder', async () => {
+        const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
+        expect(r.extraction).toContain('=== Q1 ===')
+        expect(r.extraction).toContain('=== Notes ===')
+        expect(r.extraction).toContain('West\t4200')
+        expect(r.extraction).toContain('Total\t7300') // formula RESULT survived
+        expect(r.extraction).not.toContain('SUM(')
+    })
+})
+
+// Sheet identity --------------------------------------------------------------
+// Order, names and membership come from xl/workbook.xml + its rels, not from the archive. Every
+// fixture here needs the two to DISAGREE, and exceljs's writer never produces that — it emits
+// <sheets> in file order with relative rel targets — so each is built by editing the parts of a
+// real workbook afterwards, which is how all three shapes reach us in the wild anyway.
+
+describe('attachment — xlsx sheet identity comes from the workbook', () => {
+    const rebuild = async (content: Buffer, edit: (zip: JSZip) => Promise<void>): Promise<Buffer> => {
+        const zip = await JSZip.loadAsync(content)
+        await edit(zip)
+        return zip.generateAsync({ type: 'nodebuffer' })
+    }
+
+    const part = (zip: JSZip, name: string) => zip.file(name)!.async('string')
+    const headers = (extraction?: string) => extraction?.match(/^=== .* ===$/gm)
+
+    // Dragging a tab in Excel reorders <sheets> and leaves the sheetN.xml parts exactly where they
+    // were. load() followed <sheets>; reading entry order does not.
+    it('emits sheets in tab order when it disagrees with archive order', async () => {
+        const dragged = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            zip.file(
+                'xl/workbook.xml',
+                xml.replace(/<sheets>(.*?)<\/sheets>/, (_, inner: string) => {
+                    const elements = inner.match(/<sheet\b[^>]*\/>/g) ?? []
+                    return `<sheets>${elements.reverse().join('')}</sheets>`
+                })
+            )
+        })
+
+        const r = await extractAttachment({ content: dragged, contentType: XLSX_TYPE })
+        expect(headers(r.extraction)).toEqual(['=== S3 ===', '=== S2 ===', '=== S1 ==='])
+        // The ROWS have to move with the header — reordering names alone would mislabel every sheet.
+        expect(r.extraction).toMatch(/=== S3 ===\ns3r1/)
+        expect(r.extraction).toMatch(/=== S1 ===\ns1r1/)
+    })
+
+    // A legal absolute Target. exceljs compares rel.Target to the single string
+    // `worksheets/sheetN.xml`, so this spelling matches nothing and every sheet lost its name.
+    it('resolves an absolute rel Target rather than falling back to positional names', async () => {
+        const absolute = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/_rels/workbook.xml.rels')
+            const absolutized = xml.replace(/Target="(worksheets\/sheet\d+\.xml)"/g, 'Target="/xl/$1"')
+            zip.file('xl/_rels/workbook.xml.rels', absolutized)
+        })
+
+        const r = await extractAttachment({ content: absolute, contentType: XLSX_TYPE })
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+        expect(r.extraction).not.toMatch(/=== Sheet\d+ ===/) // the old fallback naming
+    })
+
+    // A worksheet part no <sheet> references — a stale part left by an editing tool. The archive
+    // holds it, the workbook does not, and load() ignored it; entry-order dispatch emitted it as a
+    // sheet of its own with content duplicated from wherever it was copied.
+    it('drops a worksheet part the workbook does not reference', async () => {
+        const withOrphan = await rebuild(await workbookWith(2, 2), async (zip) => {
+            zip.file('xl/worksheets/sheet7.xml', await part(zip, 'xl/worksheets/sheet1.xml'))
+        })
+
+        const r = await extractAttachment({ content: withOrphan, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted') // the orphan must not trip the lost-worksheet backstop
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ==='])
+        expect(r.extraction!.match(/s1r1/g)).toHaveLength(1) // emitted once, not duplicated
+    })
+
+    // The fallback path, for an archive whose workbook relationships cannot be read. The reader-only
+    // rewrite injects an empty relationships part, setting exceljs's workbookRels flag and keeping
+    // every worksheet inline instead of spooling it to a temp file. Archive order supplies identity.
+    it('returns every worksheet deterministically when the rels part is missing', async () => {
+        const noRels = await rebuild(await workbookWith(3, 2), async (zip) => {
+            zip.remove('xl/_rels/workbook.xml.rels')
+        })
+
+        for (let i = 0; i < 12; i++) {
+            const r = await extractAttachment({ content: noRels, contentType: XLSX_TYPE })
+            expect(r.status).toBe('extracted')
+            expect(headers(r.extraction)).toEqual(['=== Sheet1 ===', '=== Sheet2 ===', '=== Sheet3 ==='])
+            for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+        }
+    })
+
+    it.each([
+        ['empty', ''],
+        ['rootless', '<root/>'],
+    ])('never enters ExcelJS temp-file spooling for a present-but-%s rels part', async (_label, relsBody) => {
+        const content = await rebuild(await workbookWith(6, 1), async (zip) => {
+            zip.file('xl/_rels/workbook.xml.rels', relsBody)
+        })
+        const tmp = require('tmp') as { file: (...args: unknown[]) => unknown }
+        const originalFile = tmp.file
+        let spoolCalls = 0
+        tmp.file = (..._args) => {
+            spoolCalls += 1
+            throw new Error('ExcelJS temp-file spool reached')
+        }
+        try {
+            const r = await extractAttachment({ content, contentType: XLSX_TYPE }, { maxOutputChars: 12 })
+            expect(r.status).toBe('extracted')
+            expect(r.truncated).toBe(true)
+            expect(spoolCalls).toBe(0)
+        } finally {
+            tmp.file = originalFile
+        }
+    })
+
+    // MEMBERSHIP is the archive's, not the workbook's. The workbook still declares three sheets here
+    // — only the relationship placing one of them is gone — so dropping that part would DELETE its
+    // text, and invisibly: the backstop compares `seen` against the resolved list, so removing a
+    // sheet from both sides keeps them equal and it never fires. This is the same hazard the
+    // lost-worksheet backstop exists for, reached from the other end.
+    it('keeps a declared sheet whose relationship cannot be resolved', async () => {
+        const brokenRel = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', xml.replace(/<Relationship[^>]*sheet2\.xml"[^>]*\/>/, ''))
+        })
+
+        const r = await extractAttachment({ content: brokenRel, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        // Named S1/S3 where the workbook could say so, and the unplaceable one kept under the
+        // fallback name — it loses its tab position, which is unknowable, but never its rows.
+        expect(headers(r.extraction)).toHaveLength(3)
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // Targets are URI references, so this spelling is legal and names sheet2.xml. Undecoded it
+    // resolves to nothing, which before the membership fix silently deleted the sheet.
+    it('resolves a percent-encoded rel Target', async () => {
+        const encoded = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', xml.replace('worksheets/sheet2.xml', 'worksheets/sheet%32.xml'))
+        })
+
+        const r = await extractAttachment({ content: encoded, contentType: XLSX_TYPE })
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+        expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
+    })
+
+    // The three shapes below are all one mistake: reading "we could not account for this" as "there
+    // was nothing there". Each returned a clean `extracted` while deleting rows.
+
+    // A <sheets> yielding no declaration at all is a workbook we did not understand, not a workbook
+    // with no sheets. Honoring the empty answer drops every worksheet part — the whole document,
+    // reported as success with no text whatsoever.
+    it('falls back to the archive when the workbook declares no sheets at all', async () => {
+        const noDeclarations = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            zip.file('xl/workbook.xml', xml.replace(/<sheets>.*?<\/sheets>/, '<sheets/>'))
+        })
+
+        const r = await extractAttachment({ content: noDeclarations, contentType: XLSX_TYPE })
+        expect(headers(r.extraction)).toHaveLength(3)
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // OPC compares part URIs ASCII-case-insensitively, so this Target legally names the entry stored
+    // as xl/worksheets/sheet2.xml. Matching case-sensitively left it unresolvable: the rows survived
+    // through the rescue, but under a fallback name and at the end, so the sheet lost its identity.
+    it('resolves a Target that differs from the stored entry only in case', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', xml.replace('worksheets/sheet2.xml', 'Worksheets/sheet2.xml'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        // Name and tab position both, not merely the rows — that is what case-sensitivity cost.
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+        expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
+    })
+
+    // OPC applies the same case-insensitive rule to the stored part URI, while exceljs's streaming
+    // reader dispatches only a lowercase xl/worksheets/sheetN.xml. The in-memory rebuild bridges the
+    // two by canonicalizing its private copy; the source archive is never mutated.
+    it('extracts a worksheet whose stored part name differs only in case', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const sheet = await zip.file('xl/worksheets/sheet2.xml')!.async('nodebuffer')
+            zip.remove('xl/worksheets/sheet2.xml')
+            zip.file('xl/Worksheets/Sheet2.xml', sheet)
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+        expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
+    })
+
+    // OPC relationships and content types, not filename conventions, identify a worksheet part.
+    // Streaming exceljs does not dispatch a custom path, so the rebuild gives only the streamed copy
+    // a canonical name and emits the measured entry once.
+    it('extracts a relationship-declared worksheet stored at a custom part path', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const from = 'xl/worksheets/sheet2.xml'
+            const to = 'xl/custom/quarterly-data.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet2.xml', 'custom/quarterly-data.xml'))
+
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file('[Content_Types].xml', types.replace('/xl/worksheets/sheet2.xml', '/xl/custom/quarterly-data.xml'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+        expect(r.extraction).toMatch(/=== S2 ===\ns2r1/)
+    })
+
+    it('retains a custom worksheet when content-type metadata exceeds the resolver cap', async () => {
+        const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/custom/data.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', 'custom/data.xml'))
+
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file(
+                '[Content_Types].xml',
+                types
+                    .replace('/xl/worksheets/sheet1.xml', '/xl/custom/data.xml')
+                    .replace('</Types>', `<!--${'x'.repeat(4 * 1024 * 1024)}--></Types>`)
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== S1 ===\ns1r1\t1\ns1r2\t2', truncated: false })
+    })
+
+    it('matches a UTF-8 flagged non-ASCII worksheet part name to its relationship target', async () => {
+        const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/custom/café.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', 'custom/café.xml'))
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file('[Content_Types].xml', types.replace('/xl/worksheets/sheet1.xml', '/xl/custom/café.xml'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toBe('=== S1 ===\ns1r1\t1\ns1r2\t2')
+    })
+
+    it('keeps non-ASCII part names distinct when only Unicode case folding would merge them', async () => {
+        const content = await rebuild(await workbookWith(2, 1), async (zip) => {
+            for (const [from, to] of [
+                ['xl/worksheets/sheet1.xml', 'xl/custom/Ä.xml'],
+                ['xl/worksheets/sheet2.xml', 'xl/custom/ä.xml'],
+            ]) {
+                const sheet = await zip.file(from)!.async('nodebuffer')
+                zip.remove(from)
+                zip.file(to, sheet)
+            }
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file(
+                'xl/_rels/workbook.xml.rels',
+                rels.replace('worksheets/sheet1.xml', 'custom/Ä.xml').replace('worksheets/sheet2.xml', 'custom/ä.xml')
+            )
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file(
+                '[Content_Types].xml',
+                types
+                    .replace('/xl/worksheets/sheet1.xml', '/xl/custom/Ä.xml')
+                    .replace('/xl/worksheets/sheet2.xml', '/xl/custom/ä.xml')
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toContain('=== S1 ===\ns1r1')
+        expect(r.extraction).toContain('=== S2 ===\ns2r1')
+    })
+
+    it('resolves case-variant workbook metadata before placing a custom worksheet', async () => {
+        const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/custom/data.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const relsName = 'xl/_rels/workbook.xml.rels'
+            const rels = (await part(zip, relsName)).replace('worksheets/sheet1.xml', 'custom/data.xml')
+            zip.remove(relsName)
+            zip.file('XL/_rels/Workbook.xml.rels', rels)
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file('[Content_Types].xml', types.replace('/xl/worksheets/sheet1.xml', '/xl/custom/data.xml'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', truncated: false })
+        expect(r.extraction).toContain('=== S1 ===\ns1r1')
+    })
+
+    it.each(['uppercase Override media type', 'Default extension mapping'])(
+        'authorizes a custom worksheet through %s',
+        async (variant) => {
+            const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+                const from = 'xl/worksheets/sheet1.xml'
+                const to = variant.startsWith('Default') ? 'xl/custom/data.foo' : 'xl/custom/data.xml'
+                const sheet = await zip.file(from)!.async('nodebuffer')
+                zip.remove(from)
+                zip.file(to, sheet)
+
+                const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+                zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', to.slice(3)))
+                const types = await part(zip, '[Content_Types].xml')
+                if (variant.startsWith('Default')) {
+                    zip.file(
+                        '[Content_Types].xml',
+                        types
+                            .replace(/<Override PartName="\/xl\/worksheets\/sheet1\.xml"[^>]*\/>/, '')
+                            .replace(
+                                '</Types>',
+                                '<Default Extension="foo" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
+                            )
+                    )
+                } else {
+                    zip.file(
+                        '[Content_Types].xml',
+                        types
+                            .replace('/xl/worksheets/sheet1.xml', '/xl/custom/data.xml')
+                            .replace(
+                                'application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml',
+                                'APPLICATION/VND.OPENXMLFORMATS-OFFICEDOCUMENT.SPREADSHEETML.WORKSHEET+XML'
+                            )
+                    )
+                }
+            })
+
+            const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+            expect(r).toMatchObject({ status: 'extracted', truncated: false })
+            expect(r.extraction).toContain('=== S1 ===\ns1r1')
+        }
+    )
+
+    // Relationship type and content type are declarations from the same untrusted package, not
+    // independent corroboration. Even when both call styles.xml a worksheet, a structural part must
+    // never replace the real sheet or be emitted twice by the rebuilt archive.
+    it.each([
+        ['a reader-control part', 'styles.xml'],
+        ['another non-worksheet XML part', 'theme/theme1.xml'],
+    ])('rescues real rows when forged declarations point a worksheet at %s', async (_label, target) => {
+        const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('Target="worksheets/sheet1.xml"', `Target="${target}"`))
+
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file(
+                '[Content_Types].xml',
+                types.replace(
+                    '</Types>',
+                    `<Override PartName="/xl/${target}" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`
+                )
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('s1r1')
+        expect(r.extraction!.match(/s1r1/g)).toHaveLength(1)
+    })
+
+    // Resolving OUTSIDE xl/worksheets is normal — chartsheets live there — but the declaration has to
+    // be accountable. The first resolves to nothing; the last two resolve to a part that EXISTS,
+    // which is why "does the archive hold it?" was the wrong question on its own — neither holds this
+    // sheet's rows, and the part that does goes unclaimed.
+    it.each([
+        ['absolute without the xl/ prefix', '/worksheets/sheet2.xml', undefined],
+        ['a real part that is not a sheet', 'styles.xml', undefined],
+        ['a stray backup beside the real part', 'worksheets/sheet2.xml.bak', 'xl/worksheets/sheet2.xml.bak'],
+    ])('keeps a declared sheet whose Target is %s', async (_label, target, plant) => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            if (plant) zip.file(plant, await part(zip, 'xl/worksheets/sheet2.xml'))
+            const xml = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', xml.replace('worksheets/sheet2.xml', target))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // The control for the rule above: a chartsheet is a real declaration with no worksheet part, so
+    // it must NOT count as unplaced — otherwise every workbook holding one flips into rescue mode and
+    // resurrects the orphans this change exists to drop. Both halves asserted at once.
+    it('drops an orphan part while a declared chartsheet reads as accounted for', async () => {
+        const content = await rebuild(await workbookWith(1, 2), async (zip) => {
+            zip.file('xl/chartsheets/sheet1.xml', '<chartsheet/>')
+            zip.file('xl/worksheets/sheet9.xml', await part(zip, 'xl/worksheets/sheet1.xml'))
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file(
+                'xl/_rels/workbook.xml.rels',
+                rels.replace(
+                    '</Relationships>',
+                    '<Relationship Id="rIdChart" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet" Target="chartsheets/sheet1.xml"/></Relationships>'
+                )
+            )
+            const xml = await part(zip, 'xl/workbook.xml')
+            zip.file('xl/workbook.xml', xml.replace('</sheets>', '<sheet name="Chart" sheetId="2" r:id="rIdChart"/></sheets>'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        // sheet9 is a copy of sheet1's rows, so a resurrected orphan shows up as a second header —
+        // the row text alone could not tell the two apart.
+        expect(headers(r.extraction)).toEqual(['=== S1 ==='])
+    })
+
+    // The control above passes for the wrong reason if "is this a chart sheet?" is answered from the
+    // TARGET's path, which the producer writes. Here the relationship still says Type=worksheet and
+    // only the path is redirected onto a planted chartsheet part: a path whitelist reads it as an
+    // accounted-for chart sheet, and the worksheet part actually holding the rows is dropped.
+    it('classifies a sheet by relationship type, not by the path its target happens to take', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            zip.file('xl/chartsheets/sheet1.xml', '<chartsheet/>')
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file(
+                'xl/_rels/workbook.xml.rels',
+                rels.replace('Target="worksheets/sheet2.xml"', 'Target="chartsheets/sheet1.xml"')
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // The mirror of the test above, and the reason neither signal is trusted alone: here the TYPE
+    // says chartsheet while the target still points at the worksheet part holding the rows. Trusting
+    // the type by itself accepted the declaration as accounted-for and dropped that part as an orphan.
+    it('treats a non-worksheet type contradicted by its target as unplaced', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file(
+                'xl/_rels/workbook.xml.rels',
+                rels.replace(
+                    /(<Relationship[^>]*)Type="[^"]*\/worksheet"([^>]*Target="worksheets\/sheet2\.xml")/,
+                    '$1Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet"$2'
+                )
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // And the third way the pair can disagree: the type names a chart sheet, the target resolves to a
+    // real part, and that part is neither a worksheet nor a chart sheet. "Not a worksheet" was too
+    // weak a test — the kinds have to match, or the sheet that does hold the rows goes unclaimed.
+    it('treats a non-worksheet type pointing at an unrelated part as unplaced', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file(
+                'xl/_rels/workbook.xml.rels',
+                rels.replace(
+                    /(<Relationship[^>]*)Type="[^"]*\/worksheet"([^>]*)Target="worksheets\/sheet2\.xml"/,
+                    '$1Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/chartsheet"$2Target="styles.xml"'
+                )
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // And the fourth way the pair can disagree: a type that is not a relationship type at all, only
+    // spelled to end like one. A type is an exact identifier the format defines, so matching its tail
+    // let any stranger claim the authority — planted with a chart-sheet part to point at, so the
+    // target agrees and nothing but the type's origin is wrong.
+    it('rejects a foreign relationship type that merely ends like a chartsheet one', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            zip.file('xl/chartsheets/fake.xml', '<chartsheet/>')
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file(
+                'xl/_rels/workbook.xml.rels',
+                rels.replace(
+                    /(<Relationship[^>]*)Type="[^"]*\/worksheet"([^>]*)Target="worksheets\/sheet2\.xml"/,
+                    '$1Type="https://invalid.example/relationships/chartsheet"$2Target="chartsheets/fake.xml"'
+                )
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        for (let s = 1; s <= 3; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    // ISO/IEC 29500 Strict is a legal .xlsx — Excel offers it as "Strict Open XML Workbook" — and
+    // re-homes the same vocabulary under purl.oclc.org. Recognizing only Transitional matched no
+    // <sheet> at all, so a Strict workbook silently lost its tab order and names to the archive's.
+    it('reads sheet identity from an ISO Strict workbook', async () => {
+        const strict = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            zip.file(
+                'xl/workbook.xml',
+                xml
+                    .replace(/<sheets>(.*?)<\/sheets>/, (_, inner: string) => {
+                        const elements = inner.match(/<sheet\b[^>]*\/>/g) ?? []
+                        return `<sheets>${elements.reverse().join('')}</sheets>`
+                    })
+                    .replace(
+                        'http://schemas.openxmlformats.org/spreadsheetml/2006/main',
+                        'http://purl.oclc.org/ooxml/spreadsheetml/main'
+                    )
+                    .replace(
+                        'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+                        'http://purl.oclc.org/ooxml/officeDocument/relationships'
+                    )
+            )
+        })
+
+        const r = await extractAttachment({ content: strict, contentType: XLSX_TYPE })
+        // Reversed tab order, under the workbook's own names — the archive fallback would give
+        // Sheet1, Sheet2, Sheet3 in file order, which is what this used to return.
+        expect(headers(r.extraction)).toEqual(['=== S3 ===', '=== S2 ===', '=== S1 ==='])
+    })
+
+    // Element identity is (namespace, local name) plus position. Matching bare local names let a
+    // foreign <foo:sheet> in an extension block claim a real sheet's part before the genuine
+    // declaration reached it, so the sheet came back under the injected name and tab position.
+    it('ignores a foreign element whose local name is sheet', async () => {
+        const content = await rebuild(await workbookWith(3, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            const rId = /<sheet [^>]*name="S2"[^>]*r:id="([^"]+)"/.exec(xml)![1]
+            zip.file(
+                'xl/workbook.xml',
+                xml.replace(
+                    '<sheets>',
+                    `<extLst xmlns:foo="urn:example:foreign"><foo:sheet name="Injected" r:id="${rId}"/></extLst><sheets>`
+                )
+            )
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(headers(r.extraction)).toEqual(['=== S1 ===', '=== S2 ===', '=== S3 ==='])
+    })
+
+    // The two metadata parts are read whole, so their size has to be bounded independently of the
+    // 50 MB archive budget — one part spending all of it costs that twice over, as a Buffer and then
+    // as the string the parse needs. Over the cap degrades to the archive's own parts; it never fails.
+    it('falls back to the archive rather than materializing an oversized workbook part', async () => {
+        const padded = await rebuild(await workbookWith(2, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            zip.file('xl/workbook.xml', xml.replace('<sheets>', `<!--${' '.repeat(5 * 1024 * 1024)}--><sheets>`))
+        })
+
+        const r = await extractAttachment({ content: padded, contentType: XLSX_TYPE })
+        // Archive order and fallback names — the workbook's own naming is what we declined to read.
+        expect(headers(r.extraction)).toEqual(['=== Sheet1 ===', '=== Sheet2 ==='])
+        for (let s = 1; s <= 2; s++) expect(r.extraction).toContain(`s${s}r1`)
+    })
+
+    it('retains a custom worksheet when workbook metadata exceeds the resolver cap', async () => {
+        const padded = await rebuild(await workbookWith(1, 2), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/custom/data.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', 'custom/data.xml'))
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file('[Content_Types].xml', types.replace('/xl/worksheets/sheet1.xml', '/xl/custom/data.xml'))
+            const workbook = await part(zip, 'xl/workbook.xml')
+            zip.file('xl/workbook.xml', workbook.replace('<sheets>', `<!--${'x'.repeat(5 * 1024 * 1024)}--><sheets>`))
+        })
+
+        const r = await extractAttachment({ content: padded, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== Sheet ===\ns1r1\t1\ns1r2\t2', truncated: false })
+    })
+
+    it('keeps an Override from inheriting a worksheet Default in metadata fallback', async () => {
+        const content = await rebuild(await workbookWith(1, 1), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/custom/data.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', 'custom/data.xml'))
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file(
+                '[Content_Types].xml',
+                types
+                    .replace(
+                        'Extension="xml" ContentType="application/xml"',
+                        'Extension="xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"'
+                    )
+                    .replace('/xl/worksheets/sheet1.xml', '/xl/custom/data.xml')
+                    .replace(
+                        'PartName="/xl/custom/data.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"',
+                        'PartName="/xl/custom/data.xml" ContentType="application/xml"'
+                    )
+            )
+            const workbook = await part(zip, 'xl/workbook.xml')
+            zip.file('xl/workbook.xml', workbook.replace('<sheets>', `<!--${'x'.repeat(5 * 1024 * 1024)}--><sheets>`))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('failed')
+        expect(r.extraction).toBeUndefined()
+        expect(r.reason).toMatch(/no worksheet parts could be identified/i)
+    })
+
+    it('resolves escaped OPC worksheet paths without decoding them away from the ZIP item', async () => {
+        const content = await rebuild(await workbookWith(1, 1), async (zip) => {
+            const from = 'xl/worksheets/sheet1.xml'
+            const to = 'xl/worksheets/custom%20sheet.xml'
+            const sheet = await zip.file(from)!.async('nodebuffer')
+            zip.remove(from)
+            zip.file(to, sheet)
+
+            const rels = await part(zip, 'xl/_rels/workbook.xml.rels')
+            zip.file('xl/_rels/workbook.xml.rels', rels.replace('worksheets/sheet1.xml', 'worksheets/custom%20sheet.xml'))
+            const types = await part(zip, '[Content_Types].xml')
+            zip.file('[Content_Types].xml', types.replace('/xl/worksheets/sheet1.xml', '/xl/worksheets/custom%20sheet.xml'))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', extraction: '=== S1 ===\ns1r1\t1', truncated: false })
+    })
+
+    // parseWorkbookParts uses saxes with namespaces enabled, whose prefix resolution scans every
+    // open tag. The depth guard must make this fallback quickly; without it 20k nested elements take
+    // several seconds synchronously and the handler timeout cannot fire while the event loop is held.
+    it('bounds deeply nested workbook metadata before saxes becomes quadratic', async () => {
+        const content = await rebuild(await workbookWith(2, 2), async (zip) => {
+            const xml = await part(zip, 'xl/workbook.xml')
+            const nested = '<extLst>'.repeat(20_000) + '</extLst>'.repeat(20_000)
+            zip.file('xl/workbook.xml', xml.replace('<sheets>', `${nested}<sheets>`))
+        })
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted')
+        for (let s = 1; s <= 2; s++) expect(r.extraction).toContain(`s${s}r1`)
+    }, 2_000)
+
+})
+
+// The rebuild vs the decompression budget --------------------------------------
+// The budget measures each central-directory record once, then reorderForStreaming decides what
+// unzipper actually gets. That only binds if the rebuild can never write a measured entry more than
+// once — and zip permits duplicate entry names, so resolving layout through a name lookup collapsed
+// every reference onto the first entry carrying that name and re-emitted its bytes per reference.
+// Measured at 21x on a 111 KB input: 1.5 MB budgeted, 31.5 MB rebuilt. Scaled inside the existing
+// gates that is a 5 MB attachment forcing a 0.8 GB allocation, which is an OOM the API side cannot
+// contain — not a JS throw, so its per-attachment catch never sees it.
+
+describe('attachment — the rebuild cannot amplify what the budget measured', () => {
+    // Hand-built, because JSZip dedupes by name and duplicate names are the whole point.
+    const buildZip = (files: { name: string; data: Buffer }[]) => {
+        const locals: Buffer[] = []
+        const centrals: Buffer[] = []
+        let offset = 0
+        for (const file of files) {
+            const name = Buffer.from(file.name, 'latin1')
+            const deflated = zlib.deflateRawSync(file.data)
+            const local = Buffer.alloc(30)
+            local.writeUInt32LE(0x04034b50, 0)
+            local.writeUInt16LE(20, 4)
+            local.writeUInt16LE(8, 8)
+            local.writeUInt32LE(zlib.crc32(file.data), 14)
+            local.writeUInt32LE(deflated.length, 18)
+            local.writeUInt32LE(file.data.length, 22)
+            local.writeUInt16LE(name.length, 26)
+            locals.push(local, name, deflated)
+            const central = Buffer.alloc(46)
+            central.writeUInt32LE(0x02014b50, 0)
+            central.writeUInt16LE(20, 4)
+            central.writeUInt16LE(20, 6)
+            central.writeUInt16LE(8, 10)
+            central.writeUInt32LE(zlib.crc32(file.data), 16)
+            central.writeUInt32LE(deflated.length, 20)
+            central.writeUInt32LE(file.data.length, 24)
+            central.writeUInt16LE(name.length, 28)
+            central.writeUInt32LE(offset, 42)
+            centrals.push(central, name)
+            offset += 30 + name.length + deflated.length
+        }
+        const directory = Buffer.concat(centrals)
+        const end = Buffer.alloc(22)
+        end.writeUInt32LE(0x06054b50, 0)
+        end.writeUInt16LE(files.length, 8)
+        end.writeUInt16LE(files.length, 10)
+        end.writeUInt32LE(directory.length, 12)
+        end.writeUInt32LE(offset, 16)
+        return Buffer.concat([...locals, directory, end])
+    }
+
+    it('matches Mammoth by selecting the last duplicate DOCX main part', async () => {
+        const document = (value: string) =>
+            buf(
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' +
+                    `<w:p><w:r><w:t>${value}</w:t></w:r></w:p></w:body></w:document>`
+            )
+        const content = buildZip([
+            { name: '[Content_Types].xml', data: buf('<Types/>') },
+            { name: 'word/document.xml', data: document('FIRST') },
+            { name: 'word/document.xml', data: document('LAST') },
+        ])
+
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        expect(r).toMatchObject({ status: 'extracted', extraction: 'LAST\n\n', truncated: false })
+    })
+
+    // What checkDecompressionBudget counts: every central-directory record's uncompressed size, once.
+    const budgetMeasures = (buf: Buffer) => {
+        const eocd = buf.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]))
+        let p = buf.readUInt32LE(eocd + 16)
+        let total = 0
+        for (let i = buf.readUInt16LE(eocd + 10); i > 0; i--) {
+            total += buf.readUInt32LE(p + 24)
+            p += 46 + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
+        }
+        return total
+    }
+
+    // What unzipper would actually expand: every LOCAL record of the rebuilt archive.
+    const rebuildInflatesTo = (buf: Buffer) => {
+        let p = 0
+        let total = 0
+        while (p + 30 <= buf.length && buf.readUInt32LE(p) === 0x04034b50) {
+            const method = buf.readUInt16LE(p + 8)
+            const compSize = buf.readUInt32LE(p + 18)
+            const start = p + 30 + buf.readUInt16LE(p + 26) + buf.readUInt16LE(p + 28)
+            total += method === 0 ? compSize : zlib.inflateRawSync(buf.subarray(start, start + compSize)).length
+            p = start + compSize
+        }
+        return total
+    }
+
+    it.each(['xl/sharedStrings.xml', 'xl/SharedStrings.xml'])(
+        'fails closed when a duplicate control part is stored as %s',
+        async (duplicateName) => {
+            const xml = (value: string) => Buffer.from(value, 'latin1')
+            const content = buildZip([
+                {
+                    name: '[Content_Types].xml',
+                    data: xml(
+                        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">' +
+                            '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' +
+                            '</Types>'
+                    ),
+                },
+                {
+                    name: 'xl/workbook.xml',
+                    data: xml(
+                        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" ' +
+                            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+                            '<sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>'
+                    ),
+                },
+                {
+                    name: 'xl/_rels/workbook.xml.rels',
+                    data: xml(
+                        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+                            '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+                            '</Relationships>'
+                    ),
+                },
+                {
+                    name: 'xl/worksheets/sheet1.xml',
+                    data: xml(
+                        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+                            '<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row></sheetData></worksheet>'
+                    ),
+                },
+                {
+                    name: 'xl/sharedStrings.xml',
+                    data: xml(
+                        '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="1" uniqueCount="1"><si><t>KEEP</t></si></sst>'
+                    ),
+                },
+                {
+                    name: duplicateName,
+                    data: xml(
+                        '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>'
+                    ),
+                },
+            ])
+
+            const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+            expect(r.status).toBe('failed')
+            expect(r.reason).toMatch(/duplicate control part xl\/sharedStrings\.xml/i)
+        }
+    )
+
+    it('writes each measured entry at most once, even when many entries share a name', async () => {
+        const DUPLICATES = 20
+        const rows = Array.from(
+            { length: 20_000 },
+            (_, r) => `<row r="${r + 1}"><c t="inlineStr"><is><t>padding cell ${r}</t></is></c></row>`
+        ).join('')
+        const sheetXml = (body: string) =>
+            Buffer.from(
+                `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">${body}</worksheet>`,
+                'latin1'
+            )
+        // One heavy entry and 20 trivial ones, ALL named xl/worksheets/sheet1.xml. No rels part, so
+        // resolution takes the archive fallback — the path that used to map all 21 onto the heavy one.
+        const content = buildZip([
+            { name: '[Content_Types].xml', data: Buffer.from('<Types/>', 'latin1') },
+            {
+                name: 'xl/workbook.xml',
+                data: Buffer.from('<workbook><sheets><sheet name="A" sheetId="1" r:id="rId1"/></sheets></workbook>', 'latin1'),
+            },
+            { name: 'xl/worksheets/sheet1.xml', data: sheetXml(`<sheetData>${rows}</sheetData>`) },
+            ...Array.from({ length: DUPLICATES }, () => ({
+                name: 'xl/worksheets/sheet1.xml',
+                data: sheetXml('<sheetData/>'),
+            })),
+        ])
+
+        // Capture the bytes the handler hands the reader. Asserting on the extraction instead would
+        // measure the wrong thing — the amplification is in the archive, before a cap can apply.
+        let rebuilt = Buffer.alloc(0)
+        vi.resetModules()
+        vi.doMock('exceljs', () => ({
+            default: {
+                stream: {
+                    xlsx: {
+                        WorkbookReader: class {
+                            stream: NodeJS.ReadableStream
+                            constructor(stream: NodeJS.ReadableStream) {
+                                this.stream = stream
+                                stubExcelReaderHooks(this)
+                            }
+                            async *[Symbol.asyncIterator]() {
+                                const chunks: Buffer[] = []
+                                for await (const chunk of this.stream) chunks.push(chunk as Buffer)
+                                rebuilt = Buffer.concat(chunks)
+                            }
+                        },
+                    },
+                },
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            await extract({ content, contentType: XLSX_TYPE })
+        } finally {
+            vi.doUnmock('exceljs')
+            vi.resetModules()
+        }
+
+        // The only entries the rebuild adds without central records are fixed empty control parts
+        // of ours, not anything the input controls.
+        expect(rebuildInflatesTo(rebuilt)).toBeLessThanOrEqual(budgetMeasures(content) + 300)
+    })
+
+    // The same "a name is not a key" mistake, on the other side of the ledger: layout stopped
+    // duplicating entries, but the rescue that saves unplaced ones still excluded them BY NAME, so
+    // the entry nobody laid out was thrown away with the one that was. Here rather than beside the
+    // other sheet-identity tests because only this block can build an archive JSZip refuses to.
+    it('rescues an entry sharing a claimed name rather than excluding it by name', async () => {
+        const sheet = (v: string) =>
+            Buffer.from(
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+                    `<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>${v}</t></is></c></row></sheetData></worksheet>`,
+                'latin1'
+            )
+        // Alpha resolves to sheet1.xml; Beta's r:id matches no relationship, so it goes unplaced and
+        // the rescue engages. Two DISTINCT entries share that name, and only one is ever laid out.
+        const content = buildZip([
+            { name: '[Content_Types].xml', data: Buffer.from('<Types/>', 'latin1') },
+            {
+                name: 'xl/workbook.xml',
+                data: Buffer.from(
+                    '<workbook xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' +
+                        '<sheet name="Alpha" sheetId="1" r:id="rId1"/><sheet name="Beta" sheetId="2" r:id="rIdMISSING"/>' +
+                        '</sheets></workbook>',
+                    'latin1'
+                ),
+            },
+            {
+                name: 'xl/_rels/workbook.xml.rels',
+                data: Buffer.from(
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+                        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>' +
+                        '</Relationships>',
+                    'latin1'
+                ),
+            },
+            { name: 'xl/worksheets/sheet1.xml', data: sheet('AAA-claimed') },
+            { name: 'xl/worksheets/sheet1.xml', data: sheet('BBB-the-victim') },
+        ])
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.extraction).toContain('AAA-claimed')
+        expect(r.extraction).toContain('BBB-the-victim')
+    })
+})
+
+// Post-cap emptiness, CRC pin, and the lost-worksheet backstop --------------------------
+
+describe('attachment — emptiness is decided after the cap', () => {
+    // The pdf handler reports `empty` from its PRE-cap page join, so on a tight cap it answers
+    // `false` about text the central slice then reduces to nothing; `??` would emit that as '', or
+    // as a bare trailer with no document text. Routed through a PDF because pdf is the only handler
+    // that sets `empty` — a text/plain input cannot exercise this.
+    const pdfWithText = () => buildPdf([['some real extractable text on page one']])
+
+    it('omits extraction when the cap slices a pdf to nothing, rather than returning an empty string', async () => {
+        const r = await extractAttachment({ content: pdfWithText(), contentType: 'application/pdf' }, { maxOutputChars: 0 })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBeUndefined() // never '', per the contract
+        expect('extraction' in r).toBe(false)
+    })
+
+    it('never returns a bare trailer with no document text in front of it', async () => {
+        const trailer = '\n[truncated]'
+        const r = await extractAttachment(
+            { content: pdfWithText(), contentType: 'application/pdf' },
+            { maxOutputChars: 0, trailer }
+        )
+        expect(r.extraction).toBeUndefined()
+        expect(r.extraction ?? '').not.toBe(trailer)
+    })
+
+    // A handler's own `empty: true` must still be honoured: the guard only stops a stale `false`
+    // from overriding a genuinely-empty slice.
+    it('still honours a handler that reports itself empty', async () => {
+        const r = await extractAttachment({ content: fixture('blank.pdf'), contentType: 'application/pdf' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBeUndefined()
+    })
+})
+
+// xlsx deadline enforcement ---------------------------------------------------
+// The deadline check has to run once per ROW, not once per row that produced text: an all-empty row
+// is skipped and trips no cap, so a check below that skip leaves the budget unenforced exactly where
+// the loop is cheapest to spin.
+
+describe('attachment — xlsx honours the deadline on contentless rows', () => {
+    // addRow(['']) emits a <row> yielding no non-empty cells — measured: all 30 reach the reader and
+    // all are skipped by the handler. addRow([]) emits nothing, so it cannot exercise this. The
+    // trailing marker row is what makes the stop observable from outside.
+    const sheetOfBlankRows = async (blanks: number) => {
+        const workbook = new ExcelJS.Workbook()
+        const sheet = workbook.addWorksheet('Blanks')
+        for (let i = 0; i < blanks; i++) sheet.addRow([''])
+        sheet.addRow(['TRAILING-MARKER'])
+        return Buffer.from(await workbook.xlsx.writeBuffer())
+    }
+
+    it('stops on a sheet of blank-but-present rows instead of iterating to the end', async () => {
+        const content = await sheetOfBlankRows(400)
+
+        // Blunt, like the pdf deadline test: the FIRST Date.now() sets the deadline, every later
+        // call lands past it. exceljs/unzipper may read the clock themselves, so a mock letting N
+        // rows through would depend on how often they do.
+        const base = Date.now()
+        let calls = 0
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => {
+            calls += 1
+            return calls === 1 ? base : base + HANDLER_TIMEOUT_MS + 1
+        })
+        const stopped = await extractAttachment({ content, contentType: XLSX_TYPE })
+        clock.mockRestore()
+
+        expect(stopped.status).toBe('extracted') // a deadline stop is not a failure
+        expect(stopped.truncated).toBe(true)
+        // The point of the test: the blank rows must not have been walked through to reach this.
+        expect(stopped.extraction ?? '').not.toContain('TRAILING-MARKER')
+
+        // Control: a real clock reads the same bytes to the end and flags nothing. Without it the
+        // assertions above would also pass if the handler simply failed on this workbook.
+        const whole = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(whole.truncated).toBe(false)
+        expect(whole.extraction).toContain('TRAILING-MARKER')
+    })
+
+    it('returns earlier sheet text when the deadline expires across row-less sheets', async () => {
+        const content = await workbookWith(2, 1)
+        let readKept = false
+        const row = {
+            eachCell: (_options: unknown, callback: (cell: { text: string }) => void) => {
+                callback({ text: 'kept' })
+                readKept = true
+            },
+        }
+        const worksheet = (rows: unknown[]) => ({
+            async *[Symbol.asyncIterator]() {
+                for (const value of rows) yield value
+            },
+        })
+
+        vi.resetModules()
+        vi.doMock('exceljs', () => ({
+            default: {
+                stream: {
+                    xlsx: {
+                        WorkbookReader: class {
+                            constructor() {
+                                stubExcelReaderHooks(this)
+                            }
+                            async *[Symbol.asyncIterator]() {
+                                yield worksheet([row])
+                                yield worksheet([]) // never enters the per-row deadline check
+                            }
+                        },
+                    },
+                },
+            },
+        }))
+        const base = Date.now()
+        const clock = vi
+            .spyOn(Date, 'now')
+            .mockImplementation(() => (readKept ? base + HANDLER_TIMEOUT_MS : base))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content, contentType: XLSX_TYPE })
+            expect(r.status).toBe('extracted')
+            expect(r.truncated).toBe(true)
+            expect(r.extraction).toContain('kept')
+        } finally {
+            clock.mockRestore()
+            vi.doUnmock('exceljs')
+            vi.resetModules()
+        }
+    })
+
+    it('checks the deadline while parsing non-row worksheet markup', async () => {
+        const workbook = new ExcelJS.Workbook()
+        workbook.addWorksheet('Markup').addRow(['kept'])
+        const zip = await JSZip.loadAsync(await workbook.xlsx.writeBuffer())
+        const name = 'xl/worksheets/sheet1.xml'
+        const xml = await zip.file(name)!.async('string')
+        zip.file(name, xml.replace('</worksheet>', `<extLst><!--${'x'.repeat(512 * 1024)}--></extLst></worksheet>`))
+        const content = await zip.generateAsync({ type: 'nodebuffer' })
+
+        const base = Date.now()
+        let calls = 0
+        const clock = vi
+            .spyOn(Date, 'now')
+            .mockImplementation(() => (++calls < 8 ? base : base + HANDLER_TIMEOUT_MS + 1))
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        clock.mockRestore()
+
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(true)
+        expect(r.extraction).toContain('kept')
+    })
+})
+
+describe('attachment — xlsx incremental output cap', () => {
+    it('charges sheet headers and separators before reading later worksheets', async () => {
+        const content = await workbookWith(20, 1)
+        const row = {
+            eachCell: (_options: unknown, callback: (cell: { text: string }) => void) => callback({ text: 'x' }),
+        }
+        const worksheet = {
+            async *[Symbol.asyncIterator]() {
+                yield row
+            },
+        }
+
+        vi.resetModules()
+        vi.doMock('exceljs', () => ({
+            default: {
+                stream: {
+                    xlsx: {
+                        WorkbookReader: class {
+                            constructor() {
+                                stubExcelReaderHooks(this)
+                            }
+                            async *[Symbol.asyncIterator]() {
+                                for (let i = 0; i < 4; i++) yield worksheet
+                                throw new Error('reader advanced beyond the header-bound cap')
+                            }
+                        },
+                    },
+                },
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content, contentType: XLSX_TYPE }, { maxOutputChars: 20 })
+            expect(r.status).toBe('extracted')
+            expect(r.truncated).toBe(true)
+            expect(r.extraction).toBe('=== S1 ===\nx\n\n=== S2')
+        } finally {
+            vi.doUnmock('exceljs')
+            vi.resetModules()
+        }
+    })
+})
+
+describe('attachment — xlsx lost-worksheet backstop', () => {
+    // Pins the precomputed CRC against a fresh computation, so the constant and the literal it
+    // describes cannot drift if the injected XML is edited.
+    it('the injected control parts match their precomputed CRCs', () => {
+        const parts: Array<[string, number]> = [
+            [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+                    '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"/>',
+                0x2949bd0b,
+            ],
+            [
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>',
+                0x9f1f1b86,
+            ],
+        ]
+        for (const [body, crc] of parts) expect(zlib.crc32(Buffer.from(body, 'latin1'))).toBe(crc)
+    })
+
+    // The reorder closes the two KNOWN triggers; this proves the CLASS is closed. Deleting a
+    // worksheet part cannot simulate it — that lowers the archive's count too, so there is no
+    // mismatch. The failure is a reader under-yielding against an intact archive, so that is stubbed.
+    it('fails rather than silently returning a workbook with a missing worksheet', async () => {
+        const workbook = new ExcelJS.Workbook()
+        for (const name of ['Alpha', 'Beta', 'Gamma']) workbook.addWorksheet(name).addRow([`${name} data`])
+        const content = Buffer.from(await workbook.xlsx.writeBuffer())
+
+        vi.resetModules()
+        vi.doMock('exceljs', async () => {
+            const actual = await vi.importActual<{ default: typeof ExcelJS }>('exceljs')
+            const Real = actual.default.stream.xlsx.WorkbookReader
+            // Yields the first two of the archive's three worksheets, then stops — exactly the shape
+            // of the upstream entry loss, minus the nondeterminism.
+            class UnderYieldingReader extends Real {
+                async *[Symbol.asyncIterator]() {
+                    let yielded = 0
+                    for await (const worksheet of super[Symbol.asyncIterator]()) {
+                        if (yielded++ >= 2) return
+                        yield worksheet
+                    }
+                }
+            }
+            return {
+                ...actual,
+                default: {
+                    ...actual.default,
+                    stream: { xlsx: { ...actual.default.stream.xlsx, WorkbookReader: UnderYieldingReader } },
+                },
+            }
+        })
+
+        const { extractAttachment: withLossyReader } = await import('../attachment')
+        const r = await withLossyReader({ content, contentType: XLSX_TYPE })
+        vi.doUnmock('exceljs')
+        vi.resetModules()
+
+        expect(r.status).toBe('failed')
+        expect(r.reason).toMatch(/yielded 2 of 3 worksheets/)
+    })
+
+    it('fails fast when the pinned ExcelJS streaming hooks are unavailable', async () => {
+        const content = await workbookWith(1, 1)
+        vi.resetModules()
+        vi.doMock('exceljs', () => ({
+            default: {
+                stream: {
+                    xlsx: {
+                        WorkbookReader: class {
+                            constructor() {
+                                stubExcelReaderHooks(this, '_parseStyles')
+                            }
+                            async *[Symbol.asyncIterator]() {}
+                        },
+                    },
+                },
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content, contentType: XLSX_TYPE })
+            expect(r.status).toBe('failed')
+            expect(r.reason).toMatch(/no _parseStyles; expected the 4\.4\.0 internals/)
+        } finally {
+            vi.doUnmock('exceljs')
+            vi.resetModules()
+        }
+    })
+
+    // The backstop must not fire on a deliberate stop: truncation leaves later sheets unread BY
+    // DESIGN, and turning that into a failure would break every capped large workbook.
+    it('does not fire when extraction stopped early at the cap', async () => {
+        const workbook = new ExcelJS.Workbook()
+        const big = workbook.addWorksheet('Big')
+        const cell = 'x'.repeat(40)
+        for (let i = 0; i < 5_000; i++) big.addRow([cell, cell, cell]) // flattens past the 250k cap
+        workbook.addWorksheet('Later').addRow(['never reached'])
+        const content = Buffer.from(await workbook.xlsx.writeBuffer())
+
+        const r = await extractAttachment({ content, contentType: XLSX_TYPE })
+        expect(r.status).toBe('extracted') // not 'failed', despite 1 of 2 worksheets read
+        expect(r.truncated).toBe(true)
+        expect(r.extraction).not.toContain('=== Later ===')
+    })
+})
+
+// xlsx archive-rewrite limits -------------------------------------------------
+// Built by hand: no writer emits a 65534-entry workbook, and this needs the count exactly. Every
+// entry is empty and stored, keeping the fixture ~5.6 MB (inside MAX_INPUT_BYTES) with a
+// decompressed total of zero, so it reaches the rewrite instead of a gate in front of it.
+
+describe('attachment — xlsx archive rewrite limits', () => {
+    // `dropped` names that many entries so the rewrite's third group discards them: the unanchored
+    // regex exceljs dispatches on matches these, the anchored WORKSHEET_PART does not, so they are
+    // neither laid out nor kept. That is what makes the pre-drop and post-drop counts differ.
+    const zipWithEntryCount = (count: number, dropped = 0): Buffer => {
+        // One entry must be xl/workbook.xml so the archive routes as .xlsx; the rest are filler.
+        const names = Array.from({ length: count }, (_, i) =>
+            i === 0
+                ? 'xl/workbook.xml'
+                : i <= dropped
+                  ? `xl/worksheets/sheet${i}.xml.bak`
+                  : `p/${i.toString(36).padStart(5, '0')}`
+        )
+        const locals: Buffer[] = []
+        const centrals: Buffer[] = []
+        const offsets: number[] = []
+        let offset = 0
+        for (const entry of names) {
+            const name = Buffer.from(entry, 'latin1')
+            const local = Buffer.alloc(30) // method 0, crc 0, both sizes 0 — an empty stored entry
+            local.writeUInt32LE(0x04034b50, 0)
+            local.writeUInt16LE(20, 4)
+            local.writeUInt16LE(name.length, 26)
+            locals.push(local, name)
+            offsets.push(offset)
+            offset += 30 + name.length
+        }
+        names.forEach((entry, i) => {
+            const name = Buffer.from(entry, 'latin1')
+            const central = Buffer.alloc(46)
+            central.writeUInt32LE(0x02014b50, 0)
+            central.writeUInt16LE(20, 4)
+            central.writeUInt16LE(20, 6)
+            central.writeUInt16LE(name.length, 28)
+            central.writeUInt32LE(offsets[i], 42)
+            centrals.push(central, name)
+        })
+        const directory = Buffer.concat(centrals)
+        const end = Buffer.alloc(22)
+        end.writeUInt32LE(0x06054b50, 0)
+        end.writeUInt16LE(count, 8)
+        end.writeUInt16LE(count, 10)
+        end.writeUInt32LE(directory.length, 12)
+        end.writeUInt32LE(offset, 16)
+        return Buffer.concat([...locals, directory, end])
+    }
+
+    // These fixtures are ~5.6 MB with 65k entries by construction — the size IS the test. For the
+    // accepting cases, replace ExcelJS with a drain-only reader and freeze timers: the behavior under
+    // test is the rewritten archive's entry count, not whether a loaded CI worker parses 65k empty
+    // entries inside the production 10-second handler timeout.
+    const BOUNDARY_TIMEOUT_MS = 30_000
+
+    const rewriteAtBoundary = async (content: Buffer) => {
+        let rebuilt = Buffer.alloc(0)
+        vi.resetModules()
+        vi.doMock('exceljs', () => ({
+            default: {
+                stream: {
+                    xlsx: {
+                        WorkbookReader: class {
+                            stream: NodeJS.ReadableStream
+                            constructor(stream: NodeJS.ReadableStream) {
+                                this.stream = stream
+                                stubExcelReaderHooks(this)
+                            }
+                            async *[Symbol.asyncIterator]() {
+                                const chunks: Buffer[] = []
+                                for await (const chunk of this.stream) chunks.push(chunk as Buffer)
+                                rebuilt = Buffer.concat(chunks)
+                            }
+                        },
+                    },
+                },
+            },
+        }))
+        vi.useFakeTimers()
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const result = await extract({ content, contentType: XLSX_TYPE })
+            const eocd = rebuilt.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]))
+            return { result, entryCount: eocd < 0 ? undefined : rebuilt.readUInt16LE(eocd + 10) }
+        } finally {
+            vi.useRealTimers()
+            vi.doUnmock('exceljs')
+            vi.resetModules()
+        }
+    }
+
+    // The reason is asserted, not just the status: this archive's directory read perfectly well — we
+    // declined to REWRITE it — and reporting that as "could not be read" sent an investigation at the
+    // wrong half of the preflight. Two distinct causes must not collapse into one message.
+    it(
+        'refuses an archive whose rewrite would land on the 0xffff entry-count sentinel',
+        async () => {
+            // 65533 real entries + two injected control parts = 65535 = 0xffff.
+            const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2), contentType: XLSX_TYPE })
+            expect(r.status).toBe('failed')
+            expect(r.reason).toMatch(/0xffff count sentinel/)
+            expect(r.reason).not.toMatch(/central directory could not be read/)
+        },
+        BOUNDARY_TIMEOUT_MS
+    )
+
+    it(
+        'accepts one entry below that boundary, so the refusal is the sentinel and not the size',
+        async () => {
+            // 65532 + 2 = 65534, a legal count. Same shape, same ~5.6 MB, one fewer entry: without
+            // this the test above would also pass if the rewrite simply gave up on large archives.
+            const { result, entryCount } = await rewriteAtBoundary(zipWithEntryCount(0xffff - 3))
+            expect(result.status).toBe('extracted')
+            expect(entryCount).toBe(0xfffe)
+        },
+        BOUNDARY_TIMEOUT_MS
+    )
+
+    // The count that matters is the one the EOCD is written from, which is post-drop. Checking the
+    // pre-drop count refused archives whose actual rewrite lands comfortably under the sentinel —
+    // the same 65535 as the first test, minus two entries the third group discards.
+    it(
+        'counts the entries it will write, not the ones it was given',
+        async () => {
+            const { result, entryCount } = await rewriteAtBoundary(zipWithEntryCount(0xffff - 2, 2))
+            expect(result.status).toBe('extracted')
+            expect(entryCount).toBe(0xfffd)
+        },
+        BOUNDARY_TIMEOUT_MS
+    )
+})
+
+// PDF truncation signals ------------------------------------------------------
+// The pdf handler stops for three reasons, each of which has to reach the caller as `truncated`.
+// All three are asserted because they fail differently — content-driven cap, structural page
+// ceiling, time-driven deadline.
+
+describe('attachment — pdf reports every way it can stop early', () => {
+    const PDF = 'application/pdf'
+
+    // Two mechanisms produce the flag — the handler's own break, and the page of overshoot tripping
+    // the entry point's over-cap check — so breaking the handler's flag alone does NOT fail this.
+    // Not quite redundant: the handler's running total counts a trailing page join the final text
+    // lacks, so a document landing within ~2 chars of the cap is flagged only by the handler.
+    it('reports truncated when the output cap stops it', async () => {
+        // 90 pages x 55 lines (~57 chars each) ≈ 280k extractable chars, past the 250k cap.
+        const line = 'the quick brown fox jumps over the lazy dog and then some'
+        const pdf = buildPdf(Array.from({ length: 90 }, () => Array.from({ length: 55 }, () => line)))
+        const r = await extractAttachment({ content: pdf, contentType: PDF })
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(true)
+        expect(r.extraction!.length).toBeLessThanOrEqual(MAX_OUTPUT_CHARS)
+    })
+
+    it('does not count a trailing page separator or flag a complete near-cap PDF', async () => {
+        const pdf = buildPdf([['a complete single-page document near its cap']])
+        const whole = await extractAttachment({ content: pdf, contentType: PDF })
+        const length = whole.extraction!.length
+        const trailer = '\n[truncated]'
+
+        for (const cap of [length, length + 1]) {
+            const r = await extractAttachment({ content: pdf, contentType: PDF }, { maxOutputChars: cap, trailer })
+            expect(r.truncated).toBe(false)
+            expect(r.extraction).toBe(whole.extraction)
+            expect(r.extraction).not.toContain(trailer)
+        }
+    })
+
+    // Pages past MAX_PDF_PAGES are never read, so their text is missing whether or not the cap was
+    // reached — 2001 pages of one word each stays far under the cap and would otherwise look
+    // complete. This flag is the only signal that says otherwise.
+    it('reports truncated when the page ceiling stops it, even far under the output cap', async () => {
+        const pdf = buildPdf(Array.from({ length: MAX_PDF_PAGES + 1 }, (_, i) => [`page${i + 1}`]))
+        const r = await extractAttachment({ content: pdf, contentType: PDF })
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(true)
+        expect(r.extraction!.length).toBeLessThan(MAX_OUTPUT_CHARS) // nowhere near the cap
+        expect(r.extraction).toContain('page1')
+        expect(r.extraction).not.toContain(`page${MAX_PDF_PAGES + 1}`) // the page past the ceiling
+    })
+
+    it('reports truncated when the deadline stops it', async () => {
+        const pdf = buildPdf(Array.from({ length: 20 }, (_, i) => [`page ${i + 1} of the document`]))
+
+        // extractAttachment's FIRST Date.now() sets the deadline; every later call lands past it, so
+        // the page loop stops on its first check. Deliberately blunt — pdf.js may read the clock
+        // itself, so a mock letting N pages through would depend on how often it does.
+        const base = Date.now()
+        let calls = 0
+        const clock = vi.spyOn(Date, 'now').mockImplementation(() => {
+            calls += 1
+            return calls === 1 ? base : base + HANDLER_TIMEOUT_MS + 1
+        })
+        const stopped = await extractAttachment({ content: pdf, contentType: PDF })
+        clock.mockRestore()
+
+        expect(stopped.status).toBe('extracted') // a deadline stop is not a failure
+        expect(stopped.truncated).toBe(true)
+
+        // Control: the same bytes with a real clock are complete and NOT flagged — without this the
+        // assertion above would also pass if `truncated` were hardcoded true.
+        const whole = await extractAttachment({ content: pdf, contentType: PDF })
+        expect(whole.truncated).toBe(false)
+        expect(whole.extraction).toContain('page 20 of the document')
+    })
+
+    it('leaves truncated false for a pdf that is read completely', async () => {
+        const r = await extractAttachment({ content: buildPdf([['short document']]), contentType: PDF })
+        expect(r.status).toBe('extracted')
+        expect(r.truncated).toBe(false)
+        expect(r.extraction).toContain('short document')
     })
 })
