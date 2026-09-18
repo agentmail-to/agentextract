@@ -21,14 +21,41 @@ export const MAX_INPUT_BYTES = 10 * 1024 * 1024
 // Cutting sets `truncated` — a partial extraction that reads as complete is worse than a missing one.
 export const MAX_OUTPUT_CHARS = 250_000
 
+// Extra UTF-16 units an incrementally-building handler keeps PAST its cap, so the central trim can
+// do its job. That trim detects overshoot as `text.length > maxOutputChars` and only then checks
+// whether the boundary splits a surrogate pair — so a handler that stored exactly maxOutputChars
+// would report a still-continuing document as exactly-at-cap, skip the check, and emit a lone
+// surrogate half as U+FFFD. One unit is what makes the overshoot visible and is the strict minimum
+// (verified: dropping to zero fails the docx surrogate test); the second is slack so an astral
+// character landing on the boundary is stored whole rather than as a half the trim must discard.
+const CAP_STORAGE_SLACK = 2
+
+// Blocks a handler concatenates into one extraction — PDF pages, XLSX sheets — are joined by this.
+// The incremental length accounting has to charge for it BEFORE the join, so both must read it from
+// here: a separator that disagrees with its own charged width makes the cap off by that difference.
+const BLOCK_SEPARATOR = '\n\n'
+
 // A PDF can declare an enormous page count. Bounds parse work when per-page text is too sparse to
 // trip the output cap; a content-bearing PDF hits MAX_OUTPUT_CHARS within a few dozen pages first.
+// 2000 is a backstop, not a tuned threshold, and only the sparse case can ever reach it: at even 125
+// characters per page the output cap binds first, so a document this bound is one carrying almost no
+// text at all — where the pages parsed, not the text kept, is the cost. Sized against the real
+// corpus (an email attachment running past a few hundred pages is already an outlier) with an order
+// of magnitude of headroom, so no plausible attachment is cut by it before the deadline intervenes.
 export const MAX_PDF_PAGES = 2000
 
 // Max ACTUAL uncompressed size of an OOXML zip, measured by inflating it — the declared size is
 // attacker-controlled (see DECOMPRESSION BUDGET). MAX_INPUT_BYTES only bounds the COMPRESSED size.
 // Parsers build a model on top (~8x for a dense sheet), so stay well under the 1024 MB memory floor.
 export const MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+
+// Ceiling on a <v> shared-string index before the scan stops reading digits. Derived, not picked: the
+// smallest legal <si> record ('<si><t></t></si>') is 16 bytes, so MAX_UNCOMPRESSED_BYTES bounds a
+// workbook at ~3.3M entries even if the shared-string table were the only part in it. Any index past
+// this cannot resolve, so the digits after it carry no information and only serve to make the scan
+// retain an attacker-sized numeric string. Rounded up to 10M to stay clearly above the real bound
+// rather than tracking it exactly — the point is to stop unbounded accumulation, not to be tight.
+const MAX_SHARED_STRING_INDEX = 10_000_000
 
 // Guard: stop awaiting a slow handler. Can't cancel synchronous CPU already running inside a parser.
 export const HANDLER_TIMEOUT_MS = 10_000
@@ -42,6 +69,14 @@ export const HANDLER_TIMEOUT_MS = 10_000
 // answer when a single unit overruns.
 export const HANDLER_DEADLINE_MARGIN_MS = 1_000
 
+// Granularity at which an already-resident buffer is fed to a parser — XLSX control XML and a STORED
+// .docx part both come this way. Only the cap and deadline checks BETWEEN slices can stop a parse,
+// so this is how long a stop can be deferred: a whole buffer handed over at once cannot be
+// interrupted at all, and one character at a time pays per-slice overhead on every byte. 16 KB is
+// the compromise, and is chosen to match what zlib pushes out of createInflateRaw so a stored part
+// and a deflated one arrive in comparable pieces rather than on two different response latencies.
+const STREAM_SLICE_UNITS = 16 * 1024
+
 // saxes resolves namespace prefixes by scanning the open-tag stack, so attacker-controlled nesting
 // makes its xmlns mode quadratic even when the XML is tiny. Twenty nested Word tables legitimately
 // reach depth 65, so the ceiling must leave real structure room while still bounding a synchronous
@@ -54,11 +89,31 @@ const assertXmlDepth = (depth: number): void => {
     }
 }
 
-// Sniff the first 8KB to decide whether bytes look like text.
+// How much of the head the three byte-shape tests read: the printable-ratio sniff (looksLikeText),
+// the utf-8 NUL scan, and the utf-16 well-formedness check. Shared deliberately — each one is
+// deciding the same question, "do the opening bytes agree with a text claim", and a file that
+// disagrees does so immediately. 8 KB because every format these must separate is distinguishable
+// far inside it: a binary file puts a NUL, an unpaired surrogate, or a non-printable byte in its
+// first few hundred, so raising this buys no accuracy and lowering it starts missing headers that
+// pad with ASCII. The one place it is more than a budget is the utf-16 check's truncation branch
+// (see isWellFormedUtf16): a trailing high surrogate at the sample edge means "out of view" for a
+// longer file and "genuinely unpaired" for a shorter one, so the two readings are split at exactly
+// this boundary. Changing this value moves that line — it is not only a performance knob.
 const SNIFF_BYTES = 8 * 1024
+// Share of the sampled bytes that must be printable for the bytes to pass as text. Not a tuned
+// number and does not need to be: the distributions are nowhere near it. Real text is ~100%
+// printable (the exceptions are stray control bytes, a handful per file), and binary that gets this
+// far is ~30-50% by the structure of byte values, since only 95 of 256 are printable ASCII. Anything
+// from roughly 0.6 to 0.95 separates them identically; 0.85 leaves room for a text file carrying
+// some control noise without letting through anything with real binary density.
 const SNIFF_TEXT_RATIO = 0.85
 
-// Charset detection samples the head; below this confidence the guess isn't trusted.
+// Charset detection samples the head; below this confidence the guess isn't trusted. 64 KB rather
+// than SNIFF_BYTES because this asks a harder question than "is it text": distinguishing among the
+// legacy single-byte encodings is a statistical judgement over character frequencies, and jschardet
+// gets sharper with more of them. Confidence is jschardet's own 0-1 score, and a miss here is not
+// benign — it silently mojibakes the extraction rather than failing — so the bar sits high enough to
+// fall back to the latin1 path on a genuinely ambiguous file instead of committing to a coin flip.
 const DETECT_SAMPLE_BYTES = 64 * 1024
 const DETECT_MIN_CONFIDENCE = 0.7
 
@@ -305,7 +360,7 @@ const pdfHandler: Handler = {
                     .join('')
                     .trim()
                 if (pageText) {
-                    length += pageText.length + (pages.length === 0 ? 0 : 2) // '\n\n' only BETWEEN pages
+                    length += pageText.length + (pages.length === 0 ? 0 : BLOCK_SEPARATOR.length) // only BETWEEN pages
                     pages.push(pageText)
                     if (length > maxOutputChars) {
                         truncated = true
@@ -315,7 +370,7 @@ const pdfHandler: Handler = {
             }
             // Pages past the ceiling are text we never read.
             if (pageCount < pdf.numPages) truncated = true
-            const joined = pages.join('\n\n').trim()
+            const joined = pages.join(BLOCK_SEPARATOR).trim()
             return { text: joined, empty: joined.length === 0, truncated }
         } finally {
             // getDocumentProxy exposes pdf.js's loading task; release its worker handler, document
@@ -472,6 +527,12 @@ const createXmlScan = (): ExcelXmlScan => {
     let rootClosed = false
     let depth = 0
     const booleanCells = new Set<string>()
+    // This scanner buffers a tag's text to read its name when the tag closes, so an unterminated '<'
+    // in a hostile file would otherwise accumulate the rest of the document into one string. Past
+    // this point the characters are dropped and only the name-bearing head is kept — which is all
+    // that is read. 8 KB because the name is the first token: no legal element name approaches it,
+    // and the slack covers a tag carrying a long attribute list before its '>'. A tag longer than
+    // this is truncated for NAMING purposes only; depth tracking still follows its real '>'.
     const TAG_CAPTURE_LIMIT = 8 * 1024
 
     const finishTag = (): void => {
@@ -671,7 +732,6 @@ const xlsxHandler: Handler = {
             })
             return entry.pipe(guard as unknown as ExcelXmlEntry)
         }
-        const XML_SLICE_CHARS = 16 * 1024
         const decodeChunks = async function* (
             chunks: ExcelXmlChunks,
             scan?: ExcelXmlScan
@@ -679,13 +739,13 @@ const xlsxHandler: Handler = {
             const decoder = new StringDecoder('utf8')
             let stopped = false
             const slices = function* (text: string): Iterable<string> {
-                for (let offset = 0; offset < text.length; offset += XML_SLICE_CHARS) {
+                for (let offset = 0; offset < text.length; offset += STREAM_SLICE_UNITS) {
                     if (Date.now() > deadline) {
                         truncated = true
                         stopped = true
                         return
                     }
-                    const slice = text.slice(offset, offset + XML_SLICE_CHARS)
+                    const slice = text.slice(offset, offset + STREAM_SLICE_UNITS)
                     scan?.write(slice)
                     yield slice
                 }
@@ -828,7 +888,7 @@ const xlsxHandler: Handler = {
                         return
                     }
                     cell.sharedIndexValue = cell.sharedIndexValue * 10 + char.charCodeAt(0) - 48
-                    if (cell.sharedIndexValue > 10_000_000) {
+                    if (cell.sharedIndexValue > MAX_SHARED_STRING_INDEX) {
                         // The decompression ceiling cannot hold this many <si> records. Stop reading
                         // digits now rather than retaining an attacker-sized value string.
                         cell.sharedIndexState = 'overflow'
@@ -990,7 +1050,7 @@ const xlsxHandler: Handler = {
                     const line = cells.map((cell) => cell.text).join('\t')
                     length +=
                         rows.length === 0
-                            ? (sheets.length === 0 ? 0 : 2) + header.length + line.length
+                            ? (sheets.length === 0 ? 0 : BLOCK_SEPARATOR.length) + header.length + line.length
                             : 1 + line.length
                     rows.push(line)
                     if (length > maxOutputChars) {
@@ -1028,7 +1088,7 @@ const xlsxHandler: Handler = {
             throw new Error(`xlsx reader yielded ${seen} of ${resolved.length} worksheets`)
         }
 
-        return { text: sheets.join('\n\n'), truncated }
+        return { text: sheets.join(BLOCK_SEPARATOR), truncated }
     },
 }
 
@@ -1186,6 +1246,11 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
 const EOCD_MAGIC = Buffer.from([0x50, 0x4b, 0x05, 0x06]) // End-of-Central-Directory
 const CD_SIG = 0x02014b50 // Central-Directory file header
 const LOCAL_SIG = 0x04034b50 // Local file header
+// Fixed-record sizes from APPNOTE 4.3.7/4.3.12/4.3.16 — the bytes before each record's variable-length
+// tail (name, extra, comment). Used by both the walks below and the rebuild in reorderForStreaming.
+const LOCAL_HEADER_BYTES = 30
+const CENTRAL_HEADER_BYTES = 46
+const EOCD_BYTES = 22
 
 // `ok` = safe to hand to the parser. Otherwise `status` is which kind of no, since the two differ to
 // a caller: `failed` = the bytes are broken (the parser would have thrown anyway), `skipped` = intact
@@ -1228,7 +1293,7 @@ const inflateCounting = (comp: Buffer, runningTotal: number, cap: number): Promi
 // unzipper on the .xlsx path, and because it doesn't false-skip zips with bytes after the EOCD.
 const findEocd = (buf: Buffer): number => {
     const eocd = buf.lastIndexOf(EOCD_MAGIC)
-    return eocd >= 0 && eocd + 22 <= buf.length ? eocd : -1 // need room for the 22-byte fixed record
+    return eocd >= 0 && eocd + EOCD_BYTES <= buf.length ? eocd : -1 // need room for the fixed record
 }
 
 // One entry as the central directory describes it, plus its stored (still-compressed) bytes.
@@ -1258,12 +1323,12 @@ const zipEntryNames = (buf: Buffer): string[] | undefined => {
     const names: string[] = []
     let p = buf.readUInt32LE(eocd + 16)
     for (let i = 0; i < count; i++) {
-        if (p + 46 > buf.length || buf.readUInt32LE(p) !== CD_SIG) return undefined
+        if (p + CENTRAL_HEADER_BYTES > buf.length || buf.readUInt32LE(p) !== CD_SIG) return undefined
         const nameLen = buf.readUInt16LE(p + 28)
-        if (p + 46 + nameLen > buf.length) return undefined
+        if (p + CENTRAL_HEADER_BYTES + nameLen > buf.length) return undefined
         const encoding = (buf.readUInt16LE(p + 8) & 0x0800) !== 0 ? 'utf8' : 'latin1'
-        names.push(buf.toString(encoding, p + 46, p + 46 + nameLen))
-        p += 46 + nameLen + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
+        names.push(buf.toString(encoding, p + CENTRAL_HEADER_BYTES, p + CENTRAL_HEADER_BYTES + nameLen))
+        p += CENTRAL_HEADER_BYTES + nameLen + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
     }
     return names
 }
@@ -1289,20 +1354,20 @@ const zipEntries = (buf: Buffer): ZipEntry[] | undefined => {
     const entries: ZipEntry[] = []
     let p = buf.readUInt32LE(eocd + 16)
     for (let i = 0; i < count; i++) {
-        if (p + 46 > buf.length || buf.readUInt32LE(p) !== CD_SIG) return undefined
+        if (p + CENTRAL_HEADER_BYTES > buf.length || buf.readUInt32LE(p) !== CD_SIG) return undefined
         const nameLen = buf.readUInt16LE(p + 28)
-        if (p + 46 + nameLen > buf.length) return undefined
+        if (p + CENTRAL_HEADER_BYTES + nameLen > buf.length) return undefined
         const compSize = buf.readUInt32LE(p + 20)
         const localOffset = buf.readUInt32LE(p + 42)
         if (compSize === 0xffffffff || localOffset === 0xffffffff) return undefined // ZIP64
         // The local header carries its own name/extra lengths, which can differ from the central
         // copy — they are what fixes where this entry's bytes actually start.
-        if (localOffset + 30 > buf.length || buf.readUInt32LE(localOffset) !== LOCAL_SIG) return undefined
-        const dataStart = localOffset + 30 + buf.readUInt16LE(localOffset + 26) + buf.readUInt16LE(localOffset + 28)
+        if (localOffset + LOCAL_HEADER_BYTES > buf.length || buf.readUInt32LE(localOffset) !== LOCAL_SIG) return undefined
+        const dataStart = localOffset + LOCAL_HEADER_BYTES + buf.readUInt16LE(localOffset + 26) + buf.readUInt16LE(localOffset + 28)
         const data = buf.subarray(dataStart, dataStart + compSize)
         if (data.length < compSize) return undefined
         entries.push({
-            name: buf.toString((buf.readUInt16LE(p + 8) & 0x0800) !== 0 ? 'utf8' : 'latin1', p + 46, p + 46 + nameLen),
+            name: buf.toString((buf.readUInt16LE(p + 8) & 0x0800) !== 0 ? 'utf8' : 'latin1', p + CENTRAL_HEADER_BYTES, p + CENTRAL_HEADER_BYTES + nameLen),
             utf8Name: (buf.readUInt16LE(p + 8) & 0x0800) !== 0,
             method: buf.readUInt16LE(p + 10),
             crc: buf.readUInt32LE(p + 16),
@@ -1310,7 +1375,7 @@ const zipEntries = (buf: Buffer): ZipEntry[] | undefined => {
             uncompSize: buf.readUInt32LE(p + 24),
             data,
         })
-        p += 46 + nameLen + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
+        p += CENTRAL_HEADER_BYTES + nameLen + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
     }
     return entries
 }
@@ -1350,7 +1415,7 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
     for (let i = 0; i < entries; i++) {
         // Guard: a missing/misaligned header means the offset lied. Fail closed — a partial walk must
         // never silently return the total it accumulated so far.
-        if (p + 46 > buf.length || buf.readUInt32LE(p) !== CD_SIG)
+        if (p + CENTRAL_HEADER_BYTES > buf.length || buf.readUInt32LE(p) !== CD_SIG)
             return corrupt('malformed zip: truncated or misaligned central directory')
         const method = buf.readUInt16LE(p + 10)
         const compSize = buf.readUInt32LE(p + 20)
@@ -1359,9 +1424,9 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
             return declined('zip declares a ZIP64 / out-of-range size')
         // Read the local header's own name/extra lengths — they can differ from the central copy, and
         // they're what fixes where this entry's compressed bytes actually begin.
-        if (localOffset + 30 > buf.length || buf.readUInt32LE(localOffset) !== LOCAL_SIG)
+        if (localOffset + LOCAL_HEADER_BYTES > buf.length || buf.readUInt32LE(localOffset) !== LOCAL_SIG)
             return corrupt('malformed zip: bad local header offset')
-        const dataStart = localOffset + 30 + buf.readUInt16LE(localOffset + 26) + buf.readUInt16LE(localOffset + 28)
+        const dataStart = localOffset + LOCAL_HEADER_BYTES + buf.readUInt16LE(localOffset + 26) + buf.readUInt16LE(localOffset + 28)
         const comp = buf.subarray(dataStart, dataStart + compSize)
         if (comp.length < compSize)
             return corrupt('malformed zip: compressed data runs past end of file')
@@ -1376,7 +1441,7 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
             return declined(`zip uses unsupported compression method ${method}`)
         }
         if (total > cap) return declined(`decompresses to over ${cap} bytes`)
-        p += 46 + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
+        p += CENTRAL_HEADER_BYTES + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
     }
     // Invariant 2: walking exactly `entries` records must land exactly on the EOCD.
     // This one GAINED a job. Its original reason was jszip, which ignores the declared count and
@@ -1493,9 +1558,6 @@ const EMPTY_WORKBOOK_RELS = Buffer.from(
 )
 const EMPTY_WORKBOOK_RELS_CRC = 0x9f1f1b86
 
-const LOCAL_HEADER_BYTES = 30
-const CENTRAL_HEADER_BYTES = 46
-const EOCD_BYTES = 22
 const ZIP_VERSION = 20 // 2.0 — the floor for deflate, which is all we re-emit
 
 // The conventional worksheet path, anchored. OPC part URIs are ASCII-case-insensitive, so this also
@@ -2410,7 +2472,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     let discardDeferredText = false
     let deferredFreshFrames: Set<DocxFrame> | undefined
     let discardTableText = false
-    const storageLimit = maxOutputChars + 2
+    const storageLimit = maxOutputChars + CAP_STORAGE_SLACK
 
     const appendRaw = (frame: DocxFrame, field: 'value' | 'extra' | 'claimedExtra' | 'allValue', text: string): void => {
         const value = frame[field] ?? ''
@@ -3008,11 +3070,10 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     }
 }
 
-const DOCX_CHUNK_BYTES = 16 * 1024
 
 const storedDocxChunks = function* (data: Buffer): Iterable<Buffer> {
-    for (let offset = 0; offset < data.length; offset += DOCX_CHUNK_BYTES) {
-        yield data.subarray(offset, offset + DOCX_CHUNK_BYTES)
+    for (let offset = 0; offset < data.length; offset += STREAM_SLICE_UNITS) {
+        yield data.subarray(offset, offset + STREAM_SLICE_UNITS)
     }
 }
 
