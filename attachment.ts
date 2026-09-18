@@ -21,15 +21,6 @@ export const MAX_INPUT_BYTES = 10 * 1024 * 1024
 // Cutting sets `truncated` — a partial extraction that reads as complete is worse than a missing one.
 export const MAX_OUTPUT_CHARS = 250_000
 
-// Extra UTF-16 units an incrementally-building handler keeps PAST its cap, so the central trim can
-// do its job. That trim detects overshoot as `text.length > maxOutputChars` and only then checks
-// whether the boundary splits a surrogate pair — so a handler that stored exactly maxOutputChars
-// would report a still-continuing document as exactly-at-cap, skip the check, and emit a lone
-// surrogate half as U+FFFD. One unit is what makes the overshoot visible and is the strict minimum
-// (verified: dropping to zero fails the docx surrogate test); the second is slack so an astral
-// character landing on the boundary is stored whole rather than as a half the trim must discard.
-const CAP_STORAGE_SLACK = 2
-
 // Blocks a handler concatenates into one extraction — PDF pages, XLSX sheets — are joined by this.
 // The incremental length accounting has to charge for it BEFORE the join, so both must read it from
 // here: a separator that disagrees with its own charged width makes the cap off by that difference.
@@ -2474,7 +2465,10 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     let discardDeferredText = false
     let deferredFreshFrames: Set<DocxFrame> | undefined
     let discardTableText = false
-    const storageLimit = maxOutputChars + CAP_STORAGE_SLACK
+    // Exactly the cap: nothing is stored past what can be returned. The entry point strips a
+    // trailing surrogate half unconditionally, so stopping flush against the cap cannot split a
+    // character, and truncation is reported from capExceeded rather than inferred from overshoot.
+    const storageLimit = maxOutputChars
 
     const appendRaw = (frame: DocxFrame, field: 'value' | 'extra' | 'claimedExtra' | 'allValue', text: string): void => {
         const value = frame[field] ?? ''
@@ -3323,11 +3317,13 @@ export const extractAttachment = async (
         // host memory limit (see README). Don't split a surrogate pair at the boundary: a lone half
         // serializes as U+FFFD.
         const overCap = output.text.length > maxOutputChars
-        const capEnd =
-            overCap && output.text.charCodeAt(maxOutputChars - 1) >= 0xd800 && output.text.charCodeAt(maxOutputChars - 1) <= 0xdbff
-                ? maxOutputChars - 1
-                : maxOutputChars
-        const text = overCap ? output.text.slice(0, capEnd) : output.text
+        const capped = overCap ? output.text.slice(0, maxOutputChars) : output.text
+        // A trailing high surrogate is half a character however it got there — our cut, or a handler
+        // that stopped exactly on the cap. Checked unconditionally rather than only when we cut,
+        // because the alternative is requiring every incremental handler to store past its own cap
+        // purely so this check can notice, which is what the CAP_STORAGE_SLACK constant used to buy.
+        const lastUnit = capped.charCodeAt(capped.length - 1)
+        const text = lastUnit >= 0xd800 && lastUnit <= 0xdbff ? capped.slice(0, -1) : capped
         // Decided on the FINAL text: a tight enough cap slices a non-empty extraction to '', and the
         // contract is that `extraction` is omitted rather than ever being ''. `||`, not `??`, because
         // the handler's call can only ADD emptiness — pdf computes `empty` from its pre-cap page join
