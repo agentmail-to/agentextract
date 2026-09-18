@@ -4,13 +4,59 @@
 // Peer module to attachment.ts; neither depends on the other. Both are surfaced together
 // from the package entry (index.ts) and each also has its own subpath export.
 
-const ATTRIBUTION_WRAP_WINDOW = 2
+// Three different lookaheads, deliberately three different sizes — each is bounded by what the
+// structure it scans can actually span, not by a shared "peek ahead a bit".
+//
+// An attribution ("On <date>, <name> <addr> wrote:") is ONE logical line that a client hard-wrapped.
+// At typical 72-80 column wrapping the longest of them — a long display name plus a bracketed
+// address plus a spelled-out date — runs to three physical lines and no further, so stitching line i
+// with the two after it covers the real cases. Kept tight on purpose: every extra line widens the
+// window in which an unrelated following line can supply the "wrote:" that triggers a wrong cut.
+const ATTRIBUTION_WRAP_LINES = 2
+// A "_____" divider is ambiguous (signature rule vs. quote header), so it is only believed when a
+// real quote signal follows. Clients put at most a blank line and a header line between the two;
+// three NON-EMPTY lines is that, with slack for a client that inserts its own label first.
+const DIVIDER_LOOKAHEAD_LINES = 3
+// A pasted "From:" header block is corroborated by its siblings — Sent:/Date:, To:, Subject:. Those
+// three are what immediately follow From: in every client's paste format, so this spans the block
+// without reaching the message body underneath it.
+const HEADER_BLOCK_LINES = 3
 
-// An "On ... wrote:" attribution can get glued onto the sender's reply text.
-// The cutter scans line-by-line, so it can't see it. 
-// This splits it onto its own line. Guards ensure we only split genuine headers (date + email + verb).
-// Supports all languages in the data set.
-const GLUED_ATTRIBUTION_RE = /([^\r\n>])[ \t]+((?:On|Le|Il|W dniu|Op|Am|På|Den|Em|El|Vào|في)\s+(?=[^\r\n]{0,240}(?:wrote|sent|a écrit|escribió|ha scritto|escreveu|schrieb|schreef|geschreven|verzond|skrev|napisał|написал|đã viết|كتب)\s*:)(?=[^\r\n]{0,240}(?:<[^>]+@[^>]+>|\b[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+))(?=[^\r\n]{0,240}(?:\b20\d\d\b|\b\d{1,2}:\d{2}\b|\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\b|[\u0660-\u0669]{1,2}[:：][\u0660-\u0669]{2}))[^\r\n]{0,240}(?:wrote|sent|a écrit|escribió|ha scritto|escreveu|schrieb|schreef|geschreven|verzond|skrev|napisał|написал|đã viết|كتب)\s*:)/gi
+// How far past the opener the guards may look for the rest of an attribution. One budget, used by
+// all four scans below, because they are reading the SAME logical line: giving them different
+// bounds would let a guard match against text the consuming scan never reaches (or vice versa),
+// which is how a lookahead-corroborated match becomes a cut in the wrong place. 240 covers the
+// longest real attributions — a spelled-out date, a long display name and a bracketed address —
+// while keeping each scan linear in a bounded window rather than the whole line.
+const ATTRIBUTION_SCAN_CHARS = 240
+// Same line, bounded: [^\r\n] so a scan can never cross into the next one.
+const ATTRIBUTION_SCAN = `[^\\r\\n]{0,${ATTRIBUTION_SCAN_CHARS}}`
+// Openers and verbs for every language in the data set. Kept separate from FOREIGN_VERB below, which
+// is a DIFFERENT list on purpose: that one anchors on the verb alone and so excludes the English
+// "wrote|sent", while this one is only ever reached after a matching opener.
+const ATTRIBUTION_OPENERS = 'On|Le|Il|W dniu|Op|Am|På|Den|Em|El|Vào|في'
+const ATTRIBUTION_VERBS =
+    'wrote|sent|a écrit|escribió|ha scritto|escreveu|schrieb|schreef|geschreven|verzond|skrev|napisał|написал|đã viết|كتب'
+// A date-ish token: a year, a clock time, an English month/day abbreviation, or an Arabic-indic time.
+const ATTRIBUTION_DATE =
+    String.raw`\b20\d\d\b|\b\d{1,2}:\d{2}\b|\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\b|[\u0660-\u0669]{1,2}[:：][\u0660-\u0669]{2}`
+const ATTRIBUTION_EMAIL = String.raw`<[^>]+@[^>]+>|\b[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+`
+// An "On ... wrote:" attribution can get glued onto the sender's reply text. The cutter scans
+// line-by-line, so it can't see it; this splits it onto its own line. Guards ensure we only split
+// genuine headers (date + email + verb). Supports all languages in the data set. Assembled from the
+// parts above rather than written as one literal so the scan budget and the verb list each appear
+// once — the four scans have to agree, and in a 600-character literal they can silently stop doing so.
+const GLUED_ATTRIBUTION_RE = new RegExp(
+    String.raw`([^\r\n>])[ \t]+((?:${ATTRIBUTION_OPENERS})\s+` +
+        // Three guards, all anchored at the opener: the line must carry a verb+colon, an address and
+        // a date before we accept it as a header rather than prose that happens to start with "On".
+        String.raw`(?=${ATTRIBUTION_SCAN}(?:${ATTRIBUTION_VERBS})\s*:)` +
+        String.raw`(?=${ATTRIBUTION_SCAN}(?:${ATTRIBUTION_EMAIL}))` +
+        String.raw`(?=${ATTRIBUTION_SCAN}(?:${ATTRIBUTION_DATE}))` +
+        // Guards passed — now consume through the verb and its colon, which is the split point.
+        String.raw`${ATTRIBUTION_SCAN}(?:${ATTRIBUTION_VERBS})\s*:)`,
+    'gi'
+)
 const splitGluedAttributions = (text: string): string => text.replace(GLUED_ATTRIBUTION_RE, '$1\n$2')
 
 // Returns whether this line looks like the START of quoted history.
@@ -34,9 +80,9 @@ const isQuoteSignal = (lines: string[], i: number): boolean => {
     if (/^-+\s*(original message|ursprüngliche nachricht|oprindelig meddelelse|reply message|antwort nachricht)/i.test(line)) return true
     // #3. _____________________ (ambiguous - could be a signature divider).
     // Therefore, we only treat it as quoted history IFF a real quote signal follows it.
-    // Scan the next 3 non-empty lines (blanks skipped, not counted) and recurse on each.
+    // Scan the next DIVIDER_LOOKAHEAD_LINES non-empty lines (blanks skipped, not counted), recursing on each.
     if (/^_{5,}\s*$/.test(line)) {
-        for (let j = i + 1, seen = 0; j < lines.length && seen < 3; j++) {
+        for (let j = i + 1, seen = 0; j < lines.length && seen < DIVIDER_LOOKAHEAD_LINES; j++) {
             if (lines[j].trim() === '') continue
             seen++
             if (isQuoteSignal(lines, j)) return true
@@ -45,9 +91,9 @@ const isQuoteSignal = (lines: string[], i: number): boolean => {
     // #4. On ... wrote: 
     if (/^On\b/i.test(line)) {
         // This line can wrap across 2-3 lines, splitting "On" from "wrote:". 
-        // Stitch line i + up to ATTRIBUTION_WRAP_WINDOW more into one string.
+        // Stitch line i + up to ATTRIBUTION_WRAP_LINES more into one string.
         const parts: string[] = []
-        for (let j = i; j < lines.length && j <= i + ATTRIBUTION_WRAP_WINDOW; j++) {
+        for (let j = i; j < lines.length && j <= i + ATTRIBUTION_WRAP_LINES; j++) {
             const part = lines[j].trim()
             // Stop at the first blank line — real attribution has no blanks inside it.
             if (part === '') break
@@ -77,9 +123,9 @@ const isQuoteSignal = (lines: string[], i: number): boolean => {
         const shortLabel = /^(de|van|da|fra|från)$/i.test(fromLabel[1])
         const emailRe = /<[^>]+@[^>]+>|\b[^\s@]+@[^\s@]+\.[^\s@]+/
         const hasEmail = emailRe.test(line) // email on the From: line itself
-        const next = lines.slice(i + 1, i + 1 + 3).map((l) => l.trim())  // look at the 3 lines below
-        const hasSentOrDate = next.some((l) => /^\s*(sent|date|gesendet|envoyé|enviado|enviada|datum|verzonden|inviato|skickat|sendt)\s*:/i.test(l)) // a Sent:/Date: line in those 3
-        const emailInBlock = next.some((l) => emailRe.test(l)) // an email in those 3 lines
+        const next = lines.slice(i + 1, i + 1 + HEADER_BLOCK_LINES).map((l) => l.trim()) // the sibling header lines below
+        const hasSentOrDate = next.some((l) => /^\s*(sent|date|gesendet|envoyé|enviado|enviada|datum|verzonden|inviato|skickat|sendt)\s*:/i.test(l)) // a Sent:/Date: line among them
+        const emailInBlock = next.some((l) => emailRe.test(l)) // an email among them
         // Essentially: the weaker the trigger word, the more evidence we demand before we mark it as quoted history.
         if (hasEmail || (!shortLabel && hasSentOrDate) || (shortLabel && hasSentOrDate && emailInBlock)) return true
     }
@@ -93,7 +139,7 @@ const isQuoteSignal = (lines: string[], i: number): boolean => {
     // cost only when the line truly looks like an attribution start. Date+time is the tell-tale sign.
     if (/\b20\d\d\b/.test(line) && /\d{1,2}:\d{2}/.test(line)) {
         const parts: string[] = []
-        for (let j = i; j < lines.length && j <= i + ATTRIBUTION_WRAP_WINDOW; j++) {
+        for (let j = i; j < lines.length && j <= i + ATTRIBUTION_WRAP_LINES; j++) {
             const part = lines[j].trim()
             if (part === '') break
             parts.push(part)
