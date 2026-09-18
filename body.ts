@@ -4,22 +4,26 @@
 // Peer module to attachment.ts; neither depends on the other. Both are surfaced together
 // from the package entry (index.ts) and each also has its own subpath export.
 
-// Three different lookaheads, deliberately three different sizes — each is bounded by what the
-// structure it scans can actually span, not by a shared "peek ahead a bit".
-//
-// An attribution ("On <date>, <name> <addr> wrote:") is ONE logical line that a client hard-wrapped.
-// At typical 72-80 column wrapping the longest of them — a long display name plus a bracketed
-// address plus a spelled-out date — runs to three physical lines and no further, so stitching line i
-// with the two after it covers the real cases. Kept tight on purpose: every extra line widens the
-// window in which an unrelated following line can supply the "wrote:" that triggers a wrong cut.
+// Three line lookaheads. Each is a FLOOR demonstrated by the corpus, not a window: the corpus shows
+// what each one must be at least, and none of them has a case that breaks when it is raised. They
+// are kept at the demonstrated minimum (plus, for the divider, a margin) on the general principle
+// that a wider scan has more chances to match something unrelated — a risk that is argued, not
+// measured, so treat the low side as evidence and the high side as judgement.
+
+// An attribution ("On <date>, <name> <addr> wrote:") is ONE logical line the client hard-wrapped, so
+// this stitches line i with the next few before testing. 2 is the smallest value that keeps every
+// wrapped attribution in the corpus: at 1 one message miscuts, at 0 six do. Raising it to 3, 4, 6,
+// 10 or 50 changes no output at all, so the corpus does not say a tighter window is safer.
 const ATTRIBUTION_WRAP_LINES = 2
 // A "_____" divider is ambiguous (signature rule vs. quote header), so it is only believed when a
-// real quote signal follows. Clients put at most a blank line and a header line between the two;
-// three NON-EMPTY lines is that, with slack for a client that inserts its own label first.
+// real quote signal follows within this many NON-EMPTY lines (blanks skipped, not counted). Only
+// being non-zero is demonstrated: every value from 1 to 1000 is identical on the corpus, and only 0
+// regresses. Left at 3 — a blank plus a header line, with room for a client that labels the block —
+// rather than 1, because an unbounded scan would recurse over the rest of the message.
 const DIVIDER_LOOKAHEAD_LINES = 3
-// A pasted "From:" header block is corroborated by its siblings — Sent:/Date:, To:, Subject:. Those
-// three are what immediately follow From: in every client's paste format, so this spans the block
-// without reaching the message body underneath it.
+// A pasted "From:" header block is corroborated by its siblings — Sent:/Date:, To:, Subject: — which
+// is what this spans. 2 is the demonstrated minimum (at 1 one message miscuts, at 0 three do); 4, 6,
+// 20 and 1000 are all identical. Left at 3 to cover the three sibling headers a paste actually has.
 const HEADER_BLOCK_LINES = 3
 
 // How far past the opener the guards may look for the rest of an attribution. One budget, used by
@@ -27,7 +31,10 @@ const HEADER_BLOCK_LINES = 3
 // bounds would let a guard match against text the consuming scan never reaches (or vice versa),
 // which is how a lookahead-corroborated match becomes a cut in the wrong place. 240 covers the
 // longest real attributions — a spelled-out date, a long display name and a bracketed address —
-// while keeping each scan linear in a bounded window rather than the whole line.
+// while keeping each scan linear in a bounded window rather than the whole line. Measured floor is
+// about 80 (the corpus's longest glued attribution spans ~62 characters between "On" and "wrote:";
+// 40 regresses it, 80 does not), and nothing constrains it from above out to 2000 — so the value is
+// roughly 3x the worst observed case, and the headroom is deliberate rather than load-bearing.
 const ATTRIBUTION_SCAN_CHARS = 240
 // Same line, bounded: [^\r\n] so a scan can never cross into the next one.
 const ATTRIBUTION_SCAN = `[^\\r\\n]{0,${ATTRIBUTION_SCAN_CHARS}}`
@@ -163,6 +170,32 @@ const isQuoteSignal = (lines: string[], i: number): boolean => {
     return false
 }
 
+// Thresholds for rescuing a signature stranded below a quote. All three were tuned against a corpus
+// that is not in this repo; the bounds recorded here are what the 161-message test corpus can still
+// demonstrate, so they narrow the safe range rather than re-deriving the original values.
+
+// Share of the block between the cut and a "--" that must be quoted lines for that "--" to count as
+// sitting just after the quote (rather than being some unrelated "--" further down). Genuinely
+// two-sided: at 0 a pasted "From:" header block with no quote markers at all qualifies and its
+// trailing line is wrongly reattached, and at 0.75 or above the second marker in a
+// quote -> "--" -> inner sig -> "--" -> real sig layout stops qualifying, so the inner (quoted)
+// signature is kept instead of dropped. 0.5 sits between the two demonstrated failures.
+const QUOTED_BLOCK_RATIO = 0.5
+// Non-empty lines a "--" block needs before it counts as the sender's real signature rather than a
+// one-line scrap of quoted junk. At 1 the inner signature of that same layout is treated as
+// substantial and kept. Nothing in the corpus constrains it from above (3, 4 and 10 are identical),
+// so this is a floor, not a window.
+const SIG_BODY_LINES = 2
+// Visible characters a trailing HTML block may have and still be reattached as a signature. The only
+// threshold here with a demonstrated bound on BOTH sides: a real multi-line sig (name, title,
+// company, address, phone, LinkedIn) runs about 110 characters and is dropped below that, while a
+// 370-character block is meant to be refused and is reattached once this goes to 500. Counted in
+// visible characters, not lines, because HTML splits signatures across many short lines/cells.
+const SIG_VISIBLE_CHARS = 400
+// Markup a "more quoting below" guard may span before finding its "wrote:". 50 is enough for every
+// corpus case; kept at HTML_MARKER_SPAN's neighbourhood since it is the same kind of scan.
+const MORE_QUOTE_SPAN = 200
+
 // Forwards 
 // Detects ---------- Forwarded message ---------- or begin forwarded message:
 const RE_FWD_LINE = /^(?:-+\s*forwarded message\s*-+|begin forwarded message:?)\s*$/i
@@ -260,14 +293,14 @@ export const extractNewContent = (text: string): string => {
                 if (!/^--\s*$/.test(lines[j])) continue
                 const body = lines.slice(cut + 1, j).filter((l) => l.trim())
                 const quoted = body.filter((l) => l.startsWith('>')).length
-                if (body.length && quoted >= body.length * 0.5) markers.push(j)
+                if (body.length && quoted >= body.length * QUOTED_BLOCK_RATIO) markers.push(j)
             }
             let sigIdx = -1
             // Earliest marker whose sig body (up to the next marker) is a substantial ≥2-line block.
             for (const j of markers) {
                 const nextMarker = markers.find((k) => k > j) ?? lines.length
                 const sigBody = lines.slice(j + 1, nextMarker).filter((l) => l.trim())
-                if (sigBody.length >= 2) {
+                if (sigBody.length >= SIG_BODY_LINES) {
                     sigIdx = j
                     break
                 }
@@ -290,6 +323,24 @@ export const extractNewContent = (text: string): string => {
 // HTML VERSION 
 // HTML counterpart to isQuoteSignal. HTML has no lines, so we search for a LIST of
 // markers and cut at whichever appears earliest.
+// Characters of markup a marker may span before reaching what corroborates it — a "wrote:", an
+// address, a colon. ONE constant for all three scans below, because they are one idea: allow the
+// tags a client puts between an attribution's parts. It is not what keeps a marker inside its own
+// block — the negative lookahead on the closing tag does that — which is why the bound can be
+// generous. Measured over the corpus, the widest real span is 184 characters, Outlook's inline CSS
+// between "From:" and the address, so this sits just above the worst observed case.
+//
+// Replaces three separately-chosen values (200 / 250 / 80). All three produce identical output on
+// every corpus input at any shared value from 200 to 400, and the 80 was the least grounded of them:
+// it fires on one HTML input in the whole corpus, with a 9-character match.
+const HTML_MARKER_SPAN = 250
+// Stop a scan at the enclosing block's close, so a marker cannot pair with a corroborator in some
+// later block. "On ... wrote:" also stops at list tags; the other two never sit inside a list.
+const BLOCK_TAGS = 'div|p|td|tr|table|blockquote|body'
+const notPast = (tags: string): string => String.raw`(?:(?!<\/(?:${tags}))[\s\S]){0,${HTML_MARKER_SPAN}}?`
+const HTML_FOREIGN_VERBS =
+    '(a [ée]crit|escribi[óo]|ha scritto|escreveu|schrieb|schreef|geschreven|verzond|skrev|napisał|написал|đã viết|yazd[ıi]|a scris)'
+
 const HTML_QUOTE_MARKERS: RegExp[] = [
     // Client wrappers — each client marks quotes its own way.
     /<div[^>]*gmail_quote/i,                     // Gmail
@@ -300,11 +351,11 @@ const HTML_QUOTE_MARKERS: RegExp[] = [
     
     // Mirrors #4 — "On ... wrote:". Tags can sit between them, so allow 200 chars;
     // the inner guard stops "On" pairing with a "wrote:" in a different block.
-    /\bOn\b(?:(?!<\/(?:div|p|td|tr|table|blockquote|body|ul|ol|li))[\s\S]){0,200}?wrote:/i,
+    new RegExp(String.raw`\bOn\b` + notPast(`${BLOCK_TAGS}|ul|ol|li`) + 'wrote:', 'i'),
     // Mirrors #5 — "From:" header. Lookbehind keeps "From" a standalone word, then needs an email.
-    /(?<![A-Za-z])(?:From|Von|De|Van|Da|Fra|Från):(?:(?!<\/(?:div|p|td|tr|table|blockquote|body))[\s\S]){0,250}?[^\s@]+@[^\s@]+\.[^\s@]+/i,
+    new RegExp(String.raw`(?<![A-Za-z])(?:From|Von|De|Van|Da|Fra|Från):` + notPast(BLOCK_TAGS) + String.raw`[^\s@]+@[^\s@]+\.[^\s@]+`, 'i'),
     // Mirrors #6 — foreign "wrote" verbs ending in a colon.
-    /(a [ée]crit|escribi[óo]|ha scritto|escreveu|schrieb|schreef|geschreven|verzond|skrev|napisał|написал|đã viết|yazd[ıi]|a scris)(?:(?!<\/(?:div|p|td|tr|table|blockquote|body))[\s\S]){0,80}?[:：]/i,
+    new RegExp(HTML_FOREIGN_VERBS + notPast(BLOCK_TAGS) + '[:：]', 'i'),
     // Mirrors #7 — Chinese + Arabic ([:：] accepts the full-width colon).
     /写道\s*[:：]/,
     /发件人\s*[:：]/,
@@ -360,7 +411,10 @@ const reattachTrailingSignature = (html: string, cutAt: number): string | undefi
     const looksLikeSig = /class=["'][^"']*gmail_signature/i.test(rawTail) || /^\s*--\s*$/m.test(tail) ||
         /[^\s@]+@[^\s@]+\.[^\s@]|\+?\d[\d\-\s().]{7,}|https?:\/\/|linkedin\.com|\b(?:regards|thanks|sincerely|cheers|best)\b/i.test(tail)
     // Guard 2: reject anything that is really MORE quoting or a forward — not a signature.
-    const hasMoreQuote = /\bOn\b[\s\S]{0,200}?wrote:|-+\s*forwarded message|begin forwarded message:|^\s*From:\s.{0,80}@/im.test(tail)
+    const hasMoreQuote = new RegExp(
+        String.raw`\bOn\b[\s\S]{0,${MORE_QUOTE_SPAN}}?wrote:|-+\s*forwarded message|begin forwarded message:|^\s*From:\s.{0,80}@`,
+        'im'
+    ).test(tail)
     if (looksLikeSig && !hasMoreQuote) {
         // Skip the empty wrapper junk between the quote close and the real trailing content
         // (stray </div>, empty <div><br></div> gaps) so the spliced HTML stays clean.
@@ -370,7 +424,7 @@ const reattachTrailingSignature = (html: string, cutAt: number): string | undefi
         // Guard 3: what's LEFT after trimming noise must be a real, short signature — bounded by VISIBLE
         // CHARACTER count (not line count: HTML splits sigs into many short lines/table-cells, so a line
         // cap misfires on whitespace-padded sigs). Empty (tail was pure noise) → bail to a plain cut.
-        if (sigVis && sigVis.length <= 400) {
+        if (sigVis && sigVis.length <= SIG_VISIBLE_CHARS) {
             return html.slice(0, cutAt) + sig // reply + signature, quoted middle + footer dropped
         }
     }

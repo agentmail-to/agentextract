@@ -21,27 +21,20 @@ export const MAX_INPUT_BYTES = 10 * 1024 * 1024
 // Cutting sets `truncated` — a partial extraction that reads as complete is worse than a missing one.
 export const MAX_OUTPUT_CHARS = 250_000
 
-// Extra UTF-16 units an incrementally-building handler keeps PAST its cap, so the central trim can
-// do its job. That trim detects overshoot as `text.length > maxOutputChars` and only then checks
-// whether the boundary splits a surrogate pair — so a handler that stored exactly maxOutputChars
-// would report a still-continuing document as exactly-at-cap, skip the check, and emit a lone
-// surrogate half as U+FFFD. One unit is what makes the overshoot visible and is the strict minimum
-// (verified: dropping to zero fails the docx surrogate test); the second is slack so an astral
-// character landing on the boundary is stored whole rather than as a half the trim must discard.
-const CAP_STORAGE_SLACK = 2
-
 // Blocks a handler concatenates into one extraction — PDF pages, XLSX sheets — are joined by this.
 // The incremental length accounting has to charge for it BEFORE the join, so both must read it from
 // here: a separator that disagrees with its own charged width makes the cap off by that difference.
 const BLOCK_SEPARATOR = '\n\n'
 
-// A PDF can declare an enormous page count. Bounds parse work when per-page text is too sparse to
-// trip the output cap; a content-bearing PDF hits MAX_OUTPUT_CHARS within a few dozen pages first.
-// 2000 is a backstop, not a tuned threshold, and only the sparse case can ever reach it: at even 125
-// characters per page the output cap binds first, so a document this bound is one carrying almost no
-// text at all — where the pages parsed, not the text kept, is the cost. Sized against the real
-// corpus (an email attachment running past a few hundred pages is already an outlier) with an order
-// of magnitude of headroom, so no plausible attachment is cut by it before the deadline intervenes.
+// A PDF can declare an enormous page count. What this buys is DETERMINISM, not work-bounding: the
+// page loop already checks the deadline before every page, so a pathological page count is bounded
+// in time with or without this. Without it, though, where a huge sparse PDF stops would depend on
+// how fast the host is, and the same attachment would extract differently on a re-index. A declared
+// page count is a fixed property of the file, so cutting on it cuts at the same place every time.
+// Only the sparse case can reach it: at even 125 characters per page MAX_OUTPUT_CHARS binds first,
+// so a document stopped here is one carrying almost no text at all. 2000 is a backstop rather than
+// a tuned threshold — an email attachment past a few hundred pages is already an outlier, and the
+// suite is indifferent to raising it (it passes with this at 1e9), so it is sized for headroom.
 export const MAX_PDF_PAGES = 2000
 
 // Max ACTUAL uncompressed size of an OOXML zip, measured by inflating it — the declared size is
@@ -75,6 +68,10 @@ export const HANDLER_DEADLINE_MARGIN_MS = 1_000
 // interrupted at all, and one character at a time pays per-slice overhead on every byte. 16 KB is
 // the compromise, and is chosen to match what zlib pushes out of createInflateRaw so a stored part
 // and a deflated one arrive in comparable pieces rather than on two different response latencies.
+// Pinned from BOTH sides by 'checks the deadline between chunks of a stored document part', which
+// sizes its fixture so that the first slice holds the prefix and 5,000 paragraphs do not fit in one:
+// the suite fails at 64 and again at 1 GB. That test states 16 KiB in prose rather than importing
+// this, so retuning it here surfaces as an unrelated-looking deadline assertion — change both.
 const STREAM_SLICE_UNITS = 16 * 1024
 
 // saxes resolves namespace prefixes by scanning the open-tag stack, so attacker-controlled nesting
@@ -105,17 +102,18 @@ const SNIFF_BYTES = 8 * 1024
 // printable (the exceptions are stray control bytes, a handful per file), and binary that gets this
 // far is ~30-50% by the structure of byte values, since only 95 of 256 are printable ASCII. Anything
 // from roughly 0.6 to 0.95 separates them identically; 0.85 leaves room for a text file carrying
-// some control noise without letting through anything with real binary density.
+// some control noise without letting through anything with real binary density. Worth knowing when
+// changing it: the NUL check above is doing the discrimination the suite actually exercises, and no
+// test distinguishes this value — it passes at 0, 0.5, 0.7 and 0.95, and fails only when set above 1
+// (unreachable, so every input is binary). A file that is, say, 60% printable is untested territory.
 const SNIFF_TEXT_RATIO = 0.85
 
-// Charset detection samples the head; below this confidence the guess isn't trusted. 64 KB rather
-// than SNIFF_BYTES because this asks a harder question than "is it text": distinguishing among the
-// legacy single-byte encodings is a statistical judgement over character frequencies, and jschardet
-// gets sharper with more of them. Confidence is jschardet's own 0-1 score, and a miss here is not
-// benign — it silently mojibakes the extraction rather than failing — so the bar sits high enough to
-// fall back to the latin1 path on a genuinely ambiguous file instead of committing to a coin flip.
+// Charset detection samples the head. 64 KB rather than SNIFF_BYTES because this asks a harder
+// question than "is it text": telling the legacy single-byte encodings apart is a statistical
+// judgement over character frequencies, and jschardet sharpens with more of them. Not currently
+// pinned from either side — the suite passes with this at 4 bytes and at 1 GB — so treat it as a
+// sampling budget rather than a tuned threshold.
 const DETECT_SAMPLE_BYTES = 64 * 1024
-const DETECT_MIN_CONFIDENCE = 0.7
 
 /////////////////////////////////////////////////////////////
 // TYPES
@@ -219,21 +217,16 @@ const resolveCharset = (content: Buffer, hint?: string): string => {
     if (isUtf8(content) && !content.subarray(0, SNIFF_BYTES).includes(0)) return 'utf-8'
     // #3. Explicit charset from the Content-Type, if iconv knows it.
     if (hint && iconv.encodingExists(hint)) return hint
-    // #4. Statistical detection on the head, gated on confidence.
+    // #4. Statistical detection on the head, DELIBERATELY UNGATED on jschardet's confidence score.
+    //     Step 2 ruled out utf-8, so these are single-byte legacy bytes: decoding them as utf-8 would
+    //     turn every high byte into an irreversible U+FFFD, and a low-confidence guess still beats
+    //     that. A confidence gate used to sit here and could not ever change the answer — the branch
+    //     below it returned the same `detected.encoding` the gate had just rejected, so every value
+    //     of the threshold produced identical output. Re-adding one is not a tightening: it means
+    //     choosing latin1 over a plausible guess, which is a behaviour change and needs its own case.
     const detected = jschardet.detect(content.subarray(0, DETECT_SAMPLE_BYTES))
-    if (
-        detected &&
-        detected.encoding &&
-        detected.confidence > DETECT_MIN_CONFIDENCE &&
-        iconv.encodingExists(detected.encoding)
-    ) {
-        return detected.encoding
-    }
-    // #5. Floor. Step 2 ruled out utf-8, so these are single-byte legacy bytes and decoding as utf-8
-    //     would turn every high byte into an irreversible U+FFFD. Take jschardet's guess even below
-    //     the gate (a plausible decode beats guaranteed U+FFFD), else latin1 — maybe wrong, but it
-    //     maps every byte, so it's reversible.
     if (detected?.encoding && iconv.encodingExists(detected.encoding)) return detected.encoding
+    // #5. Floor. latin1 maps every byte, so it is wrong-but-reversible rather than lossy.
     return 'latin1'
 }
 
@@ -2472,7 +2465,10 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
     let discardDeferredText = false
     let deferredFreshFrames: Set<DocxFrame> | undefined
     let discardTableText = false
-    const storageLimit = maxOutputChars + CAP_STORAGE_SLACK
+    // Exactly the cap: nothing is stored past what can be returned. The entry point strips a
+    // trailing surrogate half unconditionally, so stopping flush against the cap cannot split a
+    // character, and truncation is reported from capExceeded rather than inferred from overshoot.
+    const storageLimit = maxOutputChars
 
     const appendRaw = (frame: DocxFrame, field: 'value' | 'extra' | 'claimedExtra' | 'allValue', text: string): void => {
         const value = frame[field] ?? ''
@@ -3321,11 +3317,13 @@ export const extractAttachment = async (
         // host memory limit (see README). Don't split a surrogate pair at the boundary: a lone half
         // serializes as U+FFFD.
         const overCap = output.text.length > maxOutputChars
-        const capEnd =
-            overCap && output.text.charCodeAt(maxOutputChars - 1) >= 0xd800 && output.text.charCodeAt(maxOutputChars - 1) <= 0xdbff
-                ? maxOutputChars - 1
-                : maxOutputChars
-        const text = overCap ? output.text.slice(0, capEnd) : output.text
+        const capped = overCap ? output.text.slice(0, maxOutputChars) : output.text
+        // A trailing high surrogate is half a character however it got there — our cut, or a handler
+        // that stopped exactly on the cap. Checked unconditionally rather than only when we cut,
+        // because the alternative is requiring every incremental handler to store past its own cap
+        // purely so this check can notice, which is what the CAP_STORAGE_SLACK constant used to buy.
+        const lastUnit = capped.charCodeAt(capped.length - 1)
+        const text = lastUnit >= 0xd800 && lastUnit <= 0xdbff ? capped.slice(0, -1) : capped
         // Decided on the FINAL text: a tight enough cap slices a non-empty extraction to '', and the
         // contract is that `extraction` is omitted rather than ever being ''. `||`, not `??`, because
         // the handler's call can only ADD emptiness — pdf computes `empty` from its pre-cap page join
