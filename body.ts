@@ -323,21 +323,33 @@ export const extractNewContent = (text: string): string => {
 // HTML VERSION 
 // HTML counterpart to isQuoteSignal. HTML has no lines, so we search for a LIST of
 // markers and cut at whichever appears earliest.
-// Characters of markup a marker may span before reaching what corroborates it — a "wrote:", an
-// address, a colon. ONE constant for all three scans below, because they are one idea: allow the
-// tags a client puts between an attribution's parts. It is not what keeps a marker inside its own
-// block — the negative lookahead on the closing tag does that — which is why the bound can be
-// generous. Measured over the corpus, the widest real span is 184 characters, Outlook's inline CSS
-// between "From:" and the address, so this sits just above the worst observed case.
+// Characters of markup each marker may span before reaching the thing that corroborates it. These
+// are NOT one number. They were briefly unified at 250 on the grounds that no corpus output changed;
+// that was wrong, and the case below is why — how far a scan may wander depends on how much evidence
+// the thing it is looking for actually carries.
 //
-// Replaces three separately-chosen values (200 / 250 / 80). All three produce identical output on
-// every corpus input at any shared value from 200 to 400, and the 80 was the least grounded of them:
-// it fires on one HTML input in the whole corpus, with a 9-character match.
+// "On ... wrote:" and "From: <address>" are strongly anchored: ordinary prose does not contain a
+// literal "wrote:", and the From: scan has to reach a full email address. They can afford a wide
+// window, and need one — the widest real span in the corpus is 184 characters, Outlook's inline CSS
+// sitting between "From:" and the address.
 const HTML_MARKER_SPAN = 250
+// "On ... wrote:" kept its own 200 rather than being rounded up to the constant above: the corpus's
+// longest real match is 90 characters, so 200 is already ~2x the worst case and widening it buys
+// nothing measurable while giving a stray "wrote:" more room to pair with an unrelated "On".
+const HTML_ON_WROTE_SPAN = 200
+// The foreign-verb scan is the weak one: it only needs a COLON, and its verbs are ordinary words in
+// ordinary sentences. "Paul a écrit une proposition détaillée ... Voici mon avis :" is a plain French
+// reply, and at a 250-character window that sentence's own later colon corroborates the verb and the
+// whole message below it is cut away. 80 keeps the scan inside the attribution-shaped neighbourhood
+// where a real "X a écrit :" puts its colon. Do not raise this to match the constant above; if it
+// needs to reach further, the fix is more evidence (a date, an address), not a longer leash.
+const HTML_FOREIGN_VERB_SPAN = 80
 // Stop a scan at the enclosing block's close, so a marker cannot pair with a corroborator in some
 // later block. "On ... wrote:" also stops at list tags; the other two never sit inside a list.
+// NOTE the block guard does not save the foreign-verb case above: that colon is in the SAME <div>.
 const BLOCK_TAGS = 'div|p|td|tr|table|blockquote|body'
-const notPast = (tags: string): string => String.raw`(?:(?!<\/(?:${tags}))[\s\S]){0,${HTML_MARKER_SPAN}}?`
+const notPast = (tags: string, span = HTML_MARKER_SPAN): string =>
+    String.raw`(?:(?!<\/(?:${tags}))[\s\S]){0,${span}}?`
 const HTML_FOREIGN_VERBS =
     '(a [ée]crit|escribi[óo]|ha scritto|escreveu|schrieb|schreef|geschreven|verzond|skrev|napisał|написал|đã viết|yazd[ıi]|a scris)'
 
@@ -351,11 +363,11 @@ const HTML_QUOTE_MARKERS: RegExp[] = [
     
     // Mirrors #4 — "On ... wrote:". Tags can sit between them, so allow 200 chars;
     // the inner guard stops "On" pairing with a "wrote:" in a different block.
-    new RegExp(String.raw`\bOn\b` + notPast(`${BLOCK_TAGS}|ul|ol|li`) + 'wrote:', 'i'),
+    new RegExp(String.raw`\bOn\b` + notPast(`${BLOCK_TAGS}|ul|ol|li`, HTML_ON_WROTE_SPAN) + 'wrote:', 'i'),
     // Mirrors #5 — "From:" header. Lookbehind keeps "From" a standalone word, then needs an email.
     new RegExp(String.raw`(?<![A-Za-z])(?:From|Von|De|Van|Da|Fra|Från):` + notPast(BLOCK_TAGS) + String.raw`[^\s@]+@[^\s@]+\.[^\s@]+`, 'i'),
     // Mirrors #6 — foreign "wrote" verbs ending in a colon.
-    new RegExp(HTML_FOREIGN_VERBS + notPast(BLOCK_TAGS) + '[:：]', 'i'),
+    new RegExp(HTML_FOREIGN_VERBS + notPast(BLOCK_TAGS, HTML_FOREIGN_VERB_SPAN) + '[:：]', 'i'),
     // Mirrors #7 — Chinese + Arabic ([:：] accepts the full-width colon).
     /写道\s*[:：]/,
     /发件人\s*[:：]/,
