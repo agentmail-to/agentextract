@@ -1666,6 +1666,21 @@ describe('extractEmailBody — HTML — quote markers', () => {
         expect(exHtml(html)).toBe('<div>Merci, bien noté.</div>')
     })
 
+    // The mirror of the test above, and the reason the foreign-verb scan has a TIGHTER window than
+    // the other HTML markers rather than sharing theirs. That scan's verbs are ordinary words and its
+    // only corroborator is a colon, so the window is the whole guard: widen it and an unremarkable
+    // French sentence reaches its own later colon and the reply below is cut away as quoted history.
+    // Pinned with a ~125-character gap — inside a 250-char window, outside the 80-char one — and in
+    // one <div>, so the closing-tag lookahead cannot save it either.
+    it('keeps French prose where "a écrit" is a verb and a colon follows much later', () => {
+        const html =
+            '<div>Bonjour Marie,</div>' +
+            '<div>Paul a écrit une proposition détaillée pour le nouveau projet et je pense ' +
+            'que nous devrions en discuter demain matin. Voici mon avis : elle est solide.</div>' +
+            '<div>Merci !</div>'
+        expect(exHtml(html)).toBe(html)
+    })
+
     // #7 (Chinese): 写道 ("wrote") verb-last ending in a full-width colon.
     it('cuts at a Chinese "写道：" attribution in HTML', () => {
         const html =
