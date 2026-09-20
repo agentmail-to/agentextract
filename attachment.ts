@@ -268,6 +268,65 @@ const decodeText = (content: Buffer, hint?: string): string => {
     return text
 }
 
+// A w:-namespaced attribute, resolved by URI rather than by literal prefix, for the same reason
+// OOXML_PREFIXES exists. Module scope because the part shapes above read it too.
+type SaxesAttributes = Record<string, string | { uri?: string; local?: string; value: string }>
+const wordAttribute = (attributes: SaxesAttributes, local: string): string | undefined => {
+    for (const attribute of Object.values(attributes)) {
+        if (
+            typeof attribute !== 'string' &&
+            attribute.local === local &&
+            attribute.uri !== undefined &&
+            OOXML_PREFIXES[attribute.uri] === 'w'
+        ) {
+            return attribute.value
+        }
+    }
+    return undefined
+}
+
+// WHERE a part keeps its block-level content. The main document buries it one level down
+// (w:document > w:body); a header or footer IS its own container; footnotes, endnotes and comments
+// hold a repeating wrapper per item. Everything below that container — paragraphs, runs, tables —
+// is identical vocabulary across all five, which is why one reader serves them with only this
+// varying. The main-document shape is expressed here exactly as it was hard-coded before, so the
+// path this file has always taken is unchanged rather than re-derived.
+interface DocxPartShape {
+    root: string // the document element
+    content: string // element that opens a content region; === root when the root holds it directly
+    contentDepth: number // stack.length at which `content` is expected, so a nested namesake cannot open one
+    repeats: boolean // may open more than once (one w:footnote per note), rather than exactly once
+    // A footnotes/endnotes part always carries the separator and continuation-separator notes Word
+    // uses to draw the rule above the note area. They are structure, not content, and emitting them
+    // puts a stray empty paragraph in the output of every document that has a single footnote.
+    skipItem?: (attributes: SaxesAttributes) => boolean
+}
+
+const DOCX_SEPARATOR_NOTE_TYPES = new Set(['separator', 'continuationSeparator'])
+const isSeparatorNote = (attributes: SaxesAttributes): boolean => {
+    const type = wordAttribute(attributes, 'type')
+    return type !== undefined && DOCX_SEPARATOR_NOTE_TYPES.has(type)
+}
+
+const DOCX_MAIN_SHAPE: DocxPartShape = { root: 'w:document', content: 'w:body', contentDepth: 2, repeats: false }
+const DOCX_HEADER_SHAPE: DocxPartShape = { root: 'w:hdr', content: 'w:hdr', contentDepth: 1, repeats: false }
+const DOCX_FOOTER_SHAPE: DocxPartShape = { root: 'w:ftr', content: 'w:ftr', contentDepth: 1, repeats: false }
+const DOCX_FOOTNOTES_SHAPE: DocxPartShape = {
+    root: 'w:footnotes',
+    content: 'w:footnote',
+    contentDepth: 2,
+    repeats: true,
+    skipItem: isSeparatorNote,
+}
+const DOCX_ENDNOTES_SHAPE: DocxPartShape = {
+    root: 'w:endnotes',
+    content: 'w:endnote',
+    contentDepth: 2,
+    repeats: true,
+    skipItem: isSeparatorNote,
+}
+const DOCX_COMMENTS_SHAPE: DocxPartShape = { root: 'w:comments', content: 'w:comment', contentDepth: 2, repeats: true }
+
 /////////////////////////////////////////////////////////////
 // HANDLER REGISTRY
 
@@ -409,6 +468,30 @@ const pdfHandler: Handler = {
 
 // DOCX — modern OOXML Word. Streams word/document.xml; see DOCX STREAMING READER for the machinery,
 // and for why the output contract is mammoth's, reproduced rather than invented.
+// The parts a .docx keeps its text in, beyond word/document.xml. All five carry the same
+// paragraph/run vocabulary as the body, differing only in the container the shape names — which is
+// why one reader reads all of them and this table is the entire addition.
+//
+// ORDER IS THE CAP'S PRIORITY ORDER, not the document's reading order, which cannot be
+// reconstructed anyway: a footnote's body lives here while its reference sits inline in the body,
+// and a header is repeated per section rather than positioned once. Body first, then the notes a
+// reader would follow, then the margins — so a document that runs into MAX_OUTPUT_CHARS loses its
+// page furniture before it loses a footnote, and a footnote before it loses a paragraph.
+//
+// Matched by CONVENTIONAL PATH, as the main part already is, rather than resolved through
+// word/_rels/document.xml.rels. Consistent with the existing reader, and the failure mode is benign
+// in a way the main part's is not: a part missed here costs its own text, nothing else.
+const DOCX_AUXILIARY_PARTS: { pattern: RegExp; shape: DocxPartShape; dedupe: boolean }[] = [
+    { pattern: /^word\/footnotes\.xml$/, shape: DOCX_FOOTNOTES_SHAPE, dedupe: false },
+    { pattern: /^word\/endnotes\.xml$/, shape: DOCX_ENDNOTES_SHAPE, dedupe: false },
+    { pattern: /^word\/comments\.xml$/, shape: DOCX_COMMENTS_SHAPE, dedupe: false },
+    // A section can declare up to three headers (default, first page, even pages) and Word writes
+    // one part each, usually with identical text. Emitted once per distinct text, because repeating
+    // a letterhead once per section is noise that also eats the cap.
+    { pattern: /^word\/header\d*\.xml$/, shape: DOCX_HEADER_SHAPE, dedupe: true },
+    { pattern: /^word\/footer\d*\.xml$/, shape: DOCX_FOOTER_SHAPE, dedupe: true },
+]
+
 const docxHandler: Handler = {
     kind: 'docx',
     contentTypes: ['application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
@@ -428,18 +511,22 @@ const docxHandler: Handler = {
         const part = entries.findLast((entry) => opcKey(entry.name) === DOCX_MAIN_PART)
         if (!part) throw new Error(`docx archive has no ${DOCX_MAIN_PART} entry`)
 
-        const reader = await createDocxReader(maxOutputChars)
         // Decode ACROSS inflate chunks, not per chunk: a 16 KB boundary lands mid-sequence in any
         // document with a non-ASCII character, and chunk.toString('utf8') would turn that one
         // character into two U+FFFD. StringDecoder carries the partial bytes forward. (saxes handles
         // a surrogate pair split across write() calls itself; this is the layer below that.)
         const { StringDecoder } = await import('node:string_decoder')
-        const decoder = new StringDecoder('utf8')
 
-        let truncated = false
-        let sawBody: boolean | undefined
-        try {
-            for await (const chunk of docxMainPartChunks(part)) {
+        // One part, read to its end or to the budget it was given. Returns the text and whether it
+        // stopped early, and throws only the way the main part always has — so the caller can treat
+        // the main part as load-bearing and every other part as best-effort.
+        const readPart = async (entry: ZipEntry, shape: DocxPartShape, budget: number) => {
+            const reader = await createDocxReader(budget, shape)
+            const decoder = new StringDecoder('utf8')
+            let partTruncated = false
+            let sawContent: boolean | undefined
+            try {
+                for await (const chunk of docxMainPartChunks(entry)) {
                 // Both guards here, ahead of the work, at one inflate chunk of granularity. Finer
                 // than the pdf per-page and xlsx per-row checks, and the only place a stop is
                 // possible: saxes has no abort, so the way to stop parsing is to stop feeding it.
@@ -448,16 +535,16 @@ const docxHandler: Handler = {
                 // at all, so a cap-only check would never fire on precisely the cheapest loop to
                 // spin. Breaking a `for await` destroys the inflate stream, so the rest of the
                 // document is never decompressed either.
-                if (Date.now() > deadline || reader.shouldStop()) {
-                    truncated = true
-                    break
+                    if (Date.now() > deadline || reader.shouldStop()) {
+                        partTruncated = true
+                        break
+                    }
+                    reader.write(decoder.write(chunk))
                 }
-                reader.write(decoder.write(chunk))
-            }
-            // Only a read that ran to the end may assert the document ended cleanly.
-            if (!truncated) sawBody = reader.end(decoder.end())
-            if (reader.overCap()) truncated = true
-        } catch (error) {
+                // Only a read that ran to the end may assert the part ended cleanly.
+                if (!partTruncated) sawContent = reader.end(decoder.end())
+                if (reader.overCap()) partTruncated = true
+            } catch (error) {
             // saxes is conformant where mammoth's DOM parser recovered, so a document the old reader
             // read to the end can stop short here. Text already extracted is still text, and the
             // contract has a word for "the document continues past this point" — so keep it and say
@@ -465,18 +552,63 @@ const docxHandler: Handler = {
             // and retry. What this deliberately does NOT do is install a saxes error handler and
             // parse on; measured, that emits close-tag text as content and descends into elements
             // mammoth drops — silent wrong output, the one outcome this file fails over everywhere else.
-            if (reader.text().trim().length === 0) throw error
-            truncated = true
+                if (reader.text().trim().length === 0) throw error
+                partTruncated = true
+            }
+            return { text: reader.text(), truncated: partTruncated, sawContent }
         }
 
+        const body = await readPart(part, DOCX_MAIN_SHAPE, maxOutputChars)
         // Keep this semantic assertion outside the malformed-XML recovery above. A bodyless main
         // part can contain parseable paragraph text, but it is still not a Word document; catching
         // this assertion as though parsing stopped midway would mislabel the foreign content as a
         // useful truncated prefix.
-        if (sawBody === false) throw new Error('docx main part has no w:body element')
+        if (body.sawContent === false) throw new Error('docx main part has no w:body element')
+
+        // Concatenated, NOT joined with a separator: the reader already terminates every paragraph
+        // with one, so a part's text ends where the next can start. Adding another here is what put
+        // a pair of blank paragraphs between the body and its own footnotes.
+        const sections = [body.text]
+        let truncated = body.truncated
+        const used = () => sections.reduce((total, part) => total + part.length, 0)
+
+        for (const { pattern, shape, dedupe } of DOCX_AUXILIARY_PARTS) {
+            const seen = new Set<string>()
+            for (const entry of entries) {
+                if (truncated || Date.now() > deadline) {
+                    // Ran out of room or time. The body is already read, so this is a truncation of
+                    // the document, exactly as stopping mid-body would be — not a failure.
+                    truncated = true
+                    break
+                }
+                const key = opcKey(entry.name)
+                if (key === undefined || !pattern.test(key)) continue
+                const remaining = maxOutputChars - used()
+                if (remaining <= 0) {
+                    truncated = true
+                    break
+                }
+                try {
+                    const read = await readPart(entry, shape, remaining)
+                    // Trimmed for the DECISIONS (is there anything here, have we already emitted
+                    // it), raw for the OUTPUT, so a part keeps the paragraph breaks it read.
+                    const key = read.text.trim()
+                    if (key === '' || (dedupe && seen.has(key))) continue
+                    seen.add(key)
+                    sections.push(read.text)
+                    if (read.truncated) truncated = true
+                } catch {
+                    // BEST-EFFORT, and the reason the main part is read separately above: a broken
+                    // footnotes part costs its own text and nothing else. Turning a readable document
+                    // into a failure over its margins would trade a whole extraction for a fragment.
+                    truncated = true
+                }
+            }
+            if (truncated) break
+        }
 
         // Emptiness is left to the entry point: an empty document is exactly '\n\n', which trims to ''.
-        return { text: reader.text(), truncated }
+        return { text: sections.join(''), truncated }
     },
 }
 
@@ -2466,16 +2598,17 @@ interface PendingDeletedParagraph {
     chars: number
 }
 
+
 interface DocxReader {
     write: (chunk: string) => void // one decoded slice of document.xml; THROWS on malformed XML
     chars: () => number // characters emitted so far — what the handler's cap check reads
     overCap: () => boolean
     shouldStop: () => boolean // cap crossed and any output-order-sensitive frame has closed
-    end: (tail: string) => boolean // flush/close; whether the document contained w:body
+    end: (tail: string) => boolean // flush/close; whether the part contained its content container
     text: () => string // the text, complete or partial
 }
 
-const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => {
+const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = DOCX_MAIN_SHAPE): Promise<DocxReader> => {
     // Lazy like every other parser here: a Lambda that only ever sees text never loads saxes.
     const { SaxesParser } = await import('saxes')
     const { hex: dingbatHex } = await import('dingbat-to-unicode')
@@ -2607,23 +2740,6 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         charge(text.length)
     }
 
-    const wordAttribute = (
-        attributes: Record<string, string | { uri?: string; local?: string; value: string }>,
-        local: string
-    ): string | undefined => {
-        for (const attribute of Object.values(attributes)) {
-            if (
-                typeof attribute !== 'string' &&
-                attribute.local === local &&
-                attribute.uri !== undefined &&
-                OOXML_PREFIXES[attribute.uri] === 'w'
-            ) {
-                return attribute.value
-            }
-        }
-        return undefined
-    }
-
     const emitSymbol = (attributes: Record<string, string | { uri?: string; local?: string; value: string }>): void => {
         const font = wordAttribute(attributes, 'font')
         const char = wordAttribute(attributes, 'char')
@@ -2722,9 +2838,23 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
         // the root only as a path to that child; any sibling before or after the first body is a
         // malformed-document subtree and is dropped without affecting the body itself.
         if (!inBody) {
-            if (name === 'w:document' && stack.length === 1) return
-            if (name === 'w:body' && stack.length === 2 && stack[0] === 'w:document' && !sawBody) {
+            // The root is kept only as a path to the container below it; for a header or footer the
+            // two are the same element and there is no such step. `repeats` is what separates the
+            // one-body parts from a footnotes part, where every w:footnote opens a fresh region.
+            if (name === shape.root && stack.length === 1 && shape.content !== shape.root) return
+            if (
+                name === shape.content &&
+                stack.length === shape.contentDepth &&
+                (shape.contentDepth === 1 || stack[0] === shape.root) &&
+                (shape.repeats || !sawBody)
+            ) {
                 sawBody = true
+                // A separator note is structure — counted as seen, so the part still reads as
+                // well-formed, but not entered, so it contributes no paragraph.
+                if (shape.skipItem?.(tag.attributes) ?? false) {
+                    skip = stack.length - 1
+                    return
+                }
                 inBody = true
                 return
             }
@@ -2934,7 +3064,7 @@ const createDocxReader = async (maxOutputChars: number): Promise<DocxReader> => 
             }
             return
         }
-        if (name === 'w:body' && stack.length === 1) {
+        if (name === shape.content && stack.length === shape.contentDepth - 1 && inBody) {
             // Availability-preserving divergence retained from the previous reader: Mammoth drops
             // a final deleted-mark paragraph because nothing claims its stash; attachment
             // extraction keeps its plain text. Extras remain deferred and therefore absent.

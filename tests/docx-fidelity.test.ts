@@ -41,7 +41,36 @@ const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingm
 
 // Documents where our reader deliberately diverges from mammoth. Each entry must say WHY, and holds
 // what mammoth produces — the snapshot holds ours. An empty table means the port is exact.
-const ACCEPTED_DIVERGENCES: Record<string, { reason: string; mammoth: string | null }> = {}
+const ACCEPTED_DIVERGENCES: Record<string, { reason: string; mammoth: string | null }> = {
+    // mammoth.extractRawText reads word/document.xml and nothing else, so a footnote, endnote or
+    // comment body — which lives in its own part — is text it never sees. We now read those parts
+    // through the same reader, so on any document that has one we produce strictly MORE text than
+    // the oracle, and the oracle can no longer be the authority for these four files.
+    //
+    // This is the divergence direction the interlock exists to make deliberate: each entry below is
+    // a document where mammoth's answer is a subset of ours, the snapshot holds what we produce, and
+    // the string here holds what mammoth still produces. If our reader regresses to mammoth's
+    // output, the snapshot fails; if mammoth ever starts reading these parts, this table fails.
+    'comments.docx': {
+        reason: 'comment bodies live in word/comments.xml, which mammoth.extractRawText does not read',
+        mammoth: 'Ouch.\n\n',
+    },
+    'endnotes.docx': {
+        reason: 'endnote bodies live in word/endnotes.xml, which mammoth.extractRawText does not read',
+        mammoth: 'Ouch.\n\n',
+    },
+    'footnotes.docx': {
+        reason: 'footnote bodies live in word/footnotes.xml, which mammoth.extractRawText does not read',
+        mammoth: 'Ouch.\n\n',
+    },
+    // The sharpest case: this document's body is empty, so mammoth extracts nothing at all and the
+    // entry point would have reported it as a document with no text. Its only content is a
+    // hyperlink inside a footnote.
+    'footnote-hyperlink.docx': {
+        reason: 'the document body is empty; all of its text is a hyperlink inside word/footnotes.xml',
+        mammoth: null,
+    },
+}
 
 // The entry point omits `extraction` entirely rather than ever returning '' (a ran-but-empty
 // extraction is `{ status: 'extracted' }` with no text). That collapse is a library-wide contract

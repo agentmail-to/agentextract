@@ -64,6 +64,113 @@ const extract = async (body: string, options?: { maxOutputChars?: number }) =>
 const para = (inner: string) => `<w:p><w:r>${inner}</w:r></w:p>`
 const text = (s: string) => para(`<w:t>${s}</w:t>`)
 
+// An archive with extra parts alongside word/document.xml, for the auxiliary-part reader.
+const docxWithParts = async (body: string, parts: Record<string, string>) => {
+    const zip = new JSZip()
+    zip.file(
+        '[Content_Types].xml',
+        '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>'
+    )
+    zip.file(
+        '_rels/.rels',
+        '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'
+    )
+    zip.file('word/document.xml', `<?xml version="1.0"?><w:document ${NS}><w:body>${body}</w:body></w:document>`)
+    for (const [name, xml] of Object.entries(parts)) zip.file(name, xml)
+    return Buffer.from(await zip.generateAsync({ type: 'nodebuffer' }))
+}
+const auxPart = (root: string, inner: string) => `<?xml version="1.0"?><w:${root} ${NS}>${inner}</w:${root}>`
+const extractParts = async (body: string, parts: Record<string, string>, options?: { maxOutputChars?: number }) =>
+    extractAttachment({ content: await docxWithParts(body, parts), contentType: DOCX_TYPE }, options)
+
+// Text in a .docx is spread across parts: word/document.xml holds the body, while footnotes,
+// endnotes, comments, headers and footers each live in their own. Reading only the body silently
+// dropped all of it — a footnote carrying the substance of a contract clause, a header carrying a
+// confidentiality marking — with nothing in the result to say anything was missing.
+describe('docx — text outside word/document.xml', () => {
+    it('reads footnote bodies', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${text('A real footnote.')}</w:footnote>`),
+        })
+        expect(r.extraction).toBe('Body.\n\nA real footnote.\n\n')
+    })
+
+    it('reads endnote and comment bodies', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/endnotes.xml': auxPart('endnotes', `<w:endnote w:id="2">${text('An endnote.')}</w:endnote>`),
+            'word/comments.xml': auxPart('comments', `<w:comment w:id="1">${text('A comment.')}</w:comment>`),
+        })
+        expect(r.extraction).toBe('Body.\n\nAn endnote.\n\nA comment.\n\n')
+    })
+
+    // Word writes a separator and a continuation-separator note into every footnotes part to draw
+    // the rule above the note area. They hold no text, and emitting them puts a stray blank
+    // paragraph into the output of every document that has a single footnote.
+    it('skips the separator notes Word writes into every footnotes part', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/footnotes.xml': auxPart(
+                'footnotes',
+                `<w:footnote w:id="-1" w:type="separator">${text('SEP')}</w:footnote>` +
+                    `<w:footnote w:id="0" w:type="continuationSeparator">${text('CONT')}</w:footnote>` +
+                    `<w:footnote w:id="2">${text('Real note.')}</w:footnote>`
+            ),
+        })
+        expect(r.extraction).toBe('Body.\n\nReal note.\n\n')
+        expect(r.extraction).not.toContain('SEP')
+        expect(r.extraction).not.toContain('CONT')
+    })
+
+    it('reads headers and footers', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': auxPart('hdr', text('CONFIDENTIAL')),
+            'word/footer1.xml': auxPart('ftr', text('Page 1 of 4')),
+        })
+        expect(r.extraction).toBe('Body.\n\nCONFIDENTIAL\n\nPage 1 of 4\n\n')
+    })
+
+    // A section can declare three headers (default, first page, even pages), and Word writes a part
+    // for each — usually with identical text. Repeating a letterhead once per section is noise that
+    // also spends the output cap.
+    it('emits a repeated header once', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': auxPart('hdr', text('CONFIDENTIAL')),
+            'word/header2.xml': auxPart('hdr', text('CONFIDENTIAL')),
+            'word/header3.xml': auxPart('hdr', text('Appendix header')),
+        })
+        expect(r.extraction).toBe('Body.\n\nCONFIDENTIAL\n\nAppendix header\n\n')
+    })
+
+    // The main part is load-bearing and an auxiliary part is not, which is the whole reason they are
+    // read separately. Trading a readable document for a fragment over its margins would be a worse
+    // answer than the one this replaced.
+    it('keeps the body when an auxiliary part is malformed', async () => {
+        const r = await extractParts(text('Body survives.'), {
+            'word/footnotes.xml': '<?xml version="1.0"?><w:footnotes><w:footnote><w:p>unclosed',
+        })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('Body survives.')
+        expect(r.truncated).toBe(true)
+    })
+
+    // Order is the cap's priority order: a document that runs out of room loses its page furniture
+    // before a footnote, and a footnote before a body paragraph.
+    it('spends the cap on the body before the margins', async () => {
+        const r = await extractParts(text('BODY'), {
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${text('NOTE')}</w:footnote>`),
+            'word/header1.xml': auxPart('hdr', text('HEADER')),
+        }, { maxOutputChars: 12 })
+        expect(r.extraction).toContain('BODY')
+        expect(r.extraction).not.toContain('HEADER')
+        expect(r.truncated).toBe(true)
+    })
+
+    // A document with no auxiliary parts must read exactly as it did before they were considered.
+    it('leaves a document without auxiliary parts unchanged', async () => {
+        const r = await extract(text('Only a body.'))
+        expect(r.extraction).toBe('Only a body.\n\n')
+    })
+})
+
 describe('docx — the whitelist drops unrecognised subtrees', () => {
     // mc:Choice is the DrawingML branch and mc:Fallback the VML one; Word emits both for the same
     // text box. Taking both would DOUBLE the text, and taking Choice instead of Fallback would take
