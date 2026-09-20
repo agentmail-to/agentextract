@@ -1157,9 +1157,20 @@ const RTF_MAGIC = Buffer.from('{\\rtf')
 // Legacy OLE (.doc). Shared with .xls/.ppt/.msg, so we only claim doc when the extension confirms it.
 const OLE_MAGIC = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
 
-// docx and xlsx share the zip magic; their main part is what tells them apart.
-const DOCX_PART = Buffer.from('word/document.xml')
-const XLSX_PART = Buffer.from('xl/workbook.xml')
+// docx and xlsx share the zip magic; their main part is what tells them apart. The names are needed
+// in two shapes — as entry-name strings for the exact-match path, and as bytes for the raw scan the
+// fallback uses — so the string is canonical here and the Buffer is derived from it. Both shapes
+// have to name the SAME part or the two paths disagree about what a package is.
+const DOCX_MAIN_PART = 'word/document.xml'
+const WORKBOOK_PART = 'xl/workbook.xml'
+const DOCX_PART = Buffer.from(DOCX_MAIN_PART)
+const XLSX_PART = Buffer.from(WORKBOOK_PART)
+// The other OPC part names this module names by hand, kept with the two above so there is a single
+// home for them: routing, the streaming rebuild and the sheet-identity resolver all spell the same
+// parts, and a rebuild that ordered a part the resolver reads under a different spelling would put
+// exceljs back on the branch the rebuild exists to avoid.
+const WORKBOOK_RELS_PART = 'xl/_rels/workbook.xml.rels'
+const CONTENT_TYPES_PART = '[Content_Types].xml'
 
 const startsWith = (content: Buffer, magic: Buffer): boolean =>
     content.length >= magic.length && content.subarray(0, magic.length).equals(magic)
@@ -1172,8 +1183,8 @@ const ooxmlKind = (content: Buffer): HandlerKind | undefined => {
     const names = zipEntryNames(content)
     if (names) {
         const folded = new Set(names.flatMap((name) => opcKey(name) ?? []))
-        const hasDocx = folded.has('word/document.xml')
-        const hasXlsx = folded.has('xl/workbook.xml')
+        const hasDocx = folded.has(DOCX_MAIN_PART)
+        const hasXlsx = folded.has(WORKBOOK_PART)
         if (hasDocx) return 'docx' // a real word/document.xml root part wins (docx may embed a workbook)
         if (hasXlsx) return 'xlsx'
         return undefined // OOXML zip with neither root part (pptx, jar, plain archive)
@@ -1481,10 +1492,10 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
 // the 'sheets' TypeError above. Sheet NAMES no longer come from it — we resolve those ourselves, so
 // the reader's own copy is only what keeps it from throwing.
 const XLSX_LEADING_ENTRIES = [
-    '[Content_Types].xml',
+    CONTENT_TYPES_PART,
     '_rels/.rels',
-    'xl/workbook.xml', // -> this.model  (the 'sheets' TypeError without it)
-    'xl/_rels/workbook.xml.rels', // -> this.workbookRels
+    WORKBOOK_PART, // -> this.model  (the 'sheets' TypeError without it)
+    WORKBOOK_RELS_PART, // -> this.workbookRels
     'xl/sharedStrings.xml', // -> this.sharedStrings
     'xl/styles.xml', // -> this.styles      (number formats)
 ]
@@ -1589,9 +1600,8 @@ const EXCELJS_WORKSHEET_DISPATCH = /xl\/worksheets\/sheet\d+[.]xml/
 // The workbook is the ORDERING and NAMING authority only. MEMBERSHIP stays the archive's: see the
 // tail of workbookWorksheets for why handing it that third job silently deletes text.
 
-const WORKBOOK_PART = 'xl/workbook.xml'
-const WORKBOOK_RELS_PART = 'xl/_rels/workbook.xml.rels'
-const CONTENT_TYPES_PART = '[Content_Types].xml'
+// WORKBOOK_PART, WORKBOOK_RELS_PART and CONTENT_TYPES_PART are declared with the format magic
+// above, where routing needs them first.
 
 // The relationship types naming a sheet that has NO xl/worksheets part, mapped to the part family
 // each one must live in, in both flavours: Transitional (schemas.openxmlformats.org) and Strict
@@ -1700,6 +1710,10 @@ const OFFICE_RELS_NS = new Set([
 // part markup, not in the package. Relationship TYPE values do move, so NON_WORKSHEET_REL lists both
 // spellings of each one explicitly.
 const PACKAGE_RELS_NS = 'http://schemas.openxmlformats.org/package/2006/relationships'
+// The content-types part has its own OPC namespace, distinct from the relationships one above. Read
+// by two separate scans of [Content_Types].xml — one resolving worksheet parts, one classifying
+// them — which each used to declare it locally; they must agree, so there is one of it.
+const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
 
 // One relationship as the workbook points at it. The TYPE is carried, not just the target: a Target
 // is a string the producer chose, so classifying a declaration by the shape of its path let a
@@ -1759,7 +1773,6 @@ const parseWorkbookParts = async (workbookXml: string, relsXml: string, contentT
     const overriddenParts = new Set<string>()
     let contentTypesKnown = false
     if (contentTypesXml !== undefined) {
-        const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
         const contentTypes = new SaxesParser({
             xmlns: true,
             resolvePrefix: () => UNBOUND_NAMESPACE,
@@ -1851,7 +1864,6 @@ const metadataFallbackWorksheets = async (
     }
 
     if (contentTypesXml !== undefined) {
-        const CONTENT_TYPES_NS = 'http://schemas.openxmlformats.org/package/2006/content-types'
         const contentTypes = new SaxesParser({
             xmlns: true,
             resolvePrefix: () => UNBOUND_NAMESPACE,
@@ -2270,7 +2282,7 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
 // Fidelity is pinned by tests/docx-fidelity.test.ts against mammoth itself over a real Word corpus.
 // The deliberate divergences are listed at DOCX_CONTAINERS.
 
-const DOCX_MAIN_PART = 'word/document.xml'
+// DOCX_MAIN_PART is declared with the format magic above, where routing needs it first.
 
 // Namespace URI -> the prefix mammoth's element names carry (office-xml-reader.js:10-36). Matching a
 // literal `w:` prefix instead would be a shippable bug three times over: the ISO-strict format binds
