@@ -17,9 +17,10 @@ import {
     MAX_UNCOMPRESSED_BYTES,
 } from '../attachment'
 
-// NOTE: result shape is { status, extraction?, reason?, truncated? }; `extraction` is omitted (never
-// '') when a handler runs but produces no text, and `truncated` says whether the document continues
-// past it. Nested emails (.eml) are out of scope in this version and skip.
+// NOTE: result shape is { status, extraction?, reason?, truncated?, emptyReason? }; `extraction` is
+// omitted (never '') when a handler runs but produces no text, `truncated` says whether the document
+// continues past it, and `emptyReason` says WHY there is no text on exactly the results that have
+// none. Nested emails (.eml) are out of scope in this version and skip.
 
 // Real fixtures generated once with macOS textutil (.docx) and cupsfilter (.pdf), and exceljs (.xlsx).
 // vitest runs from the repo root, so resolve against cwd.
@@ -1172,6 +1173,59 @@ describe('attachment — xlsx handler', () => {
 // Output cap -----------------------------------------------------------------
 // Input is byte-capped, but output isn't proportional to input — cap it centrally so a
 // pathological/large document can't dump megabytes of text into S3 + the search index.
+
+// An empty extraction used to be one result object for three unrelated situations, so a caller had
+// no way to tell "this page is a scan, send it to OCR" from "this file is empty". These pin the
+// distinction, and pin that it is drawn from PROOF rather than guessed: only a format that can show
+// it holds non-text content may say 'no-text-layer'.
+describe('attachment — why an extraction is empty', () => {
+    it('reports no-text-layer for a PDF whose pages carry no text', async () => {
+        const r = await extractAttachment({ content: fixture('blank.pdf'), filename: 'scan.pdf' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBeUndefined()
+        expect(r.emptyReason).toBe('no-text-layer')
+    })
+
+    it('reports no-text-content for a zero-byte attachment', async () => {
+        const r = await extractAttachment({ content: Buffer.alloc(0), filename: 'empty.txt' })
+        expect(r.status).toBe('extracted')
+        expect(r.emptyReason).toBe('no-text-content')
+    })
+
+    // The case that makes this more than a PDF feature: whitespace-only text reached the same result
+    // object as a scan, and the two want opposite follow-up actions.
+    it('reports no-text-content for a whitespace-only text attachment', async () => {
+        const r = await extractAttachment({ content: Buffer.from('   \n\t  '), filename: 'blank.txt' })
+        expect(r.status).toBe('extracted')
+        expect(r.emptyReason).toBe('no-text-content')
+    })
+
+    // Exactly one of the two is present on every successful result, so a consumer never has to test
+    // for both — and never sees a reason contradicting text it was also handed.
+    it('omits emptyReason whenever there is text', async () => {
+        const r = await extractAttachment({ content: fixture('sample.pdf'), filename: 'a.pdf' })
+        expect(r.extraction).toBeTruthy()
+        expect(r.emptyReason).toBeUndefined()
+    })
+
+    // A password-protected OOXML file is an OLE container, so routing saw OLE where it wanted PK and
+    // called the file unrecognized — true of the bytes, and wrong about the file.
+    it('names a password-protected Office file rather than calling it unrecognized', async () => {
+        const ole = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
+        const marker = Buffer.from('EncryptedPackage', 'utf16le')
+        const content = Buffer.concat([ole, Buffer.alloc(400), marker, Buffer.alloc(2_048)])
+        const r = await extractAttachment({ content, filename: 'locked.docx' })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toContain('password-protected')
+    })
+
+    // The marker is what earns the label; an OLE file without it is still a legacy binary we may or
+    // may not read, and must not be relabeled as locked.
+    it('does not call an ordinary OLE file password-protected', async () => {
+        const r = await extractAttachment({ content: fixture('sample.doc'), filename: 'sample.doc' })
+        expect(r.status).toBe('extracted')
+    })
+})
 
 describe('attachment — output cap', () => {
     // Over-cap output is bounded to exactly MAX_OUTPUT_CHARS (silently — no truncation flag).

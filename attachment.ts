@@ -147,6 +147,19 @@ export interface ExtractOptions {
     trailer?: string
 }
 
+// Why an `extracted` result carries no text. Set ONLY when `status` is 'extracted' and `extraction`
+// is absent, because that is the one outcome a caller could not otherwise interpret: before this, a
+// scanned page, a zero-byte file and a whitespace-only file were the same result object, so "we
+// found nothing" and "there is nothing" were indistinguishable, and no consumer could decide
+// whether OCR was worth trying.
+export type EmptyReason =
+    // Read, and genuinely holds no text. Nothing else will get more out of it.
+    | 'no-text-content'
+    // HAS content, but none of it is text — a scan, a photographed page, a deck of images. Text
+    // extraction is the wrong tool here and OCR is the next step. Reported only where the format
+    // lets us PROVE the difference, never guessed.
+    | 'no-text-layer'
+
 export interface ExtractionResult {
     status: ExtractionStatus
     extraction?: string // omitted entirely (never '') when the handler produced no text
@@ -154,6 +167,9 @@ export interface ExtractionResult {
     // Whether the document continues past `extraction`. Set on `extracted` only — skipped/failed
     // have no text to have cut. Independent of `trailer`, so a consumer never parses the text for it.
     truncated?: boolean
+    // Set on `extracted` with no `extraction`, and never otherwise — so exactly one of `extraction`
+    // and `emptyReason` is present on every successful result.
+    emptyReason?: EmptyReason
 }
 
 interface HandlerContext {
@@ -170,6 +186,11 @@ interface HandlerContext {
 interface HandlerOutput {
     text: string
     empty?: boolean // handler's own emptiness call; defaults to text.trim() === ''
+    // Set by a handler that can PROVE the document holds non-text content; the entry point turns it
+    // into `emptyReason: 'no-text-layer'` when the extraction came out empty. Proof, not inference —
+    // a handler that cannot tell an image-only document from an empty one leaves this unset, and the
+    // result says 'no-text-content', which is the honest answer for a format that cannot tell.
+    hasNonTextContent?: boolean
     // Set by a handler that stopped early; ORed with the entry point's over-cap check. A handler
     // stopping ON the cap or on the deadline lands under it and would otherwise look complete.
     truncated?: boolean
@@ -337,6 +358,7 @@ const pdfHandler: Handler = {
             const pages: string[] = []
             let length = 0
             let truncated = false
+            let pagesRead = 0 // pages whose text content we actually asked for, deadline stops excluded
             for (let n = 1; n <= pageCount; n++) {
                 // This loop awaits per page, so the deadline is enforceable here in a way withTimeout's
                 // race is not. Before the fetch: stopping is only useful if it precedes the work.
@@ -346,6 +368,7 @@ const pdfHandler: Handler = {
                 }
                 const page = await pdf.getPage(n)
                 const { items } = await page.getTextContent()
+                pagesRead++
                 // Replicates unpdf's per-page join: str, plus a newline on hasEOL.
                 const pageText = (items as Array<{ str?: string; hasEOL?: boolean }>)
                     .filter((item) => item.str != null)
@@ -364,7 +387,13 @@ const pdfHandler: Handler = {
             // Pages past the ceiling are text we never read.
             if (pageCount < pdf.numPages) truncated = true
             const joined = pages.join(BLOCK_SEPARATOR).trim()
-            return { text: joined, empty: joined.length === 0, truncated }
+            // A PDF that HAS pages and yielded no text from any of them is the canonical scan: the
+            // pages carry images, and pdf.js found no text operators to report. That is provable
+            // here in a way it is not in most formats, and it is the difference between "send this
+            // to OCR" and "there was nothing to read". Deliberately requires a page we actually
+            // visited — a zero-page PDF, or one whose pages were all skipped by the deadline, has
+            // shown us nothing to draw a conclusion from.
+            return { text: joined, empty: joined.length === 0, truncated, hasNonTextContent: pagesRead > 0 }
         } finally {
             // getDocumentProxy exposes pdf.js's loading task; release its worker handler, document
             // bytes, and page cache on success, early stop, and errors alike. Cleanup is best-effort:
@@ -3103,6 +3132,15 @@ const docxMainPartChunks = (part: ZipEntry): AsyncIterable<Buffer> | Iterable<Bu
 // nothing, so a real .doc sent without a filename still routes.
 const NON_DOC_OLE_EXTENSIONS = new Set(['.xls', '.ppt', '.msg'])
 
+// A password-protected OOXML file is not a zip at all: Office wraps the encrypted package in an OLE
+// container, so routing sees OLE magic where it expected PK and declines the file as unrecognized.
+// True, and useless to a caller — the file was recognized fine, it is locked. OLE directory entry
+// names are UTF-16LE, so the marker stream's name appears verbatim in the bytes. Bounded to the head
+// like every other sniff: the directory of a real encrypted package sits well inside it.
+const ENCRYPTED_PACKAGE_MARKER = Buffer.from('EncryptedPackage', 'utf16le')
+const looksEncryptedOffice = (content: Buffer): boolean =>
+    startsWith(content, OLE_MAGIC) && content.subarray(0, DETECT_SAMPLE_BYTES).includes(ENCRYPTED_PACKAGE_MARKER)
+
 // Do the bytes back up a binary claim? Catches a wrong one before the parser sees it. text/html have
 // no single signature, so they always pass here — lying text claims go to bytesContradictTextClaim.
 const magicOk = (kind: HandlerKind, content: Buffer, ext?: string): boolean => {
@@ -3279,7 +3317,7 @@ export const extractAttachment = async (
     // `truncated: false` is stated because this is the one 'extracted' return that never reaches the
     // cap logic below, and omitting it would hand `undefined` to a consumer testing `=== false`.
     if (byteSize === 0) {
-        return { status: 'extracted', truncated: false }
+        return { status: 'extracted', truncated: false, emptyReason: 'no-text-content' }
     }
 
     // Size gate, before any decode or parse.
@@ -3293,6 +3331,12 @@ export const extractAttachment = async (
 
     // Unsupported or unrecognized format.
     if (!handler) {
+        // Say WHY before falling back to the generic refusals: "unrecognized" is true of the bytes
+        // and unhelpful about the file, and a caller who knows a document is merely locked can ask
+        // its sender for it rather than treating the attachment as unreadable junk.
+        if (looksEncryptedOffice(input.content)) {
+            return { status: 'skipped', reason: 'password-protected Office file' }
+        }
         return { status: 'skipped', reason: type ? `unsupported type ${type}` : 'unrecognized attachment' }
     }
 
@@ -3348,7 +3392,12 @@ export const extractAttachment = async (
         // A present `extraction` reads as "has text"; its absence as "ran, but empty". The trailer
         // goes on AFTER the cap slice, so it never displaces extracted text.
         return isEmpty
-            ? { status: 'extracted', truncated }
+            ? {
+                  status: 'extracted',
+                  truncated,
+                  // The whole point of the field: a scan and an empty file stop looking alike here.
+                  emptyReason: output.hasNonTextContent ? 'no-text-layer' : 'no-text-content',
+              }
             : { status: 'extracted', extraction: truncated && options.trailer ? text + options.trailer : text, truncated }
     } catch (error) {
         // The bytes are attacker-controlled, so a throw or timeout is an expected event, not a bug:
