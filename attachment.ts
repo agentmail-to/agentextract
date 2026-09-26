@@ -212,11 +212,12 @@ interface HandlerContext {
 interface HandlerOutput {
     text: string
     empty?: boolean // handler's own emptiness call; defaults to text.trim() === ''
-    // Set by a handler that can PROVE the document holds non-text content; the entry point turns it
-    // into `emptyReason: 'no-text-layer'` when the extraction came out empty. Proof, not inference —
-    // a handler that cannot tell an image-only document from an empty one leaves this unset, and the
-    // result says 'no-text-content', which is the honest answer for a format that cannot tell.
-    hasNonTextContent?: boolean
+    // What the handler can PROVE about an extraction that came out empty, used only then. Absent
+    // means it cannot tell, and the entry point then reports no reason at all — because
+    // 'no-text-content' is a claim too, and defaulting to it told callers "there is nothing here"
+    // about image-only documents a handler simply could not read, which suppresses OCR exactly
+    // where it is wanted. A handler sets this only for a document it read to the end.
+    emptyReason?: EmptyReason
     // Set by a handler that stopped early; ORed with the entry point's over-cap check. A handler
     // stopping ON the cap or on the deadline lands under it and would otherwise look complete.
     truncated?: boolean
@@ -402,7 +403,9 @@ const textHandler: Handler = {
         '.yaml',
         '.yml',
     ],
-    extract: async ({ content, charsetHint }) => ({ text: decodeText(content, charsetHint) }),
+    // Everything is decoded, so nothing came out means nothing was there — a claim this handler can
+    // make, unlike a format whose content it cannot see into.
+    extract: async ({ content, charsetHint }) => ({ text: decodeText(content, charsetHint), emptyReason: 'no-text-content' }),
 }
 
 // HTML -> visible text.
@@ -426,7 +429,10 @@ const htmlHandler: Handler = {
     extensions: ['.html', '.htm', '.xhtml'],
     extract: async ({ content, charsetHint }) => {
         const decoded = decodeText(content, charsetHint)
-        return { text: await flattenHtml(decoded) }
+        // An <img>-only page has content that is not text, and html-to-text drops images — so the
+        // markup, not the flattened output, is what says which kind of empty this is.
+        const hasImage = /<img\b/i.test(decoded)
+        return { text: await flattenHtml(decoded), emptyReason: hasImage ? 'no-text-layer' : 'no-text-content' }
     },
 }
 
@@ -484,7 +490,17 @@ const pdfHandler: Handler = {
             // a real scan that is page one. A genuinely blank document walks its pages instead, and
             // is bounded by the same deadline as everything else here.
             let hasNonTextContent = false
-            if (joined.length === 0 && pagesRead > 0) {
+            // `!truncated` because the entry point only reports an emptyReason for a COMPLETE read,
+            // so on a truncated one this work is done and then discarded — on a long blank PDF it
+            // could spend the rest of the deadline producing an answer nobody sees.
+            //
+            // FIRST PAGE ONLY. getOperatorList builds a page's display list and decodes its images,
+            // which is real work this handler did not previously do, and doing it per page could
+            // push a large scan over HANDLER_TIMEOUT_MS — turning a file that used to extract into
+            // one that fails. A scan's first page is an image, so one page answers it; the cost of
+            // being wrong is a document with a blank cover page reported as 'no-text-content'
+            // instead of 'no-text-layer', which understates rather than misdirects.
+            if (joined.length === 0 && pagesRead > 0 && !truncated && Date.now() <= deadline) {
                 // Imported HERE, inside the branch: only an empty read needs it, so a document that
                 // produced text never reaches for a symbol it will not use. Absent — a stubbed
                 // module, an older unpdf — means no proof available, and so no claim made.
@@ -502,19 +518,19 @@ const pdfHandler: Handler = {
                               OPS.paintSolidColorImageMask,
                           ]
                 )
-                for (let n = 1; imageOps.size > 0 && n <= pagesRead; n++) {
-                    if (Date.now() > deadline) {
-                        truncated = true
-                        break
-                    }
-                    const { fnArray } = await (await pdf.getPage(n)).getOperatorList()
-                    if ((fnArray as number[]).some((op) => imageOps.has(op))) {
-                        hasNonTextContent = true
-                        break
-                    }
+                if (imageOps.size > 0) {
+                    const { fnArray } = await (await pdf.getPage(1)).getOperatorList()
+                    hasNonTextContent = (fnArray as number[]).some((op) => imageOps.has(op))
                 }
             }
-            return { text: joined, empty: joined.length === 0, truncated, hasNonTextContent }
+            return {
+                text: joined,
+                empty: joined.length === 0,
+                truncated,
+                // Both directions are proofs here: every page was read and none yielded text, and
+                // the probe says whether any of it is a painted image.
+                emptyReason: hasNonTextContent ? 'no-text-layer' : 'no-text-content',
+            }
         } finally {
             // getDocumentProxy exposes pdf.js's loading task; release its worker handler, document
             // bytes, and page cache on success, early stop, and errors alike. Cleanup is best-effort:
@@ -586,6 +602,7 @@ const docxHandler: Handler = {
             const reader = await createDocxReader(budget, shape)
             const decoder = new StringDecoder('utf8')
             let partTruncated = false
+            let stoppedForTime = false
             let partFailed = false
             let sawContent: boolean | undefined
             try {
@@ -598,14 +615,21 @@ const docxHandler: Handler = {
                 // at all, so a cap-only check would never fire on precisely the cheapest loop to
                 // spin. Breaking a `for await` destroys the inflate stream, so the rest of the
                 // document is never decompressed either.
-                    if (Date.now() > deadline || reader.shouldStop()) {
+                    // Split, because they mean different things to the caller. Running out of TIME
+                    // means we stopped reading and cannot know what was left; running out of ROOM
+                    // means the reader knows what it saw and can say whether any of it was text.
+                    if (Date.now() > deadline) {
+                        stoppedForTime = true
+                        break
+                    }
+                    if (reader.shouldStop()) {
                         partTruncated = true
                         break
                     }
                     reader.write(decoder.write(chunk))
                 }
                 // Only a read that ran to the end may assert the part ended cleanly.
-                if (!partTruncated) sawContent = reader.end(decoder.end())
+                if (!partTruncated && !stoppedForTime) sawContent = reader.end(decoder.end())
                 if (reader.overCap()) partTruncated = true
             } catch (error) {
             // saxes is conformant where mammoth's DOM parser recovered, so a document the old reader
@@ -622,7 +646,15 @@ const docxHandler: Handler = {
                 // here is what let a half-readable footnotes.xml end the walk over every later part.
                 partFailed = true
             }
-            return { text: reader.text(), truncated: partTruncated, failed: partFailed, sawContent }
+            return {
+                text: reader.text(),
+                truncated: partTruncated || stoppedForTime,
+                stoppedForTime,
+                failed: partFailed,
+                sawContent,
+                sawText: reader.sawText(),
+                sawPicture: reader.sawPicture(),
+            }
         }
 
         const body = await readPart(part, DOCX_MAIN_SHAPE, maxOutputChars)
@@ -638,7 +670,11 @@ const docxHandler: Handler = {
         // Concatenated, NOT joined with a separator: the reader already terminates every paragraph
         // with one, so a part's text ends where the next can start. Adding another here is what put
         // a pair of blank paragraphs between the body and its own footnotes.
-        const sections = [body.text]
+        // The body's own text is '\n\n' when it holds nothing, and prepending that to a document
+        // whose only text is in a footnote produced a leading blank paragraph. Dropped when the body
+        // has no text of its own; an entirely empty document then joins to '' rather than '\n\n',
+        // which the entry point reads as empty in exactly the same way.
+        const sections = body.sawText ? [body.text] : []
         let truncated = bodyTruncated
         const used = () => sections.reduce((total, part) => total + part.length, 0)
 
@@ -648,6 +684,7 @@ const docxHandler: Handler = {
         // or a broken footnotes.xml silently takes the headers and footers with it. Both end up
         // reported as truncation, because either way the document continues past what we return.
         let partFailed = false
+        let sawPicture = body.sawPicture
 
         // header10.xml must not sort before header2.xml, and neither may depend on the order the
         // producer happened to write the archive in: which header survives a cap that runs out
@@ -666,8 +703,17 @@ const docxHandler: Handler = {
                 if (key !== undefined && pattern.test(key)) matches.set(key, entry)
             }
 
+            const seenBytes = new Set<string>()
             for (const entry of ordered(matches)) {
                 if (truncated) break
+                // Identical parts are recognized BEFORE reading, by their stored CRC and size. Word
+                // writes the same header into a part per section, and text-level dedupe cannot help
+                // here: with no budget left the reader stores nothing, so the copy comes back as ''
+                // and looks like new text rather than the duplicate it is — charging the cap and
+                // reporting a truncation for a part we were always going to throw away.
+                const fingerprint = `${entry.crc}:${entry.uncompSize}`
+                if (dedupe && seenBytes.has(fingerprint)) continue
+                seenBytes.add(fingerprint)
                 // BELOW the name match, deliberately. Checked against entries we are actually going
                 // to read, because a deadline that passes while walking parts we would skip anyway
                 // has cost the output nothing, and marking a complete document truncated there
@@ -685,15 +731,22 @@ const docxHandler: Handler = {
                 const remaining = Math.max(0, maxOutputChars - used())
                 try {
                     const read = await readPart(entry, shape, remaining)
-                    // BEFORE the skips below: a part cut off by the cap or the deadline before it
-                    // emitted anything is still a part we did not finish, and `continue`ing past
-                    // this is what reported a document with an unread footer as complete.
-                    if (read.truncated) truncated = true
                     if (read.failed) partFailed = true
+                    if (read.sawPicture) sawPicture = true
                     // Trimmed for the DECISIONS (is there anything here, have we already emitted
                     // it), raw for the OUTPUT, so a part keeps the paragraph breaks it read.
                     const text = read.text.trim()
-                    if (text === '' || (dedupe && seen.has(text))) continue
+                    const duplicate = dedupe && seen.has(text)
+                    // TRUNCATION IS ABOUT TEXT LOST, so it is decided here rather than from the cap
+                    // alone. A part charges for its paragraph terminator like any other output, so
+                    // an empty <w:p/> — which Word writes routinely — read at a budget of zero came
+                    // back over cap and marked a COMPLETE document truncated. And a duplicate header
+                    // is discarded on purpose, so nothing is lost by not keeping it either.
+                    // Out of TIME: we stopped reading, so what the part held is unknown and the
+                    // document does continue past what we return. Out of ROOM: only a loss if there
+                    // was text to lose and we were going to keep it.
+                    if (read.stoppedForTime || (read.truncated && read.sawText && !duplicate)) truncated = true
+                    if (text === '' || duplicate) continue
                     seen.add(text)
                     sections.push(read.text)
                 } catch {
@@ -707,7 +760,17 @@ const docxHandler: Handler = {
         }
 
         // Emptiness is left to the entry point: an empty document is exactly '\n\n', which trims to ''.
-        return { text: sections.join(''), truncated: truncated || partFailed }
+        // A .docx whose only content is an image is not an empty document, and saying so is what
+        // stops a scanned page being dropped rather than sent to OCR — the same proof the PDF
+        // handler makes from its image operators.
+        return {
+            text: sections.join(''),
+            truncated: truncated || partFailed,
+            // The reader walks the whole document, so an image-only .docx is distinguishable from an
+            // empty one — the same distinction the PDF handler proves from its image operators, and
+            // the reason a scanned page pasted into Word is no longer reported as holding nothing.
+            emptyReason: sawPicture ? 'no-text-layer' : 'no-text-content',
+        }
     },
 }
 
@@ -720,6 +783,9 @@ const docHandler: Handler = {
     extract: async ({ content }) => {
         const { default: WordExtractor } = await import('word-extractor')
         const doc = await new WordExtractor().extract(content)
+        // NO emptyReason, deliberately. word-extractor hands back text or nothing and says nothing
+        // about what else the document holds, so an image-only .doc and an empty one are the same
+        // answer from here. Claiming either would be a guess, and the entry point reports neither.
         return { text: doc.getBody() } // main body only; headers/footers/notes are separate streams
     },
 }
@@ -1341,7 +1407,9 @@ const xlsxHandler: Handler = {
             throw new ExtractionFailure('internal')
         }
 
-        return { text: sheets.join(BLOCK_SEPARATOR), truncated }
+        // Every row of every sheet was read, so no text means no text. Images in a workbook are
+        // floating drawings rather than the content, so there is no OCR case to point at here.
+        return { text: sheets.join(BLOCK_SEPARATOR), truncated, emptyReason: 'no-text-content' }
     },
 }
 
@@ -1523,8 +1591,9 @@ const EOCD_BYTES = 22
 // two different statuses.
 type DecompressionCheck = { ok: true } | { ok: false; reason: ExtractionReason }
 
-const corrupt = (reason: ExtractionReason = 'malformed'): DecompressionCheck => ({ ok: false, reason })
-const declined = (reason: ExtractionReason): DecompressionCheck => ({ ok: false, reason })
+// One helper since the reason carries the status: `corrupt()` and `declined()` had become the same
+// function under two names, which read as though the choice of name still decided something.
+const refuse = (reason: ExtractionReason = 'malformed'): DecompressionCheck => ({ ok: false, reason })
 
 // Inflate one raw-deflate region onto `runningTotal`, aborting the moment it would exceed `cap`.
 // Returns the new total, or a sentinel — -1 = over budget, -2 = corrupt stream. Byte counts are
@@ -1653,7 +1722,7 @@ const zipEntries = (buf: Buffer): ZipEntry[] | undefined => {
 // neither rotted when the reader changed. Every real archive satisfies them (73 measured, 0 failures).
 const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<DecompressionCheck> => {
     const eocd = findEocd(buf)
-    if (eocd < 0) return corrupt()
+    if (eocd < 0) return refuse()
 
     const entries = buf.readUInt16LE(eocd + 10)
     const cdSize = buf.readUInt32LE(eocd + 12)
@@ -1661,7 +1730,7 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
     // ZIP64 / out-of-range sentinels: the true values live in a ZIP64 record we don't chase. Treat as
     // over-budget rather than trust the classic field or crash on the sentinel.
     if (entries === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff)
-        return declined('unsupported-zip-feature')
+        return refuse('unsupported-zip-feature')
 
     // Invariant 1: the directory must END exactly where the EOCD begins.
     // Written when .docx went through jszip, which rebases every offset by a positive
@@ -1674,7 +1743,7 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
     // Deliberate: that gap is also how a self-extracting archive legitimately carries its stub, so
     // this calls real files malformed. Accepted — an email attachment has no business being one.
     if (cdOffset + cdSize !== eocd)
-        return corrupt()
+        return refuse()
 
     let total = 0
     let p = cdOffset
@@ -1682,31 +1751,31 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
         // Guard: a missing/misaligned header means the offset lied. Fail closed — a partial walk must
         // never silently return the total it accumulated so far.
         if (p + CENTRAL_HEADER_BYTES > buf.length || buf.readUInt32LE(p) !== CD_SIG)
-            return corrupt()
+            return refuse()
         const method = buf.readUInt16LE(p + 10)
         const compSize = buf.readUInt32LE(p + 20)
         const localOffset = buf.readUInt32LE(p + 42)
         if (compSize === 0xffffffff || localOffset === 0xffffffff)
-            return declined('unsupported-zip-feature')
+            return refuse('unsupported-zip-feature')
         // Read the local header's own name/extra lengths — they can differ from the central copy, and
         // they're what fixes where this entry's compressed bytes actually begin.
         if (localOffset + LOCAL_HEADER_BYTES > buf.length || buf.readUInt32LE(localOffset) !== LOCAL_SIG)
-            return corrupt()
+            return refuse()
         const dataStart = localOffset + LOCAL_HEADER_BYTES + buf.readUInt16LE(localOffset + 26) + buf.readUInt16LE(localOffset + 28)
         const comp = buf.subarray(dataStart, dataStart + compSize)
         if (comp.length < compSize)
-            return corrupt()
+            return refuse()
 
         if (method === 0) {
             total += comp.length // stored (no compression): output === input
         } else if (method === 8) {
             total = await inflateCounting(comp, total, cap)
-            if (total === -1) return declined('expands-too-large')
-            if (total === -2) return corrupt()
+            if (total === -1) return refuse('expands-too-large')
+            if (total === -2) return refuse()
         } else {
-            return declined('unsupported-zip-feature')
+            return refuse('unsupported-zip-feature')
         }
-        if (total > cap) return declined('expands-too-large')
+        if (total > cap) return refuse('expands-too-large')
         p += CENTRAL_HEADER_BYTES + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
     }
     // Invariant 2: walking exactly `entries` records must land exactly on the EOCD.
@@ -1721,7 +1790,7 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
     // handler inflates one of those entries and the .xlsx preflight re-emits all of them; neither can
     // reach bytes this function did not measure.
     if (p !== eocd)
-        return corrupt()
+        return refuse()
     return { ok: true }
 }
 
@@ -2209,7 +2278,12 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
     if (!workbookXml || !relsXml) {
         const fallback = await metadataFallbackWorksheets(entries, relsXml, contentTypesXml)
         if (fallback.length === 0) {
-            throw new ExtractionFailure('wrong-document-shape')
+            // inflateEntry returns undefined for two different situations, and neither is the
+            // workbook being the wrong shape: over OUR metadata cap is a file we decline to
+            // materialize, and an unreadable stream is broken bytes. Distinguished here rather
+            // than reported as one, because the two differ to a caller by status as well as code.
+            const oversized = [workbookEntry, relsEntry].some((entry) => entry.uncompSize > MAX_METADATA_BYTES)
+            throw new ExtractionFailure(oversized ? 'expands-too-large' : 'malformed')
         }
         return fallback
     }
@@ -2702,6 +2776,15 @@ interface PendingDeletedParagraph {
 interface DocxReader {
     write: (chunk: string) => void // one decoded slice of document.xml; THROWS on malformed XML
     chars: () => number // characters emitted so far — what the handler's cap check reads
+    // Whether any NON-WHITESPACE text was seen, independent of whether there was room to keep it.
+    // `text()` cannot answer this: at a budget of zero the reader stores nothing, so a part full of
+    // text and a part holding one empty <w:p/> both come back as ''. The paragraph terminator is
+    // charged like any other output, so "did the cap bind" and "was there anything to lose" are
+    // different questions, and only this one decides whether a document was really truncated.
+    sawText: () => boolean
+    // Whether a picture was opened. Lets an image-only .docx be told apart from an empty one, the
+    // same distinction the PDF handler proves from its image operators.
+    sawPicture: () => boolean
     overCap: () => boolean
     shouldStop: () => boolean // cap crossed and any output-order-sensitive frame has closed
     end: (tail: string) => boolean // flush/close; whether the part contained its content container
@@ -2722,6 +2805,8 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
     let skip = -1 // stack index where the dropped subtree began, or -1 when we're reading
     let rowDeleted = false // a w:trPr said its row is deleted; act on it once that w:trPr closes
     let sawBody = false
+    let sawText = false
+    let sawPicture = false
     let inBody = false
     let chars = 0
     // Mammoth holds a deleted-mark paragraph until the following paragraph is read. Its value
@@ -2836,6 +2921,7 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
     }
 
     const emit = (text: string): void => {
+        if (!sawText && /\S/.test(text)) sawText = true
         append(top, 'value', text)
         charge(text.length)
     }
@@ -3085,8 +3171,13 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
             return
         }
 
+        // The DrawingML container a modern Word image sits in; w:pict is the VML spelling, flagged
+        // where it opens its frame below. Either one means the document has content that is not text.
+        if (name === 'w:drawing') sawPicture = true
+
         if (name === 'w:p' || name === 'w:pict') {
             if (name === 'w:pict') {
+                sawPicture = true
                 // A picture opened after an enclosing picture crossed the cap will be hoisted
                 // ahead of that enclosing picture's retained value. Since fresh deferred text is
                 // no longer accepted, emitting the retained value alone would create a hole.
@@ -3304,6 +3395,8 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
     return {
         write: (chunk) => void parser.write(chunk),
         chars: () => chars,
+        sawText: () => sawText,
+        sawPicture: () => sawPicture,
         overCap: () => capExceeded,
         shouldStop: () => capExceeded && drainUntil === undefined && !drainPendingDeletedContent,
         end: (tail) => {
@@ -3378,14 +3471,27 @@ const NON_DOC_OLE_EXTENSIONS = new Set(['.xls', '.ppt', '.msg'])
 // FAT. Bounded to the head like every other sniff.
 const ENCRYPTED_PACKAGE_NAME = Buffer.from('EncryptedPackage', 'utf16le')
 const CFB_ENTRY_BYTES = 128
+const CFB_HEADER_BYTES = 512
 const CFB_STREAM_TYPE = 2
 
 const looksEncryptedOffice = (content: Buffer): boolean => {
-    if (!startsWith(content, OLE_MAGIC)) return false
-    const end = Math.min(content.length, DETECT_SAMPLE_BYTES)
+    if (!startsWith(content, OLE_MAGIC) || content.length < CFB_HEADER_BYTES) return false
+    // Seek the directory the HEADER points at rather than scanning for records that look like one.
+    // Scanning had two faults at once: bounded to the first 64 KB it missed a real encrypted file
+    // whose directory sits later, and unbounded it matched the directory of an OLE object EMBEDDED
+    // in something else — so a .doc carrying an encrypted attachment was declined as locked while
+    // its own text went unread. The header names one directory, and only that one is this file's.
+    const sectorShift = content.readUInt16LE(30)
+    if (sectorShift < 7 || sectorShift > 20) return false // 128 B .. 1 MB; anything else is not CFB
+    const sectorSize = 1 << sectorShift
+    const firstDirectorySector = content.readUInt32LE(48)
+    if (firstDirectorySector > 0xfffffffa) return false // a sentinel, not a sector number
+    // Sector N begins one sector-size in, past the header.
+    const start = (firstDirectorySector + 1) * sectorSize
+    const end = Math.min(content.length, start + sectorSize)
     // +2 for the UTF-16LE terminator the length field counts.
     const nameBytes = ENCRYPTED_PACKAGE_NAME.length + 2
-    for (let pos = 512; pos + CFB_ENTRY_BYTES <= end; pos += CFB_ENTRY_BYTES) {
+    for (let pos = start; pos >= 0 && pos + CFB_ENTRY_BYTES <= end; pos += CFB_ENTRY_BYTES) {
         if (content.readUInt16LE(pos + 64) !== nameBytes) continue
         if (content[pos + 66] !== CFB_STREAM_TYPE) continue
         if (content.subarray(pos, pos + ENCRYPTED_PACKAGE_NAME.length).equals(ENCRYPTED_PACKAGE_NAME)) return true
@@ -3553,8 +3659,8 @@ const isPasswordError = (error: unknown): boolean => error instanceof Error && e
 // is missing a dependency. The one unexpected-throw class worth naming, because it is unambiguous.
 const isModuleLoadError = (error: unknown): boolean =>
     error instanceof Error &&
-    (('code' in error && (error.code === 'MODULE_NOT_FOUND' || error.code === 'ERR_MODULE_NOT_FOUND')) ||
-        error.name === 'ERR_MODULE_NOT_FOUND')
+    'code' in error &&
+    (error.code === 'MODULE_NOT_FOUND' || error.code === 'ERR_MODULE_NOT_FOUND')
 
 // KNOWN COST of reasons being codes: an unrecognized throw is attributed to the bytes, so a genuine
 // bug of ours that escapes here is reported as 'malformed' and blames the file. The free-text reason
@@ -3711,9 +3817,8 @@ export const extractAttachment = async (
                   // behind while the document is full of it. Reporting one there told a caller to
                   // discard, or to OCR, a document nobody had read. `truncated` alone already says
                   // the honest thing: we stopped before finding text, and there may be more.
-                  ...(truncated
-                      ? {}
-                      : { emptyReason: output.hasNonTextContent ? ('no-text-layer' as const) : ('no-text-content' as const) }),
+                  // Whatever the handler could prove, and nothing when it could prove nothing.
+                  ...(truncated || output.emptyReason === undefined ? {} : { emptyReason: output.emptyReason }),
               }
             : { status: 'extracted', extraction: truncated && options.trailer ? text + options.trailer : text, truncated }
     } catch (error) {

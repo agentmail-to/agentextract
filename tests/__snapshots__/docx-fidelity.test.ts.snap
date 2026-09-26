@@ -49,9 +49,7 @@ Second paragraph with more words here.
 `;
 
 exports[`docx fidelity — our reader against mammoth > footnote-hyperlink.docx 1`] = `
-"
-
- Example
+" Example
 
 "
 `;

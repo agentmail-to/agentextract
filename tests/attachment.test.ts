@@ -1307,8 +1307,32 @@ describe('attachment — why an extraction is empty', () => {
         }
     })
 
-    // Exactly one of the two is present on every successful result, so a consumer never has to test
-    // for both — and never sees a reason contradicting text it was also handed.
+    // 'no-text-content' is a CLAIM, not a default. Defaulting to it said "there is nothing here"
+    // about documents a handler simply could not see into — which suppresses OCR exactly where it is
+    // wanted. word-extractor reports text or nothing and nothing about the rest, so .doc says
+    // neither, and the absence means "we cannot tell" rather than "there is nothing".
+    it('reports no reason for a format that cannot tell empty from image-only', async () => {
+        vi.resetModules()
+        vi.doMock('word-extractor', () => ({
+            default: class {
+                async extract() {
+                    return { getBody: () => '' }
+                }
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content: fixture('sample.doc'), contentType: 'application/msword' })
+            expect(r.status).toBe('extracted')
+            expect(r.extraction).toBeUndefined()
+            expect(r.emptyReason).toBeUndefined()
+        } finally {
+            vi.doUnmock('word-extractor')
+            vi.resetModules()
+        }
+    })
+
+    // Never both: a reason contradicting text we also handed back would be nonsense.
     it('omits emptyReason whenever there is text', async () => {
         const r = await extractAttachment({ content: fixture('sample.pdf'), filename: 'a.pdf' })
         expect(r.extraction).toBeTruthy()
@@ -1321,21 +1345,59 @@ describe('attachment — why an extraction is empty', () => {
     // boundary, holding the name, its byte length at +64 and the stream type at +66. Built properly
     // because the detector matches the RECORD — a loose byte search declined any legacy .doc that
     // merely mentioned the word, since .doc stores its text in the same UTF-16LE encoding.
-    const encryptedOfficeFile = () => {
+    const encryptedOfficeFile = ({ directorySector = 0 } = {}) => {
         const name = Buffer.from('EncryptedPackage', 'utf16le')
+        // The Root Entry always comes first; EncryptedPackage is a sibling after it.
+        const root = Buffer.alloc(128)
+        Buffer.from('Root Entry', 'utf16le').copy(root, 0)
+        root.writeUInt16LE('Root Entry'.length * 2 + 2, 64)
+        root[66] = 5 // root storage
         const entry = Buffer.alloc(128)
         name.copy(entry, 0)
         entry.writeUInt16LE(name.length + 2, 64) // byte length, terminator included
         entry[66] = 2 // stream
         const header = Buffer.alloc(512)
         Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(header, 0)
-        return Buffer.concat([header, Buffer.alloc(128), entry, Buffer.alloc(256)])
+        header.writeUInt16LE(9, 30) // 512-byte sectors
+        header.writeUInt32LE(directorySector, 48) // where the directory starts
+        const directory = Buffer.concat([root, entry, Buffer.alloc(512 - 256)])
+        // Sector N begins at (N + 1) * sectorSize, so pad out whatever precedes the directory.
+        return Buffer.concat([header, Buffer.alloc(directorySector * 512), directory])
     }
 
     it('names a password-protected Office file rather than calling it unrecognized', async () => {
         const r = await extractAttachment({ content: encryptedOfficeFile(), filename: 'locked.docx' })
         expect(r.status).toBe('skipped')
         expect(r.reason).toBe('password-protected')
+    })
+
+    // REGRESSION: the scan was bounded to the first 64 KB, so a real encrypted file whose directory
+    // sits further in came back unrecognized. The header names where its directory is, so distance
+    // stopped mattering once we seek there instead of hunting for records that look like one.
+    it('names a locked file whose directory sits well past the sniff window', async () => {
+        const content = encryptedOfficeFile({ directorySector: 300 }) // ~150 KB in
+        expect(content.length).toBeGreaterThan(64 * 1024)
+        const r = await extractAttachment({ content, filename: 'locked.docx' })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toBe('password-protected')
+    })
+
+    // REGRESSION: matching any record-shaped bytes anywhere also matched the directory of an OLE
+    // object EMBEDDED in another file — so a .doc carrying an encrypted attachment was declined as
+    // locked and its own text went unread. Only the directory this file's header points at is its.
+    it('does not call a file locked for embedding an encrypted object', async () => {
+        const header = Buffer.alloc(512)
+        Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(header, 0)
+        header.writeUInt16LE(9, 30)
+        header.writeUInt32LE(0, 48) // this file's own directory: sector 0, holding no such stream
+        const ownDirectory = Buffer.alloc(512)
+        Buffer.from('Root Entry', 'utf16le').copy(ownDirectory, 0)
+        ownDirectory.writeUInt16LE('Root Entry'.length * 2 + 2, 64)
+        ownDirectory[66] = 5
+        // A whole encrypted package sitting in one of this file's streams, further in.
+        const content = Buffer.concat([header, ownDirectory, encryptedOfficeFile()])
+        const r = await extractAttachment({ content, filename: 'carrier.doc', contentType: 'application/msword' })
+        expect(r.reason).not.toBe('password-protected')
     })
 
     // REGRESSION: the detector searched the head for the UTF-16LE name, and .doc stores body text in
@@ -3363,9 +3425,12 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         })
 
         const r = await extractAttachment({ content, contentType: XLSX_TYPE })
-        expect(r.status).toBe('failed')
+        // The workbook part is padded past MAX_METADATA_BYTES, so this is OUR cap declining to
+        // materialize it — not the workbook being the wrong shape. `skipped`, because the file is
+        // intact and we refused it, which is the same answer every other budget gives.
+        expect(r.status).toBe('skipped')
         expect(r.extraction).toBeUndefined()
-        expect(r.reason).toBe('wrong-document-shape')
+        expect(r.reason).toBe('expands-too-large')
     })
 
     it('resolves escaped OPC worksheet paths without decoding them away from the ZIP item', async () => {

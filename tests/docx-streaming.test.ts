@@ -210,6 +210,48 @@ describe('docx — text outside word/document.xml', () => {
         expect(r.truncated).toBe(true)
     })
 
+    // REGRESSION: a part charges for its paragraph terminator like any other output, so an empty
+    // <w:p/> — which Word writes routinely — read at a budget of zero came back over cap and marked
+    // a COMPLETE document truncated. Truncation is about text LOST, not about the cap binding.
+    it('does not report truncation for a header holding only an empty paragraph', async () => {
+        const full = 'Body.\n\n'.length
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': `<?xml version="1.0"?><w:hdr ${NS}><w:p/></w:hdr>`,
+        }, { maxOutputChars: full })
+        expect(r.extraction).toBe('Body.\n\n')
+        expect(r.truncated).toBe(false)
+    })
+
+    // REGRESSION: a duplicate header read with no budget left set truncated and was then discarded
+    // as a duplicate anyway — flagging a loss for text we had already decided not to keep.
+    it('does not report truncation for a duplicate header it discards', async () => {
+        const cap = 'Body.\n\n'.length + 'ACME\n\n'.length
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': auxPart('hdr', text('ACME')),
+            'word/header2.xml': auxPart('hdr', text('ACME')),
+        }, { maxOutputChars: cap })
+        expect(r.extraction).toBe('Body.\n\nACME\n\n')
+        expect(r.truncated).toBe(false)
+    })
+
+    // REGRESSION: the body's text is '\n\n' when it holds nothing, and prepending that to a
+    // document whose only text lives in a footnote produced a leading blank paragraph.
+    it('does not prepend a blank paragraph when the body is empty', async () => {
+        const r = await extractParts('<w:p/>', {
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${text('Only here.')}</w:footnote>`),
+        })
+        expect(r.extraction).toBe('Only here.\n\n')
+    })
+
+    // A .docx whose only content is a picture is not an empty document. Reporting 'no-text-content'
+    // told a caller there was nothing to find, which is exactly the document OCR is for.
+    it('reports no-text-layer for a picture-only document', async () => {
+        const r = await extractParts('<w:p><w:r><w:drawing/></w:r></w:p>', {})
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBeUndefined()
+        expect(r.emptyReason).toBe('no-text-layer')
+    })
+
     // REGRESSION: `remaining <= 0` was treated as "there is more to lose", so a body of exactly
     // maxOutputChars got a "continues past this point" trailer over parts holding nothing. Word
     // writes empty headers routinely, so this was the ordinary case rather than a contrived one.
