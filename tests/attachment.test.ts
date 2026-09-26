@@ -1228,13 +1228,31 @@ describe('attachment — reason is a code', () => {
         }
     })
 
-    // The distinction that earns 'internal' its place: these are OUR invariant tripping or a pinned
-    // dependency moving, not a bad file. A caller seeing a spike should page someone, and retrying
-    // or re-requesting the attachment cannot help — the opposite of every other failure here.
-    it('separates our own failures from the file being at fault', async () => {
-        const ours = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
-        expect(ours.status).toBe('extracted') // baseline: nothing internal about a good workbook
-        expect(REASONS.has('internal')).toBe(true)
+    // NOTE there is no case here for 'internal' itself. It had one — asserting
+    // `REASONS.has('internal')`, a property of the literal set declared just above it, which can
+    // never fail. Reaching that code needs an invariant to actually trip, which 'fails fast when the
+    // pinned ExcelJS streaming hooks are unavailable' already does; a second copy here would be a
+    // worse version of it. Deleted rather than replaced.
+
+    // A reason is either a decline or an inability, never both. Pairing them by hand at each return
+    // site is what let the 0xffff sentinel come back `skipped` from the budget and `failed` from the
+    // rewrite for the same fact.
+    it('derives a single status from each reason', async () => {
+        const seen = new Map<string, Set<string>>()
+        const inputs = [
+            { content: Buffer.alloc(MAX_INPUT_BYTES + 1, 0x41), filename: 'big.txt' },
+            { content: Buffer.from([0x89, 0x50, 0x4e, 0x47]), contentType: 'image/png', filename: 'a.png' },
+            { content: Buffer.from([0x00, 0x01, 0x02]), filename: 'mystery.bin' },
+            { content: Buffer.from('PK\x03\x04 not a zip'), filename: 'broken.docx', contentType: DOCX_TYPE },
+        ]
+        for (const input of inputs) {
+            const r = await extractAttachment(input)
+            if (r.reason === undefined) continue
+            const statuses = seen.get(r.reason) ?? new Set<string>()
+            statuses.add(r.status)
+            seen.set(r.reason, statuses)
+        }
+        for (const [reason, statuses] of seen) expect([reason, statuses.size]).toEqual([reason, 1])
     })
 })
 
@@ -1258,6 +1276,24 @@ describe('attachment — why an extraction is empty', () => {
         const r = await extractAttachment({ content: Buffer.from('   \n\t  '), filename: 'blank.txt' })
         expect(r.status).toBe('extracted')
         expect(r.emptyReason).toBe('no-text-content')
+    })
+
+    // REGRESSION, and the sharpest of them: both values are claims about the WHOLE document, so a
+    // read that stopped early cannot support either. A PDF full of text with a zero cap reported
+    // 'no-text-layer' — telling a caller to OCR a document that has a text layer — and a .docx the
+    // same way reported 'no-text-content', telling them to discard it. `truncated` alone is the
+    // honest answer there: we stopped before finding text and cannot say whether there is any.
+    it('reports no empty reason for a read that stopped early', async () => {
+        for (const [content, filename] of [
+            [fixture('sample.pdf'), 'a.pdf'],
+            [fixture('sample.docx'), 'a.docx'],
+        ] as [Buffer, string][]) {
+            const r = await extractAttachment({ content, filename }, { maxOutputChars: 0 })
+            expect(r.status).toBe('extracted')
+            expect(r.truncated).toBe(true)
+            expect(r.extraction).toBeUndefined()
+            expect(r.emptyReason).toBeUndefined()
+        }
     })
 
     // Exactly one of the two is present on every successful result, so a consumer never has to test
@@ -1284,6 +1320,41 @@ describe('attachment — why an extraction is empty', () => {
     it('does not call an ordinary OLE file password-protected', async () => {
         const r = await extractAttachment({ content: fixture('sample.doc'), filename: 'sample.doc' })
         expect(r.status).toBe('extracted')
+    })
+
+    // REGRESSION: the check sat inside the no-handler branch, so an encrypted package named .doc —
+    // an OLE container, which carries exactly the magic the legacy handler routes on — reached
+    // word-extractor, threw, and came back 'malformed', which the codes define as never retryable.
+    // Whether we happen to have a handler says nothing about whether the content is ours to read.
+    it('names a locked file even when its extension routes to a handler', async () => {
+        const ole = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
+        const marker = Buffer.from('EncryptedPackage', 'utf16le')
+        const content = Buffer.concat([ole, Buffer.alloc(400), marker, Buffer.alloc(2_048)])
+        const r = await extractAttachment({ content, filename: 'locked.doc', contentType: 'application/msword' })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toBe('password-protected')
+    })
+
+    // pdf.js refuses an encrypted document by throwing, so there is nothing to sniff — the error is
+    // the signal. Same situation, same answer: skipped and locked, not failed and broken.
+    it('names a password-protected PDF rather than calling it malformed', async () => {
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => {
+                const error = new Error('No password given')
+                error.name = 'PasswordException'
+                throw error
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content: buf('%PDF-1.4 locked'), contentType: 'application/pdf' })
+            expect(r.status).toBe('skipped')
+            expect(r.reason).toBe('password-protected')
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
     })
 })
 
@@ -3907,9 +3978,11 @@ describe('attachment — xlsx archive rewrite limits', () => {
         async () => {
             // 65533 real entries + two injected control parts = 65535 = 0xffff.
             const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2), contentType: XLSX_TYPE })
-            expect(r.status).toBe('failed')
+            // `skipped`, not `failed`: the archive is intact and we decline the variant, which is
+            // the same answer the decompression budget gives ZIP64 for the same reason. The status
+            // is derived from the reason now, so one fact cannot come back under two statuses.
+            expect(r.status).toBe('skipped')
             expect(r.reason).toBe('unsupported-zip-feature')
-            expect(r.reason).not.toMatch(/central directory could not be read/)
         },
         BOUNDARY_TIMEOUT_MS
     )

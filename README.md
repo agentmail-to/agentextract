@@ -79,13 +79,15 @@ and on no `extracted` one, so it is safe to branch on. Two are worth knowing: `t
 failure worth retrying, and `internal` means one of our invariants tripped or a pinned dependency
 moved — not a bad file, so retrying or re-requesting the attachment cannot help.
 
-When a document yields no text at all, `extraction` is omitted and `emptyReason` says why:
+When a **complete** read yields no text, `extraction` is omitted and `emptyReason` says why:
 `'no-text-layer'` means the document has content but none of it is text — a scan, a photographed
 page — so OCR is the next step, while `'no-text-content'` means it was read and genuinely holds
-nothing. Exactly one of `extraction` and `emptyReason` is present on every `extracted` result. Only
-a handler that can *prove* the distinction reports `'no-text-layer'`; today that is PDF, where pages
-were read and none yielded text. A password-protected Office file is `skipped` and says so, rather
-than being reported as unrecognized.
+nothing. Exactly one of `extraction` and `emptyReason` is present whenever `truncated` is false.
+Both are claims about the whole document, so neither is reported for a truncated read: a result with
+no text, no `emptyReason` and `truncated: true` means we stopped before finding text and cannot say
+whether there is any. Only a handler that can *prove* the distinction reports `'no-text-layer'`;
+today that is PDF, where every page was read and none yielded text. Password-protected files —
+Office or PDF — are `skipped` with reason `password-protected`, not reported as unreadable.
 
 `trailer` is appended to `extraction` only when the text was actually cut, and sits **outside** cap
 accounting — the cap bounds extracted text, so the returned string may exceed it by the trailer's

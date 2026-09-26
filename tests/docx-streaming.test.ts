@@ -164,6 +164,87 @@ describe('docx — text outside word/document.xml', () => {
         expect(r.truncated).toBe(true)
     })
 
+    // REGRESSION: the catch set the same `truncated` flag the loop breaks on, so one unreadable part
+    // ended the whole walk and took every later part's text with it. The comment beside it claimed a
+    // broken part "costs its own text and nothing else", which was the intent and not the behaviour.
+    it('keeps reading later parts after one is malformed', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/footnotes.xml': '<?xml version="1.0"?><w:footnotes><w:footnote><w:p>unclosed',
+            'word/comments.xml': auxPart('comments', `<w:comment w:id="1">${text('Comment survives.')}</w:comment>`),
+            'word/header1.xml': auxPart('hdr', text('Header survives.')),
+        })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('Body.')
+        expect(r.extraction).toContain('Comment survives.')
+        expect(r.extraction).toContain('Header survives.')
+        // Still flagged: text IS missing, just not everything after the broken part.
+        expect(r.truncated).toBe(true)
+    })
+
+    // A clean read of a body plus one footnote makes exactly four Date.now() calls: the entry
+    // point's deadline, the body's chunk check, the auxiliary loop's gate, and the footnote's own
+    // chunk check. Expiring on a chosen one of those is what makes the two cases below deterministic
+    // rather than dependent on how fast the machine is.
+    const expireOnCall = (n: number) => {
+        const base = Date.now()
+        let calls = 0
+        return vi.spyOn(Date, 'now').mockImplementation(() => (++calls < n ? base : base + HANDLER_TIMEOUT_MS + 1))
+    }
+
+    // REGRESSION: `continue` for empty text ran BEFORE the truncation flag was read, so a part the
+    // deadline cut off before it emitted anything reported the document as complete. Expiring on
+    // call 4 lands inside the footnote's own read, after the gate that would have stopped the walk.
+    it('reports truncation from a part cut off before it emitted any text', async () => {
+        const content = await docxWithParts(text('Body.'), {
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${text('NOTE')}</w:footnote>`),
+        })
+        const clock = expireOnCall(4)
+        try {
+            const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+            expect(r.extraction).toContain('Body.')
+            expect(r.extraction).not.toContain('NOTE')
+            expect(r.truncated).toBe(true) // the footnote was never read; saying otherwise is a lie
+        } finally {
+            clock.mockRestore()
+        }
+    })
+
+    // REGRESSION: the deadline was checked once per ZIP ENTRY, before the name was matched, so a
+    // clock expiring while walking parts we never read marked a COMPLETE document truncated — and
+    // the entry point then appended a "continues past this point" trailer to a whole document.
+    // This archive has no auxiliary parts at all, so after the fix there is nothing to check a
+    // deadline against and the expiry is unreachable.
+    it('does not report truncation for a deadline that passes on entries it never reads', async () => {
+        const content = await docxWithParts(text('Complete.'), {
+            'word/settings.xml': '<?xml version="1.0"?><w:settings/>',
+            'word/styles.xml': '<?xml version="1.0"?><w:styles/>',
+            'word/fontTable.xml': '<?xml version="1.0"?><w:fonts/>',
+            'word/theme/theme1.xml': '<?xml version="1.0"?><a:theme/>',
+        })
+        const clock = expireOnCall(3)
+        try {
+            const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+            expect(r.extraction).toBe('Complete.\n\n')
+            expect(r.truncated).toBe(false)
+        } finally {
+            clock.mockRestore()
+        }
+    })
+
+    // A duplicate entry name resolves to the last record for the main part; the auxiliary walk read
+    // and emitted BOTH, so an ambiguous archive produced its footnotes twice.
+    it('reads one text per part name when an archive repeats an entry', async () => {
+        const zip = new JSZip()
+        zip.file('[Content_Types].xml', '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+        zip.file('_rels/.rels', '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>')
+        zip.file('word/document.xml', `<?xml version="1.0"?><w:document ${NS}><w:body>${text('Body.')}</w:body></w:document>`)
+        zip.file('word/footnotes.xml', auxPart('footnotes', `<w:footnote w:id="2">${text('Once.')}</w:footnote>`))
+        zip.file('word/footnotes.xml', auxPart('footnotes', `<w:footnote w:id="2">${text('Once.')}</w:footnote>`))
+        const content = Buffer.from(await zip.generateAsync({ type: 'nodebuffer' }))
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        expect(r.extraction?.match(/Once\./g) ?? []).toHaveLength(1)
+    })
+
     // A document with no auxiliary parts must read exactly as it did before they were considered.
     it('leaves a document without auxiliary parts unchanged', async () => {
         const r = await extract(text('Only a body.'))

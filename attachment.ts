@@ -170,8 +170,9 @@ export interface ExtractOptions {
     trailer?: string
 }
 
-// Why an `extracted` result carries no text. Set ONLY when `status` is 'extracted' and `extraction`
-// is absent, because that is the one outcome a caller could not otherwise interpret: before this, a
+// Why a COMPLETE `extracted` result carries no text. Both values are claims about the whole
+// document, so neither is reported for a truncated read, where "no text so far" is not evidence of
+// "no text". Set because that outcome was the one a caller could not otherwise interpret: before this, a
 // scanned page, a zero-byte file and a whitespace-only file were the same result object, so "we
 // found nothing" and "there is nothing" were indistinguishable, and no consumer could decide
 // whether OCR was worth trying.
@@ -190,8 +191,10 @@ export interface ExtractionResult {
     // Whether the document continues past `extraction`. Set on `extracted` only — skipped/failed
     // have no text to have cut. Independent of `trailer`, so a consumer never parses the text for it.
     truncated?: boolean
-    // Set on `extracted` with no `extraction`, and never otherwise — so exactly one of `extraction`
-    // and `emptyReason` is present on every successful result.
+    // Set on a COMPLETE `extracted` result that carries no text, and never otherwise — so exactly
+    // one of `extraction` and `emptyReason` is present whenever `truncated` is false. A truncated
+    // result with neither is the third case, and means what it says: we stopped before finding text
+    // and cannot tell you whether there is any.
     emptyReason?: EmptyReason
 }
 
@@ -595,17 +598,34 @@ const docxHandler: Handler = {
         let truncated = body.truncated
         const used = () => sections.reduce((total, part) => total + part.length, 0)
 
+        // Two different reasons to stop, kept apart on purpose. `truncated` means we ran out of room
+        // or time, and nothing after it can be read either — so it ends the walk. `partFailed` means
+        // one part was unreadable, which says nothing about the next one; it must NOT end the walk,
+        // or a broken footnotes.xml silently takes the headers and footers with it. Both end up
+        // reported as truncation, because either way the document continues past what we return.
+        let partFailed = false
+
         for (const { pattern, shape, dedupe } of DOCX_AUXILIARY_PARTS) {
             const seen = new Set<string>()
+            // Duplicate entry names resolve to the LAST record, matching how the main part is
+            // chosen. Collected before reading so an ambiguous archive yields one text per part
+            // name rather than one per record.
+            const matches = new Map<string, ZipEntry>()
             for (const entry of entries) {
-                if (truncated || Date.now() > deadline) {
-                    // Ran out of room or time. The body is already read, so this is a truncation of
-                    // the document, exactly as stopping mid-body would be — not a failure.
+                const key = opcKey(entry.name)
+                if (key !== undefined && pattern.test(key)) matches.set(key, entry)
+            }
+
+            for (const entry of matches.values()) {
+                if (truncated) break
+                // BELOW the name match, deliberately. Checked against entries we are actually going
+                // to read, because a deadline that passes while walking parts we would skip anyway
+                // has cost the output nothing, and marking a complete document truncated there
+                // appends a "continues past this point" trailer to a document that does not.
+                if (Date.now() > deadline) {
                     truncated = true
                     break
                 }
-                const key = opcKey(entry.name)
-                if (key === undefined || !pattern.test(key)) continue
                 const remaining = maxOutputChars - used()
                 if (remaining <= 0) {
                     truncated = true
@@ -613,25 +633,28 @@ const docxHandler: Handler = {
                 }
                 try {
                     const read = await readPart(entry, shape, remaining)
+                    // BEFORE the skips below: a part cut off by the cap or the deadline before it
+                    // emitted anything is still a part we did not finish, and `continue`ing past
+                    // this is what reported a document with an unread footer as complete.
+                    if (read.truncated) truncated = true
                     // Trimmed for the DECISIONS (is there anything here, have we already emitted
                     // it), raw for the OUTPUT, so a part keeps the paragraph breaks it read.
-                    const key = read.text.trim()
-                    if (key === '' || (dedupe && seen.has(key))) continue
-                    seen.add(key)
+                    const text = read.text.trim()
+                    if (text === '' || (dedupe && seen.has(text))) continue
+                    seen.add(text)
                     sections.push(read.text)
-                    if (read.truncated) truncated = true
                 } catch {
                     // BEST-EFFORT, and the reason the main part is read separately above: a broken
                     // footnotes part costs its own text and nothing else. Turning a readable document
                     // into a failure over its margins would trade a whole extraction for a fragment.
-                    truncated = true
+                    partFailed = true
                 }
             }
             if (truncated) break
         }
 
         // Emptiness is left to the entry point: an empty document is exactly '\n\n', which trims to ''.
-        return { text: sections.join(''), truncated }
+        return { text: sections.join(''), truncated: truncated || partFailed }
     },
 }
 
@@ -3426,13 +3449,41 @@ class ExtractionFailure extends Error {
     }
 }
 
+// Which status a reason belongs to. TOTAL, and the single authority — a reason is either a decline
+// or an inability, never both, and pairing the two by hand at each return site is what let one fact
+// ('unsupported-zip-feature') come back as `skipped` from the budget and `failed` from the rewrite.
+const REASON_STATUS: Record<ExtractionReason, 'skipped' | 'failed'> = {
+    'too-large': 'skipped',
+    'expands-too-large': 'skipped',
+    'unsupported-format': 'skipped',
+    'unrecognized': 'skipped',
+    'password-protected': 'skipped',
+    'unsupported-zip-feature': 'skipped',
+    malformed: 'failed',
+    'wrong-document-shape': 'failed',
+    'timed-out': 'failed',
+    internal: 'failed',
+}
+
+// pdf.js refuses an encrypted document by throwing rather than by anything we can sniff, and its
+// error survives as a name/message pair. A locked PDF is the same situation as a locked .docx — the
+// bytes are fine and the content is not ours to read — so it gets the same answer.
+const isPasswordError = (error: unknown): boolean =>
+    error instanceof Error && (error.name === 'PasswordException' || /password/i.test(error.message))
+
 // KNOWN COST of reasons being codes: an unrecognized throw is attributed to the bytes, so a genuine
 // bug of ours that escapes here is reported as 'malformed' and blames the file. The free-text reason
 // this replaced carried the message, which named it. Accepted rather than hidden — our own invariant
 // sites throw ExtractionFailure('internal') explicitly, and the only losses are the throws we did
 // not anticipate, which were never something a caller could branch on either way.
 const failureReason = (error: unknown): ExtractionReason =>
-    error instanceof ExtractionFailure ? error.code : error instanceof HandlerTimeoutError ? 'timed-out' : 'malformed'
+    error instanceof ExtractionFailure
+        ? error.code
+        : error instanceof HandlerTimeoutError
+          ? 'timed-out'
+          : isPasswordError(error)
+            ? 'password-protected'
+            : 'malformed'
 
 class HandlerTimeoutError extends Error {
     constructor(ms: number) {
@@ -3489,7 +3540,7 @@ export const extractAttachment = async (
 
     // Size gate, before any decode or parse.
     if (byteSize > MAX_INPUT_BYTES) {
-        return { status: 'skipped', reason: 'too-large' }
+        return { status: REASON_STATUS['too-large'], reason: 'too-large' }
     }
 
     const { type, charset: charsetHint } = parseContentType(input.contentType)
@@ -3497,14 +3548,18 @@ export const extractAttachment = async (
     const handler = kind ? findHandler(kind) : undefined
 
     // Unsupported or unrecognized format.
+    // AHEAD of the handler lookup, not inside the no-handler branch. An encrypted package is an OLE
+    // container, which still carries .doc's magic — so one named .doc routed to the legacy handler,
+    // word-extractor threw on it, and a merely locked file came back 'malformed', which the codes
+    // define as never retryable. Whether we happen to have a handler says nothing about whether the
+    // content is ours to read.
+    if (looksEncryptedOffice(input.content)) {
+        return { status: REASON_STATUS['password-protected'], reason: 'password-protected' }
+    }
+
     if (!handler) {
-        // Say WHY before falling back to the generic refusals: "unrecognized" is true of the bytes
-        // and unhelpful about the file, and a caller who knows a document is merely locked can ask
-        // its sender for it rather than treating the attachment as unreadable junk.
-        if (looksEncryptedOffice(input.content)) {
-            return { status: 'skipped', reason: 'password-protected' }
-        }
-        return { status: 'skipped', reason: type ? 'unsupported-format' : 'unrecognized' }
+        const reason = type ? 'unsupported-format' : 'unrecognized'
+        return { status: REASON_STATUS[reason], reason }
     }
 
     const maxOutputChars = resolveCap(options.maxOutputChars)
@@ -3562,13 +3617,22 @@ export const extractAttachment = async (
             ? {
                   status: 'extracted',
                   truncated,
-                  // The whole point of the field: a scan and an empty file stop looking alike here.
-                  emptyReason: output.hasNonTextContent ? 'no-text-layer' : 'no-text-content',
+                  // ONLY on a complete read. Both values are claims about the whole document — "it
+                  // holds nothing", "none of it is text" — and neither is knowable from a read that
+                  // stopped early: a cap of 0 or a deadline hit on a blank cover page leaves no text
+                  // behind while the document is full of it. Reporting one there told a caller to
+                  // discard, or to OCR, a document nobody had read. `truncated` alone already says
+                  // the honest thing: we stopped before finding text, and there may be more.
+                  ...(truncated
+                      ? {}
+                      : { emptyReason: output.hasNonTextContent ? ('no-text-layer' as const) : ('no-text-content' as const) }),
               }
             : { status: 'extracted', extraction: truncated && options.trailer ? text + options.trailer : text, truncated }
     } catch (error) {
         // The bytes are attacker-controlled, so a throw or timeout is an expected event, not a bug:
         // label it and move on rather than crashing the caller.
-        return { status: 'failed', reason: failureReason(error) }
+        // Status derived from the reason, never chosen alongside it, so the two cannot disagree.
+        const reason = failureReason(error)
+        return { status: REASON_STATUS[reason], reason }
     }
 }
