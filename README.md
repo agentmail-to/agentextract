@@ -72,6 +72,31 @@ const result = await extractAttachment(input, {
 })
 ```
 
+`reason` is a **code, not a sentence** — one of `too-large`, `expands-too-large`,
+`unsupported-format`, `unrecognized`, `password-protected`, `unsupported-zip-feature`, `malformed`,
+`wrong-document-shape`, `timed-out` or `internal`. It is set on every `skipped` and `failed` result
+and on no `extracted` one, so it is safe to branch on. Two are worth knowing: `timed-out` is the only
+failure worth retrying, and `internal` means one of our invariants tripped or a pinned dependency
+moved — not a bad file, so retrying or re-requesting the attachment cannot help.
+
+When a **complete** read yields no text, `extraction` is omitted and `emptyReason` says why:
+`'no-text-layer'` means the document has content but none of it is text — a scan, a photographed
+page — so OCR is the next step, while `'no-text-content'` means it was read and genuinely holds
+nothing. Exactly one of `extraction` and `emptyReason` is present whenever `truncated` is false.
+Both are claims about the whole document, so neither is reported for a truncated read: a result with
+no text, no `emptyReason` and `truncated: true` means we stopped before finding text and cannot say
+whether there is any. Only a handler that can *prove* the distinction reports `'no-text-layer'`;
+today PDF (its first page paints an image) and `.docx` (the document references a picture). Where a
+handler cannot prove EITHER — a multi-page PDF whose first page is blank, `.xlsx` and HTML, whose
+images live where these readers do not look, and `.doc`, whose parser reports text or nothing and
+nothing about the rest — **neither value is reported**, and that absence means exactly what it says:
+we cannot tell. Treat a missing `emptyReason` as "may be worth OCR", never as "empty".
+
+Password-protected **OOXML** files (`.docx`/`.xlsx`/`.pptx`, which Office wraps in an OLE container)
+and password-protected PDFs are `skipped` with reason `password-protected`. Legacy `.doc` files
+encrypted the old way — the `fEncrypted` FIB flag, with no `EncryptedPackage` stream — are **not**
+detected and come back `failed` / `malformed`.
+
 `trailer` is appended to `extraction` only when the text was actually cut, and sits **outside** cap
 accounting — the cap bounds extracted text, so the returned string may exceed it by the trailer's
 length. `result.truncated` reports the same fact programmatically, whether or not a trailer was
@@ -137,8 +162,14 @@ guards reduce blast radius; they are **not** a sandbox.
   takes a `Buffer`), and `saxes` buffers one text node whole, so a single enormous run still costs
   about twice its own size. Malformed XML is also stricter than before — a document the old reader
   silently half-read now comes back either `truncated` or `failed`.
-- **`.docx` scope** — text comes from `word/document.xml` only. **Footnote, endnote and comment
-  bodies are not extracted** (they are separate zip parts), and neither are headers or footers.
+- **`.docx` scope** — text comes from the document body *and* from the parts around it: footnotes,
+  endnotes, comments, headers and footers are all extracted. They are appended after the body, in
+  that order, as ordinary paragraphs — the order is the output cap's priority order rather than the
+  document's reading order, which cannot be reconstructed (a footnote's reference sits inline while
+  its body lives in another part, and a header is repeated per section rather than positioned once).
+  A document that hits the cap therefore loses its page furniture before a footnote, and a footnote
+  before a body paragraph. A header repeated across sections is emitted once. A malformed auxiliary
+  part costs only its own text and sets `truncated`; only the body is load-bearing.
   **Table structure is not preserved**: each cell's paragraphs are emitted in reading order with the
   same blank-line separator as body paragraphs, so a 2×2 table is indistinguishable from four
   consecutive paragraphs. List bullets and numbers are dropped; the item text remains. Vertical-

@@ -3,6 +3,10 @@
 exports[`docx fidelity — our reader against mammoth > comments.docx 1`] = `
 "Ouch.
 
+A tachyon walks into a bar.
+
+Fin.
+
 "
 `;
 
@@ -16,6 +20,10 @@ exports[`docx fidelity — our reader against mammoth > empty.docx 1`] = `null`;
 
 exports[`docx fidelity — our reader against mammoth > endnotes.docx 1`] = `
 "Ouch.
+
+ A tachyon walks into a bar.
+
+ Fin.
 
 "
 `;
@@ -40,10 +48,18 @@ Second paragraph with more words here.
 "
 `;
 
-exports[`docx fidelity — our reader against mammoth > footnote-hyperlink.docx 1`] = `null`;
+exports[`docx fidelity — our reader against mammoth > footnote-hyperlink.docx 1`] = `
+" Example
+
+"
+`;
 
 exports[`docx fidelity — our reader against mammoth > footnotes.docx 1`] = `
 "Ouch.
+
+ A tachyon walks into a bar.
+
+ Fin.
 
 "
 `;

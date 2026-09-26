@@ -39,6 +39,13 @@ const NS = [
     'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"',
 ].join(' ')
 
+// Only the picture cases need these, and adding them to NS shifts every other fixture's bytes.
+const DRAWING_NS = [
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"',
+    'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"',
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"',
+].join(' ')
+
 // JSZip output satisfies both decompression-budget invariants, so a fixture built here reaches the
 // handler rather than being turned away in front of it. STORE covers the stored-entry path.
 const docxFrom = async (documentXml: string, compression: 'DEFLATE' | 'STORE' = 'DEFLATE') => {
@@ -63,6 +70,311 @@ const extract = async (body: string, options?: { maxOutputChars?: number }) =>
 
 const para = (inner: string) => `<w:p><w:r>${inner}</w:r></w:p>`
 const text = (s: string) => para(`<w:t>${s}</w:t>`)
+
+// An archive with extra parts alongside word/document.xml, for the auxiliary-part reader.
+const docxWithParts = async (body: string, parts: Record<string, string>) => {
+    const zip = new JSZip()
+    zip.file(
+        '[Content_Types].xml',
+        '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>'
+    )
+    zip.file(
+        '_rels/.rels',
+        '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'
+    )
+    zip.file('word/document.xml', `<?xml version="1.0"?><w:document ${NS}><w:body>${body}</w:body></w:document>`)
+    for (const [name, xml] of Object.entries(parts)) zip.file(name, xml)
+    return Buffer.from(await zip.generateAsync({ type: 'nodebuffer' }))
+}
+const auxPart = (root: string, inner: string) => `<?xml version="1.0"?><w:${root} ${NS}>${inner}</w:${root}>`
+const extractParts = async (body: string, parts: Record<string, string>, options?: { maxOutputChars?: number }) =>
+    extractAttachment({ content: await docxWithParts(body, parts), contentType: DOCX_TYPE }, options)
+
+// Text in a .docx is spread across parts: word/document.xml holds the body, while footnotes,
+// endnotes, comments, headers and footers each live in their own. Reading only the body silently
+// dropped all of it — a footnote carrying the substance of a contract clause, a header carrying a
+// confidentiality marking — with nothing in the result to say anything was missing.
+describe('docx — text outside word/document.xml', () => {
+    it('reads footnote bodies', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${text('A real footnote.')}</w:footnote>`),
+        })
+        expect(r.extraction).toBe('Body.\n\nA real footnote.\n\n')
+    })
+
+    it('reads endnote and comment bodies', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/endnotes.xml': auxPart('endnotes', `<w:endnote w:id="2">${text('An endnote.')}</w:endnote>`),
+            'word/comments.xml': auxPart('comments', `<w:comment w:id="1">${text('A comment.')}</w:comment>`),
+        })
+        expect(r.extraction).toBe('Body.\n\nAn endnote.\n\nA comment.\n\n')
+    })
+
+    // Word writes a separator and a continuation-separator note into every footnotes part to draw
+    // the rule above the note area. They hold no text, and emitting them puts a stray blank
+    // paragraph into the output of every document that has a single footnote.
+    it('skips the separator notes Word writes into every footnotes part', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/footnotes.xml': auxPart(
+                'footnotes',
+                `<w:footnote w:id="-1" w:type="separator">${text('SEP')}</w:footnote>` +
+                    `<w:footnote w:id="0" w:type="continuationSeparator">${text('CONT')}</w:footnote>` +
+                    `<w:footnote w:id="2">${text('Real note.')}</w:footnote>`
+            ),
+        })
+        expect(r.extraction).toBe('Body.\n\nReal note.\n\n')
+        expect(r.extraction).not.toContain('SEP')
+        expect(r.extraction).not.toContain('CONT')
+    })
+
+    it('reads headers and footers', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': auxPart('hdr', text('CONFIDENTIAL')),
+            'word/footer1.xml': auxPart('ftr', text('Page 1 of 4')),
+        })
+        expect(r.extraction).toBe('Body.\n\nCONFIDENTIAL\n\nPage 1 of 4\n\n')
+    })
+
+    // A section can declare three headers (default, first page, even pages), and Word writes a part
+    // for each — usually with identical text. Repeating a letterhead once per section is noise that
+    // also spends the output cap.
+    it('emits a repeated header once', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': auxPart('hdr', text('CONFIDENTIAL')),
+            'word/header2.xml': auxPart('hdr', text('CONFIDENTIAL')),
+            'word/header3.xml': auxPart('hdr', text('Appendix header')),
+        })
+        expect(r.extraction).toBe('Body.\n\nCONFIDENTIAL\n\nAppendix header\n\n')
+    })
+
+    // The main part is load-bearing and an auxiliary part is not, which is the whole reason they are
+    // read separately. Trading a readable document for a fragment over its margins would be a worse
+    // answer than the one this replaced.
+    it('keeps the body when an auxiliary part is malformed', async () => {
+        const r = await extractParts(text('Body survives.'), {
+            'word/footnotes.xml': '<?xml version="1.0"?><w:footnotes><w:footnote><w:p>unclosed',
+        })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('Body survives.')
+        expect(r.truncated).toBe(true)
+    })
+
+    // Order is the cap's priority order: a document that runs out of room loses its page furniture
+    // before a footnote, and a footnote before a body paragraph.
+    it('spends the cap on the body before the margins', async () => {
+        const r = await extractParts(text('BODY'), {
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${text('NOTE')}</w:footnote>`),
+            'word/header1.xml': auxPart('hdr', text('HEADER')),
+        }, { maxOutputChars: 12 })
+        expect(r.extraction).toContain('BODY')
+        expect(r.extraction).not.toContain('HEADER')
+        expect(r.truncated).toBe(true)
+    })
+
+    // REGRESSION: the catch set the same `truncated` flag the loop breaks on, so one unreadable part
+    // ended the whole walk and took every later part's text with it. The comment beside it claimed a
+    // broken part "costs its own text and nothing else", which was the intent and not the behaviour.
+    it('keeps reading later parts after one is malformed', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/footnotes.xml': '<?xml version="1.0"?><w:footnotes><w:footnote><w:p>unclosed',
+            'word/comments.xml': auxPart('comments', `<w:comment w:id="1">${text('Comment survives.')}</w:comment>`),
+            'word/header1.xml': auxPart('hdr', text('Header survives.')),
+        })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('Body.')
+        expect(r.extraction).toContain('Comment survives.')
+        expect(r.extraction).toContain('Header survives.')
+        // Still flagged: text IS missing, just not everything after the broken part.
+        expect(r.truncated).toBe(true)
+    })
+
+    // A clean read of a body plus one footnote makes exactly four Date.now() calls: the entry
+    // point's deadline, the body's chunk check, the auxiliary loop's gate, and the footnote's own
+    // chunk check. Expiring on a chosen one of those is what makes the two cases below deterministic
+    // rather than dependent on how fast the machine is.
+    const expireOnCall = (n: number) => {
+        const base = Date.now()
+        let calls = 0
+        return vi.spyOn(Date, 'now').mockImplementation(() => (++calls < n ? base : base + HANDLER_TIMEOUT_MS + 1))
+    }
+
+    // REGRESSION, and the one the first fix missed: a part that breaks AFTER producing text does not
+    // throw — readPart returns it with a flag — so it landed on `truncated`, which ends the walk.
+    // Half-readable is the COMMON shape of a broken part, so this was the same defect as the throw
+    // case, reached by the path the first fix did not cover. `partFailed` now comes back from
+    // readPart too, and only running out of room or time stops the walk.
+    it('keeps reading later parts after one breaks partway through its text', async () => {
+        const r = await extractParts(text('Body.'), {
+            // Well-formed long enough to emit a paragraph, then truncated mid-element.
+            'word/footnotes.xml':
+                `<?xml version="1.0"?><w:footnotes ${NS}><w:footnote w:id="2">${text('Note text.')}` +
+                '<w:p><w:r><w:t>unterminated',
+            'word/header1.xml': auxPart('hdr', text('Header survives.')),
+        })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('Note text.') // the readable prefix is kept
+        expect(r.extraction).toContain('Header survives.') // and the walk went on
+        expect(r.truncated).toBe(true)
+    })
+
+    // REGRESSION: a part charges for its paragraph terminator like any other output, so an empty
+    // <w:p/> — which Word writes routinely — read at a budget of zero came back over cap and marked
+    // a COMPLETE document truncated. Truncation is about text LOST, not about the cap binding.
+    it('does not report truncation for a header holding only an empty paragraph', async () => {
+        const full = 'Body.\n\n'.length
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': `<?xml version="1.0"?><w:hdr ${NS}><w:p/></w:hdr>`,
+        }, { maxOutputChars: full })
+        expect(r.extraction).toBe('Body.\n\n')
+        expect(r.truncated).toBe(false)
+    })
+
+    // REGRESSION: a duplicate header read with no budget left set truncated and was then discarded
+    // as a duplicate anyway — flagging a loss for text we had already decided not to keep.
+    it('does not report truncation for a duplicate header it discards', async () => {
+        const cap = 'Body.\n\n'.length + 'ACME\n\n'.length
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': auxPart('hdr', text('ACME')),
+            'word/header2.xml': auxPart('hdr', text('ACME')),
+        }, { maxOutputChars: cap })
+        expect(r.extraction).toBe('Body.\n\nACME\n\n')
+        expect(r.truncated).toBe(false)
+    })
+
+    // REGRESSION: the body's text is '\n\n' when it holds nothing, and prepending that to a
+    // document whose only text lives in a footnote produced a leading blank paragraph.
+    it('does not prepend a blank paragraph when the body is empty', async () => {
+        const r = await extractParts('<w:p/>', {
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${text('Only here.')}</w:footnote>`),
+        })
+        expect(r.extraction).toBe('Only here.\n\n')
+    })
+
+    // A .docx whose only content is a picture is not an empty document. Reporting 'no-text-content'
+    // told a caller there was nothing to find, which is exactly the document OCR is for. Spelled out
+    // as Word writes it, because the a:blip lives under wp:inline — a subtree the reader drops — so
+    // a check placed with the extraction logic would never see it.
+    const PICTURE =
+        `<w:p><w:r><w:drawing ${DRAWING_NS}><wp:inline><a:graphic><a:graphicData><pic:pic><pic:blipFill>` +
+        '<a:blip r:embed="rId1"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>'
+
+    it('reports no-text-layer for a picture-only document', async () => {
+        const r = await extractParts(PICTURE, {})
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBeUndefined()
+        expect(r.emptyReason).toBe('no-text-layer')
+    })
+
+    // REGRESSION: any w:drawing counted, and that wraps every DrawingML object — charts, text boxes,
+    // the decorative shapes in a letterhead template. An empty template claimed to be a scan.
+    it('does not call a drawing without an image a scan', async () => {
+        const r = await extractParts(
+            `<w:p><w:r><w:drawing ${DRAWING_NS}><wp:inline><a:graphic><a:graphicData/></a:graphic></wp:inline></w:drawing></w:r></w:p>`,
+            {}
+        )
+        expect(r.emptyReason).toBe('no-text-content')
+    })
+
+    // REGRESSION: `remaining <= 0` was treated as "there is more to lose", so a body of exactly
+    // maxOutputChars got a "continues past this point" trailer over parts holding nothing. Word
+    // writes empty headers routinely, so this was the ordinary case rather than a contrived one.
+    it('does not report truncation when the parts left over are empty', async () => {
+        const body = text('Body.')
+        const full = 'Body.\n\n'.length
+        const r = await extractParts(body, {
+            'word/header1.xml': auxPart('hdr', ''), // an empty header, as Word writes
+            'word/footnotes.xml': auxPart('footnotes', '<w:footnote w:id="-1" w:type="separator"/>'),
+        }, { maxOutputChars: full })
+        expect(r.extraction).toBe('Body.\n\n')
+        expect(r.truncated).toBe(false)
+    })
+
+    // The third structural note type in ECMA-376's ST_FtnEdn. Word writes it alongside the other
+    // two, and treating it as content emits the same stray blank paragraph the separator skip fixed.
+    it('skips a continuationNotice note', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/footnotes.xml': auxPart(
+                'footnotes',
+                `<w:footnote w:id="1" w:type="continuationNotice">${text('NOTICE')}</w:footnote>` +
+                    `<w:footnote w:id="2">${text('Real note.')}</w:footnote>`
+            ),
+        })
+        expect(r.extraction).toBe('Body.\n\nReal note.\n\n')
+        expect(r.extraction).not.toContain('NOTICE')
+    })
+
+    // Which header survives a cap that runs out partway through must be a property of the DOCUMENT,
+    // not of the order the producer happened to write the archive in. Numeric-aware, so header10
+    // does not sort before header2.
+    it('reads headers in numeric order regardless of archive order', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/header10.xml': auxPart('hdr', text('TENTH')),
+            'word/header2.xml': auxPart('hdr', text('SECOND')),
+            'word/header1.xml': auxPart('hdr', text('FIRST')),
+        })
+        expect(r.extraction).toBe('Body.\n\nFIRST\n\nSECOND\n\nTENTH\n\n')
+    })
+
+    // REGRESSION: `continue` for empty text ran BEFORE the truncation flag was read, so a part the
+    // deadline cut off before it emitted anything reported the document as complete. Expiring on
+    // call 4 lands inside the footnote's own read, after the gate that would have stopped the walk.
+    it('reports truncation from a part cut off before it emitted any text', async () => {
+        const content = await docxWithParts(text('Body.'), {
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${text('NOTE')}</w:footnote>`),
+        })
+        const clock = expireOnCall(4)
+        try {
+            const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+            expect(r.extraction).toContain('Body.')
+            expect(r.extraction).not.toContain('NOTE')
+            expect(r.truncated).toBe(true) // the footnote was never read; saying otherwise is a lie
+        } finally {
+            clock.mockRestore()
+        }
+    })
+
+    // REGRESSION: the deadline was checked once per ZIP ENTRY, before the name was matched, so a
+    // clock expiring while walking parts we never read marked a COMPLETE document truncated — and
+    // the entry point then appended a "continues past this point" trailer to a whole document.
+    // This archive has no auxiliary parts at all, so after the fix there is nothing to check a
+    // deadline against and the expiry is unreachable.
+    it('does not report truncation for a deadline that passes on entries it never reads', async () => {
+        const content = await docxWithParts(text('Complete.'), {
+            'word/settings.xml': '<?xml version="1.0"?><w:settings/>',
+            'word/styles.xml': '<?xml version="1.0"?><w:styles/>',
+            'word/fontTable.xml': '<?xml version="1.0"?><w:fonts/>',
+            'word/theme/theme1.xml': '<?xml version="1.0"?><a:theme/>',
+        })
+        const clock = expireOnCall(3)
+        try {
+            const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+            expect(r.extraction).toBe('Complete.\n\n')
+            expect(r.truncated).toBe(false)
+        } finally {
+            clock.mockRestore()
+        }
+    })
+
+    // A duplicate entry name resolves to the last record for the main part; the auxiliary walk read
+    // and emitted BOTH, so an ambiguous archive produced its footnotes twice.
+    it('reads one text per part name when an archive repeats an entry', async () => {
+        const zip = new JSZip()
+        zip.file('[Content_Types].xml', '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>')
+        zip.file('_rels/.rels', '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>')
+        zip.file('word/document.xml', `<?xml version="1.0"?><w:document ${NS}><w:body>${text('Body.')}</w:body></w:document>`)
+        zip.file('word/footnotes.xml', auxPart('footnotes', `<w:footnote w:id="2">${text('Once.')}</w:footnote>`))
+        zip.file('word/footnotes.xml', auxPart('footnotes', `<w:footnote w:id="2">${text('Once.')}</w:footnote>`))
+        const content = Buffer.from(await zip.generateAsync({ type: 'nodebuffer' }))
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        expect(r.extraction?.match(/Once\./g) ?? []).toHaveLength(1)
+    })
+
+    // A document with no auxiliary parts must read exactly as it did before they were considered.
+    it('leaves a document without auxiliary parts unchanged', async () => {
+        const r = await extract(text('Only a body.'))
+        expect(r.extraction).toBe('Only a body.\n\n')
+    })
+})
 
 describe('docx — the whitelist drops unrecognised subtrees', () => {
     // mc:Choice is the DrawingML branch and mc:Fallback the VML one; Word emits both for the same
@@ -797,7 +1109,7 @@ describe('docx — the cap and the deadline stop the read', () => {
         const nested = '<w:p>'.repeat(300) + '</w:p>'.repeat(300)
         const r = await extract(nested)
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/XML nesting exceeds 256 elements/)
+        expect(r.reason).toBe('malformed')
     })
 })
 
