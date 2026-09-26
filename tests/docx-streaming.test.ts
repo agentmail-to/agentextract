@@ -39,6 +39,13 @@ const NS = [
     'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"',
 ].join(' ')
 
+// Only the picture cases need these, and adding them to NS shifts every other fixture's bytes.
+const DRAWING_NS = [
+    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"',
+    'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"',
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"',
+].join(' ')
+
 // JSZip output satisfies both decompression-budget invariants, so a fixture built here reaches the
 // handler rather than being turned away in front of it. STORE covers the stored-entry path.
 const docxFrom = async (documentXml: string, compression: 'DEFLATE' | 'STORE' = 'DEFLATE') => {
@@ -244,12 +251,28 @@ describe('docx — text outside word/document.xml', () => {
     })
 
     // A .docx whose only content is a picture is not an empty document. Reporting 'no-text-content'
-    // told a caller there was nothing to find, which is exactly the document OCR is for.
+    // told a caller there was nothing to find, which is exactly the document OCR is for. Spelled out
+    // as Word writes it, because the a:blip lives under wp:inline — a subtree the reader drops — so
+    // a check placed with the extraction logic would never see it.
+    const PICTURE =
+        `<w:p><w:r><w:drawing ${DRAWING_NS}><wp:inline><a:graphic><a:graphicData><pic:pic><pic:blipFill>` +
+        '<a:blip r:embed="rId1"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>'
+
     it('reports no-text-layer for a picture-only document', async () => {
-        const r = await extractParts('<w:p><w:r><w:drawing/></w:r></w:p>', {})
+        const r = await extractParts(PICTURE, {})
         expect(r.status).toBe('extracted')
         expect(r.extraction).toBeUndefined()
         expect(r.emptyReason).toBe('no-text-layer')
+    })
+
+    // REGRESSION: any w:drawing counted, and that wraps every DrawingML object — charts, text boxes,
+    // the decorative shapes in a letterhead template. An empty template claimed to be a scan.
+    it('does not call a drawing without an image a scan', async () => {
+        const r = await extractParts(
+            `<w:p><w:r><w:drawing ${DRAWING_NS}><wp:inline><a:graphic><a:graphicData/></a:graphic></wp:inline></w:drawing></w:r></w:p>`,
+            {}
+        )
+        expect(r.emptyReason).toBe('no-text-content')
     })
 
     // REGRESSION: `remaining <= 0` was treated as "there is more to lose", so a body of exactly

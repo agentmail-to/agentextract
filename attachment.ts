@@ -332,6 +332,15 @@ interface DocxPartShape {
 // ECMA-376 ST_FtnEdn defines four note types and only 'normal' is content. The other three are the
 // furniture Word draws around the note area — the rule, its continuation, and the notice that a note
 // carries on overleaf — and each emits a stray blank paragraph if treated as a note.
+// The elements that reference an actual image, by namespace and local name — a:blip is the blob a
+// picture points at, pic:pic the picture itself, v:imagedata the VML spelling. Matched by URI
+// because OOXML_PREFIXES maps only w/mc/v, so these arrive as {uri}local rather than a prefix.
+const DOCX_IMAGE_ELEMENTS = new Map([
+    ['http://schemas.openxmlformats.org/drawingml/2006/main', 'blip'],
+    ['http://schemas.openxmlformats.org/drawingml/2006/picture', 'pic'],
+    ['urn:schemas-microsoft-com:vml', 'imagedata'],
+])
+
 const DOCX_SEPARATOR_NOTE_TYPES = new Set(['separator', 'continuationSeparator', 'continuationNotice'])
 const isSeparatorNote = (attributes: SaxesAttributes): boolean => {
     const type = wordAttribute(attributes, 'type')
@@ -429,10 +438,12 @@ const htmlHandler: Handler = {
     extensions: ['.html', '.htm', '.xhtml'],
     extract: async ({ content, charsetHint }) => {
         const decoded = decodeText(content, charsetHint)
-        // An <img>-only page has content that is not text, and html-to-text drops images — so the
-        // markup, not the flattened output, is what says which kind of empty this is.
-        const hasImage = /<img\b/i.test(decoded)
-        return { text: await flattenHtml(decoded), emptyReason: hasImage ? 'no-text-layer' : 'no-text-content' }
+        // NO emptyReason. Deciding it from a /<img/ scan over the raw markup was wrong both ways:
+        // it matched inside comments, <script> and <noscript>, and a tracking pixel — sending empty
+        // marketing mail to OCR — while missing <svg>, <picture>, <canvas> and CSS backgrounds, so a
+        // genuinely image-only page was reported as holding nothing. Answering this properly needs
+        // the DOM that this handler deliberately does not build, so it does not answer.
+        return { text: await flattenHtml(decoded) }
     },
 }
 
@@ -489,47 +500,47 @@ const pdfHandler: Handler = {
             // Only reached on an otherwise-empty extraction, and it stops at the first image — for
             // a real scan that is page one. A genuinely blank document walks its pages instead, and
             // is bounded by the same deadline as everything else here.
-            let hasNonTextContent = false
-            // `!truncated` because the entry point only reports an emptyReason for a COMPLETE read,
-            // so on a truncated one this work is done and then discarded — on a long blank PDF it
-            // could spend the rest of the deadline producing an answer nobody sees.
-            //
-            // FIRST PAGE ONLY. getOperatorList builds a page's display list and decodes its images,
-            // which is real work this handler did not previously do, and doing it per page could
-            // push a large scan over HANDLER_TIMEOUT_MS — turning a file that used to extract into
-            // one that fails. A scan's first page is an image, so one page answers it; the cost of
-            // being wrong is a document with a blank cover page reported as 'no-text-content'
-            // instead of 'no-text-layer', which understates rather than misdirects.
-            if (joined.length === 0 && pagesRead > 0 && !truncated && Date.now() <= deadline) {
-                // Imported HERE, inside the branch: only an empty read needs it, so a document that
-                // produced text never reaches for a symbol it will not use. Absent — a stubbed
-                // module, an older unpdf — means no proof available, and so no claim made.
-                const { getResolvedPDFJS } = await import('unpdf')
-                const OPS = typeof getResolvedPDFJS === 'function' ? (await getResolvedPDFJS()).OPS : undefined
-                const imageOps = new Set<number>(
-                    OPS === undefined
-                        ? []
-                        : [
-                              OPS.paintImageXObject,
-                              OPS.paintInlineImageXObject,
-                              OPS.paintImageMaskXObject,
-                              OPS.paintImageXObjectRepeat,
-                              OPS.paintImageMaskXObjectRepeat,
-                              OPS.paintSolidColorImageMask,
-                          ]
-                )
-                if (imageOps.size > 0) {
+            // WHAT THE EMPTINESS MEANS, or nothing at all. Returning a boolean here was wrong three
+            // ways at once, because `false` silently became the positive claim 'no-text-content':
+            // a probe that could not run, one that errored, and one that only looked at page 1 of a
+            // multi-page document all ended up asserting the document was genuinely empty — the
+            // claim that tells a caller to throw a scan away. Undefined is the honest third answer.
+            const probeEmptyReason = async (): Promise<EmptyReason | undefined> => {
+                if (truncated || Date.now() > deadline) return undefined
+                try {
+                    const { getResolvedPDFJS } = await import('unpdf')
+                    if (typeof getResolvedPDFJS !== 'function') return undefined
+                    const { OPS } = await getResolvedPDFJS()
+                    if (OPS === undefined) return undefined
+                    const imageOps = new Set<number>([
+                        OPS.paintImageXObject,
+                        OPS.paintInlineImageXObject,
+                        OPS.paintImageMaskXObject,
+                        OPS.paintImageXObjectRepeat,
+                        OPS.paintImageMaskXObjectRepeat,
+                        OPS.paintSolidColorImageMask,
+                    ])
+                    // FIRST PAGE ONLY: getOperatorList builds a display list and decodes images,
+                    // work this handler did not previously do, and per page it could push a large
+                    // scan past HANDLER_TIMEOUT_MS. One page PROVES an image when it finds one —
+                    // but it cannot disprove one for a document with more pages, so a scan behind a
+                    // blank cover answers "unknown" rather than "empty".
                     const { fnArray } = await (await pdf.getPage(1)).getOperatorList()
-                    hasNonTextContent = (fnArray as number[]).some((op) => imageOps.has(op))
+                    if ((fnArray as number[]).some((op) => imageOps.has(op))) return 'no-text-layer'
+                    return pagesRead === 1 ? 'no-text-content' : undefined
+                } catch {
+                    // The probe is an extra: a document that used to come back empty must not start
+                    // coming back failed because the thing that labels its emptiness threw.
+                    return undefined
                 }
             }
+            const emptyReason = joined.length === 0 && pagesRead > 0 ? await probeEmptyReason() : undefined
+
             return {
                 text: joined,
                 empty: joined.length === 0,
                 truncated,
-                // Both directions are proofs here: every page was read and none yielded text, and
-                // the probe says whether any of it is a painted image.
-                emptyReason: hasNonTextContent ? 'no-text-layer' : 'no-text-content',
+                emptyReason,
             }
         } finally {
             // getDocumentProxy exposes pdf.js's loading task; release its worker handler, document
@@ -674,7 +685,12 @@ const docxHandler: Handler = {
         // whose only text is in a footnote produced a leading blank paragraph. Dropped when the body
         // has no text of its own; an entirely empty document then joins to '' rather than '\n\n',
         // which the entry point reads as empty in exactly the same way.
-        const sections = body.sawText ? [body.text] : []
+        // From the text the body actually KEPT, not from whether any was emitted: a suppressed
+        // vMerge cell or a discarded frame emits text that never reaches the output, and counting
+        // it here put back the leading blank paragraph this is meant to remove. The body is read
+        // with the full budget, so its own text is the honest answer. (Truncation below still uses
+        // the emitted signal, where over-counting errs toward reporting a loss rather than hiding one.)
+        const sections = body.text.trim() === '' ? [] : [body.text]
         let truncated = bodyTruncated
         const used = () => sections.reduce((total, part) => total + part.length, 0)
 
@@ -1407,9 +1423,11 @@ const xlsxHandler: Handler = {
             throw new ExtractionFailure('internal')
         }
 
-        // Every row of every sheet was read, so no text means no text. Images in a workbook are
-        // floating drawings rather than the content, so there is no OCR case to point at here.
-        return { text: sheets.join(BLOCK_SEPARATOR), truncated, emptyReason: 'no-text-content' }
+        // NO emptyReason. Rows are all this reader looks at, and a sheet holding nothing but a
+        // pasted screenshot has no rows — so claiming 'no-text-content' told a caller to discard
+        // exactly the workbook that wanted OCR. Drawings live in parts this handler never opens,
+        // so the honest answer is that we cannot tell.
+        return { text: sheets.join(BLOCK_SEPARATOR), truncated }
     },
 }
 
@@ -2000,17 +2018,37 @@ const MAX_METADATA_BYTES = 4 * 1024 * 1024
 
 // Inflate one entry, bounded. Only called on the three metadata parts above. undefined = unreadable or
 // over the cap, which the caller treats as "the workbook did not tell us" rather than as an error.
-const inflateEntry = (entry: ZipEntry): Promise<Buffer | undefined> => {
+// Returns the bytes, or WHICH failure stopped it. Two situations reach the same undefined otherwise
+// — over our cap, and a stream we cannot read — and they differ to a caller by status as well as by
+// code. The caller used to tell them apart by comparing the entry's self-declared uncompSize against
+// the cap, which is a field the archive chooses: a lying header gave the wrong answer in both
+// directions, and the guard here never trusted it in the first place.
+type InflatedEntry = { ok: true; data: Buffer } | { ok: false; reason: 'expands-too-large' | 'malformed' }
+
+const inflateEntry = (entry: ZipEntry): Promise<InflatedEntry> => {
     // Stored: output === input, and the subarray is a view on bytes already resident.
     if (entry.method === 0) {
-        return Promise.resolve(entry.data.length <= MAX_METADATA_BYTES ? entry.data : undefined)
+        return Promise.resolve(
+            entry.data.length <= MAX_METADATA_BYTES
+                ? { ok: true as const, data: entry.data }
+                : { ok: false as const, reason: 'expands-too-large' as const }
+        )
     }
-    if (entry.method !== 8) return Promise.resolve(undefined) // the budget already refuses these
+    if (entry.method !== 8) return Promise.resolve({ ok: false as const, reason: 'malformed' as const }) // budget refuses these
     // maxOutputLength, not a post-hoc length check: it errors on the chunk that would cross the cap,
     // so the allocation never happens. uncompSize is self-declared and cannot be the guard.
     return new Promise((resolve) =>
         zlib.inflateRaw(entry.data, { maxOutputLength: MAX_METADATA_BYTES }, (error, out) =>
-            resolve(error ? undefined : out)
+            resolve(
+                error
+                    ? {
+                          ok: false,
+                          // zlib's own signal for hitting maxOutputLength, so the cap and a corrupt
+                          // stream are distinguished by what actually happened.
+                          reason: (error as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE' ? 'expands-too-large' : 'malformed',
+                      }
+                    : { ok: true, data: out }
+            )
         )
     )
 }
@@ -2270,20 +2308,25 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
         entries.find((entry) => entry.name === CONTENT_TYPES_PART) ?? metadata.get(asciiFold(CONTENT_TYPES_PART))
     if (!workbookEntry || !relsEntry) return undefined
 
-    const [workbookXml, relsXml, contentTypesXml] = await Promise.all([
+    const [workbook, rels, contentTypes] = await Promise.all([
         inflateEntry(workbookEntry),
         inflateEntry(relsEntry),
         contentTypesEntry ? inflateEntry(contentTypesEntry) : undefined,
     ])
+    const bytes = (result: InflatedEntry | undefined): Buffer | undefined =>
+        result !== undefined && result.ok ? result.data : undefined
+    const workbookXml = bytes(workbook)
+    const relsXml = bytes(rels)
+    const contentTypesXml = bytes(contentTypes)
     if (!workbookXml || !relsXml) {
         const fallback = await metadataFallbackWorksheets(entries, relsXml, contentTypesXml)
         if (fallback.length === 0) {
-            // inflateEntry returns undefined for two different situations, and neither is the
-            // workbook being the wrong shape: over OUR metadata cap is a file we decline to
-            // materialize, and an unreadable stream is broken bytes. Distinguished here rather
-            // than reported as one, because the two differ to a caller by status as well as code.
-            const oversized = [workbookEntry, relsEntry].some((entry) => entry.uncompSize > MAX_METADATA_BYTES)
-            throw new ExtractionFailure(oversized ? 'expands-too-large' : 'malformed')
+            // Neither situation is the workbook being the wrong shape: over OUR metadata cap is an
+            // intact file we decline to materialize, and an unreadable stream is broken bytes. Taken
+            // from what inflateEntry actually hit rather than from the size the archive declares for
+            // itself, which a hostile header can set to anything.
+            const failure = [workbook, rels].find((result) => result !== undefined && !result.ok)
+            throw new ExtractionFailure(failure !== undefined && !failure.ok ? failure.reason : 'malformed')
         }
         return fallback
     }
@@ -3008,6 +3051,16 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
         stack.push(name)
         assertXmlDepth(stack.length)
 
+        // AHEAD of the skip gate below, because this is an observation about the document rather
+        // than a decision about its text. A picture's own elements live under wp:inline, whose
+        // subtree is deliberately dropped, so a check placed with the extraction logic would never
+        // run — and quietly report every scanned document as holding nothing.
+        //
+        // The IMAGE, not its container: w:drawing wraps every DrawingML object, charts and text
+        // boxes and a letterhead's decorative shapes included, so flagging that made an empty
+        // template claim to be a scan.
+        if (DOCX_IMAGE_ELEMENTS.get(uri) === tag.local) sawPicture = true
+
         if (skip >= 0) {
             // Inside a dropped subtree nothing is emitted, and only the two ancestor-affecting
             // markers are still looked for. The `skip ===` tests prove the marker really sits in the
@@ -3171,13 +3224,9 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
             return
         }
 
-        // The DrawingML container a modern Word image sits in; w:pict is the VML spelling, flagged
-        // where it opens its frame below. Either one means the document has content that is not text.
-        if (name === 'w:drawing') sawPicture = true
 
         if (name === 'w:p' || name === 'w:pict') {
             if (name === 'w:pict') {
-                sawPicture = true
                 // A picture opened after an enclosing picture crossed the cap will be hoisted
                 // ahead of that enclosing picture's retained value. Since fresh deferred text is
                 // no longer accepted, emitting the retained value alone would create a hole.
@@ -3472,29 +3521,53 @@ const NON_DOC_OLE_EXTENSIONS = new Set(['.xls', '.ppt', '.msg'])
 const ENCRYPTED_PACKAGE_NAME = Buffer.from('EncryptedPackage', 'utf16le')
 const CFB_ENTRY_BYTES = 128
 const CFB_HEADER_BYTES = 512
+// Sector numbers above this are the format's sentinels (FREESECT, ENDOFCHAIN, FATSECT, ...).
+const CFB_MAX_SECTOR = 0xfffffff9
+const CFB_END_OF_CHAIN = 0xfffffffe
 const CFB_STREAM_TYPE = 2
 
 const looksEncryptedOffice = (content: Buffer): boolean => {
     if (!startsWith(content, OLE_MAGIC) || content.length < CFB_HEADER_BYTES) return false
-    // Seek the directory the HEADER points at rather than scanning for records that look like one.
-    // Scanning had two faults at once: bounded to the first 64 KB it missed a real encrypted file
-    // whose directory sits later, and unbounded it matched the directory of an OLE object EMBEDDED
-    // in something else — so a .doc carrying an encrypted attachment was declined as locked while
-    // its own text went unread. The header names one directory, and only that one is this file's.
     const sectorShift = content.readUInt16LE(30)
     if (sectorShift < 7 || sectorShift > 20) return false // 128 B .. 1 MB; anything else is not CFB
     const sectorSize = 1 << sectorShift
-    const firstDirectorySector = content.readUInt32LE(48)
-    if (firstDirectorySector > 0xfffffffa) return false // a sentinel, not a sector number
-    // Sector N begins one sector-size in, past the header.
-    const start = (firstDirectorySector + 1) * sectorSize
-    const end = Math.min(content.length, start + sectorSize)
-    // +2 for the UTF-16LE terminator the length field counts.
-    const nameBytes = ENCRYPTED_PACKAGE_NAME.length + 2
-    for (let pos = start; pos >= 0 && pos + CFB_ENTRY_BYTES <= end; pos += CFB_ENTRY_BYTES) {
-        if (content.readUInt16LE(pos + 64) !== nameBytes) continue
-        if (content[pos + 66] !== CFB_STREAM_TYPE) continue
-        if (content.subarray(pos, pos + ENCRYPTED_PACKAGE_NAME.length).equals(ENCRYPTED_PACKAGE_NAME)) return true
+    const at = (sector: number) => (sector + 1) * sectorSize // sector 0 begins one sector in
+    const readSector = (sector: number): Buffer | undefined => {
+        const start = at(sector)
+        return start >= 0 && start + sectorSize <= content.length ? content.subarray(start, start + sectorSize) : undefined
+    }
+    // The FAT's own sectors are listed in the header's DIFAT: 109 entries from offset 76. That is
+    // enough for a 500+ MB file, so the DIFAT extension chain is deliberately not followed — this
+    // runs inside MAX_INPUT_BYTES.
+    const fatSectors: number[] = []
+    for (let i = 0; i < 109; i++) {
+        const sector = content.readUInt32LE(76 + i * 4)
+        if (sector > CFB_MAX_SECTOR) break
+        fatSectors.push(sector)
+    }
+    const nextSector = (sector: number): number => {
+        const perSector = sectorSize / 4
+        const fat = readSector(fatSectors[Math.floor(sector / perSector)] ?? -1)
+        return fat === undefined ? CFB_END_OF_CHAIN : fat.readUInt32LE((sector % perSector) * 4)
+    }
+
+    // WALK THE WHOLE DIRECTORY, not just its first sector. A 512-byte sector holds four entries and a
+    // real encrypted package has around ten, so EncryptedPackage usually sits in the SECOND sector —
+    // reading one sector missed exactly the files this exists to recognize, and the tests missed it
+    // too because they put the entry at index 1.
+    const nameBytes = ENCRYPTED_PACKAGE_NAME.length + 2 // +2 for the UTF-16LE terminator
+    const entriesPerSector = sectorSize / CFB_ENTRY_BYTES
+    const seen = new Set<number>()
+    for (let sector = content.readUInt32LE(48); sector <= CFB_MAX_SECTOR && !seen.has(sector); sector = nextSector(sector)) {
+        seen.add(sector) // a malformed FAT can point a chain at itself
+        const directory = readSector(sector)
+        if (directory === undefined) break
+        for (let i = 0; i < entriesPerSector; i++) {
+            const pos = i * CFB_ENTRY_BYTES
+            if (directory.readUInt16LE(pos + 64) !== nameBytes) continue
+            if (directory[pos + 66] !== CFB_STREAM_TYPE) continue
+            if (directory.subarray(pos, pos + ENCRYPTED_PACKAGE_NAME.length).equals(ENCRYPTED_PACKAGE_NAME)) return true
+        }
     }
     return false
 }

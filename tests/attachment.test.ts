@@ -1332,6 +1332,97 @@ describe('attachment — why an extraction is empty', () => {
         }
     })
 
+    // REGRESSION: the probe looked at page 1 only, and `false` became the positive claim
+    // 'no-text-content' — so a scan behind a blank cover was reported as genuinely empty and thrown
+    // away. One page can PROVE an image; it cannot disprove one for a document with more pages.
+    it('reports no reason for a multi-page PDF whose first page shows no image', async () => {
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => ({
+                numPages: 3,
+                loadingTask: { destroy: async () => undefined },
+                getPage: async () => ({ getTextContent: async () => ({ items: [] }), getOperatorList: async () => ({ fnArray: [] }) }),
+            }),
+            getResolvedPDFJS: async () => ({ OPS: { paintImageXObject: 85 } }),
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content: buf('%PDF-1.4 mock'), contentType: 'application/pdf' })
+            expect(r.status).toBe('extracted')
+            expect(r.extraction).toBeUndefined()
+            expect(r.emptyReason).toBeUndefined()
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
+
+    // REGRESSION: when the probe could not run at all, `false` still became 'no-text-content', so
+    // EVERY scanned PDF would have been reported as truly empty.
+    it('reports no reason when the image probe is unavailable', async () => {
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => ({
+                numPages: 1,
+                loadingTask: { destroy: async () => undefined },
+                getPage: async () => ({ getTextContent: async () => ({ items: [] }) }),
+            }),
+            // no getResolvedPDFJS: nothing to prove with
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content: buf('%PDF-1.4 mock'), contentType: 'application/pdf' })
+            expect(r.status).toBe('extracted')
+            expect(r.emptyReason).toBeUndefined()
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
+
+    // REGRESSION: the probe had no try/catch, so a document that used to come back empty could come
+    // back FAILED because the thing labelling its emptiness threw. The probe is an extra; it must
+    // never be able to demote a successful read.
+    it('still extracts when the image probe throws', async () => {
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => ({
+                numPages: 1,
+                loadingTask: { destroy: async () => undefined },
+                getPage: async () => ({
+                    getTextContent: async () => ({ items: [] }),
+                    getOperatorList: async () => {
+                        throw new Error('operator list failed')
+                    },
+                }),
+            }),
+            getResolvedPDFJS: async () => ({ OPS: { paintImageXObject: 85 } }),
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content: buf('%PDF-1.4 mock'), contentType: 'application/pdf' })
+            expect(r.status).toBe('extracted')
+            expect(r.emptyReason).toBeUndefined()
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
+
+    // REGRESSION: both claimed 'no-text-content' without being able to see the content that would
+    // disprove it — xlsx never opens the drawing parts a pasted screenshot lives in, and the HTML
+    // check was a /<img/ scan over raw markup that matched inside comments and <script> while
+    // missing <svg>, <picture> and CSS backgrounds. Neither answers now.
+    it('reports no reason for formats that cannot see their own non-text content', async () => {
+        const empty = await extractAttachment({ content: fixture('empty.xlsx'), contentType: XLSX_TYPE })
+        expect(empty.status).toBe('extracted')
+        expect(empty.emptyReason).toBeUndefined()
+
+        const html = await extractAttachment({ content: Buffer.from('<html><body><svg></svg></body></html>'), filename: 'a.html' })
+        expect(html.status).toBe('extracted')
+        expect(html.emptyReason).toBeUndefined()
+    })
+
     // Never both: a reason contradicting text we also handed back would be nonsense.
     it('omits emptyReason whenever there is text', async () => {
         const r = await extractAttachment({ content: fixture('sample.pdf'), filename: 'a.pdf' })
@@ -1367,6 +1458,35 @@ describe('attachment — why an extraction is empty', () => {
 
     it('names a password-protected Office file rather than calling it unrecognized', async () => {
         const r = await extractAttachment({ content: encryptedOfficeFile(), filename: 'locked.docx' })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toBe('password-protected')
+    })
+
+    // REGRESSION: only the FIRST directory sector was read, and a 512-byte sector holds four
+    // entries while a real encrypted package has about ten — so EncryptedPackage usually sits in the
+    // second sector and went undetected, which is the whole situation this code exists for. The
+    // earlier tests missed it because they put the entry at index 1.
+    it('names a locked file whose EncryptedPackage sits in a later directory sector', async () => {
+        const entry = (name: string, type: number) => {
+            const b = Buffer.alloc(128)
+            const n = Buffer.from(name, 'utf16le')
+            n.copy(b, 0)
+            b.writeUInt16LE(n.length + 2, 64)
+            b[66] = type
+            return b
+        }
+        const header = Buffer.alloc(512)
+        Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(header, 0)
+        header.writeUInt16LE(9, 30)
+        header.writeUInt32LE(1, 48) // directory starts at sector 1
+        header.writeUInt32LE(0, 76) // the FAT itself lives in sector 0
+        const fat = Buffer.alloc(512, 0xff)
+        fat.writeUInt32LE(0xfffffffd, 0) // sector 0 is the FAT
+        fat.writeUInt32LE(2, 4) // directory sector 1 chains to 2
+        fat.writeUInt32LE(0xfffffffe, 8) // and ends there
+        const first = Buffer.concat([entry('Root Entry', 5), entry('DataSpaces', 1), entry('Version', 2), entry('DataSpaceMap', 2)])
+        const second = Buffer.concat([entry('StrongEncryptionDataSpace', 2), entry('EncryptedPackage', 2), Buffer.alloc(256)])
+        const r = await extractAttachment({ content: Buffer.concat([header, fat, first, second]), filename: 'locked.docx' })
         expect(r.status).toBe('skipped')
         expect(r.reason).toBe('password-protected')
     })

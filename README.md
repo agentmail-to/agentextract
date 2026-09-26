@@ -86,10 +86,11 @@ nothing. Exactly one of `extraction` and `emptyReason` is present whenever `trun
 Both are claims about the whole document, so neither is reported for a truncated read: a result with
 no text, no `emptyReason` and `truncated: true` means we stopped before finding text and cannot say
 whether there is any. Only a handler that can *prove* the distinction reports `'no-text-layer'`;
-today PDF (no page yielded text and one paints an image), `.docx` (the document holds a picture) and
-HTML (the markup has an `<img>`). A blank page is `no-text-content`, not a scan. Where a handler
-cannot tell the two apart — `.doc`, whose parser reports text or nothing and nothing about the rest —
-**neither value is reported**, and the absence means exactly that: we cannot say.
+today PDF (its first page paints an image) and `.docx` (the document references a picture). Where a
+handler cannot prove EITHER — a multi-page PDF whose first page is blank, `.xlsx` and HTML, whose
+images live where these readers do not look, and `.doc`, whose parser reports text or nothing and
+nothing about the rest — **neither value is reported**, and that absence means exactly what it says:
+we cannot tell. Treat a missing `emptyReason` as "may be worth OCR", never as "empty".
 
 Password-protected **OOXML** files (`.docx`/`.xlsx`/`.pptx`, which Office wraps in an OLE container)
 and password-protected PDFs are `skipped` with reason `password-protected`. Legacy `.doc` files
