@@ -72,6 +72,13 @@ const result = await extractAttachment(input, {
 })
 ```
 
+`reason` is a **code, not a sentence** — one of `too-large`, `expands-too-large`,
+`unsupported-format`, `unrecognized`, `password-protected`, `unsupported-zip-feature`, `malformed`,
+`wrong-document-shape`, `timed-out` or `internal`. It is set on every `skipped` and `failed` result
+and on no `extracted` one, so it is safe to branch on. Two are worth knowing: `timed-out` is the only
+failure worth retrying, and `internal` means one of our invariants tripped or a pinned dependency
+moved — not a bad file, so retrying or re-requesting the attachment cannot help.
+
 When a document yields no text at all, `extraction` is omitted and `emptyReason` says why:
 `'no-text-layer'` means the document has content but none of it is text — a scan, a photographed
 page — so OCR is the next step, while `'no-text-content'` means it was read and genuinely holds

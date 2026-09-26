@@ -904,7 +904,7 @@ describe('docx — the cap and the deadline stop the read', () => {
         const nested = '<w:p>'.repeat(300) + '</w:p>'.repeat(300)
         const r = await extract(nested)
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/XML nesting exceeds 256 elements/)
+        expect(r.reason).toBe('malformed')
     })
 })
 

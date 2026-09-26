@@ -448,7 +448,7 @@ describe('attachment — safety gates', () => {
         const r = await extractAttachment({ content, contentType: 'text/plain', filename: 'big.txt' })
         expect(r.status).toBe('skipped')
         expect(r.extraction).toBeUndefined()
-        expect(r.reason).toContain(`${MAX_INPUT_BYTES + 1}`)
+        expect(r.reason).toBe('too-large')
     })
 
     // A handler that succeeds but yields no text is a terminal, valid outcome: extracted, no extraction.
@@ -578,7 +578,10 @@ describe('attachment — pdf handler', () => {
                 truncated: false,
             })
             fail = true
-            expect(await extract(input)).toMatchObject({ status: 'failed', reason: 'page failed' })
+            // An error escaping a third-party parser is the file's fault by default, which is what
+            // 'malformed' says. The point of the case is that teardown rejecting afterwards does not
+            // replace it, so the reason belongs to the parse and not to the cleanup.
+            expect(await extract(input)).toMatchObject({ status: 'failed', reason: 'malformed' })
         } finally {
             vi.doUnmock('unpdf')
             vi.resetModules()
@@ -834,7 +837,7 @@ describe('attachment — xlsx handler', () => {
             contentType: XLSX_TYPE,
         })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/shared-string index exceeds/i)
+        expect(r.reason).toBe('malformed')
     })
 
     it('fails explicitly when cells reference a missing shared-string table', async () => {
@@ -850,7 +853,7 @@ describe('attachment — xlsx handler', () => {
         })
         expect(r.status).toBe('failed')
         expect(r.extraction).toBeUndefined()
-        expect(r.reason).toMatch(/missing shared-string table/i)
+        expect(r.reason).toBe('malformed')
     })
 
     // A formula cell must extract its computed VALUE, not the "=SUM(...)" formula string.
@@ -1069,7 +1072,7 @@ describe('attachment — xlsx handler', () => {
             contentType: XLSX_TYPE,
         })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/XML nesting exceeds 256 elements/)
+        expect(r.reason).toBe('malformed')
     })
 
     it('rejects an incomplete shared-string table instead of silently dropping later cells', async () => {
@@ -1088,7 +1091,7 @@ describe('attachment — xlsx handler', () => {
             contentType: XLSX_TYPE,
         })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/unclosed XLSX control XML/)
+        expect(r.reason).toBe('malformed')
     })
 
     it('rejects an incomplete styles table at natural EOF', async () => {
@@ -1106,7 +1109,7 @@ describe('attachment — xlsx handler', () => {
             contentType: XLSX_TYPE,
         })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/unclosed XLSX control XML/)
+        expect(r.reason).toBe('malformed')
     })
 
     // A workbook with only empty sheets parses fine but yields no rows: extracted, no extraction.
@@ -1166,7 +1169,7 @@ describe('attachment — xlsx handler', () => {
         expect(detectRoute(input).kind).toBe('xlsx')
         const r = await extractAttachment(input)
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/malformed zip/i)
+        expect(r.reason).toBe('malformed')
     })
 })
 
@@ -1178,6 +1181,63 @@ describe('attachment — xlsx handler', () => {
 // no way to tell "this page is a scan, send it to OCR" from "this file is empty". These pin the
 // distinction, and pin that it is drawn from PROOF rather than guessed: only a format that can show
 // it holds non-text content may say 'no-text-layer'.
+// `reason` is a CODE, not prose. The strings it replaced interpolated values the caller already
+// had — its own byte count, its own content type, constants this package exports — so they read as
+// diagnostics while carrying nothing to branch on without a regex. These pin the contract itself:
+// which values exist, and that the field appears on exactly the results that were refused.
+describe('attachment — reason is a code', () => {
+    const REASONS = new Set([
+        'too-large',
+        'expands-too-large',
+        'unsupported-format',
+        'unrecognized',
+        'password-protected',
+        'unsupported-zip-feature',
+        'malformed',
+        'wrong-document-shape',
+        'timed-out',
+        'internal',
+    ])
+
+    it('never sets a reason on a successful extraction', async () => {
+        for (const [content, filename] of [
+            [fixture('sample.pdf'), 'a.pdf'],
+            [fixture('sample.xlsx'), 'a.xlsx'],
+            [Buffer.from('hello'), 'a.txt'],
+            [Buffer.alloc(0), 'empty.txt'], // extracted-but-empty still carries no REFUSAL reason
+        ] as [Buffer, string][]) {
+            const r = await extractAttachment({ content, filename })
+            expect(r.status).toBe('extracted')
+            expect(r.reason).toBeUndefined()
+        }
+    })
+
+    // Every refusal must be branchable. A free-text reason could not promise this, which is why the
+    // suite used to match it with two dozen regexes.
+    it('sets a known code on every refusal', async () => {
+        const refusals = [
+            { content: Buffer.alloc(MAX_INPUT_BYTES + 1, 0x41), filename: 'big.txt' },
+            { content: Buffer.from([0x89, 0x50, 0x4e, 0x47]), contentType: 'image/png', filename: 'a.png' },
+            { content: Buffer.from([0x00, 0x01, 0x02, 0x03]), filename: 'mystery.bin' },
+            { content: Buffer.from('PK\x03\x04 not really a zip'), filename: 'broken.docx', contentType: DOCX_TYPE },
+        ]
+        for (const input of refusals) {
+            const r = await extractAttachment(input)
+            expect(r.status).not.toBe('extracted')
+            expect(REASONS.has(r.reason as string)).toBe(true)
+        }
+    })
+
+    // The distinction that earns 'internal' its place: these are OUR invariant tripping or a pinned
+    // dependency moving, not a bad file. A caller seeing a spike should page someone, and retrying
+    // or re-requesting the attachment cannot help — the opposite of every other failure here.
+    it('separates our own failures from the file being at fault', async () => {
+        const ours = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
+        expect(ours.status).toBe('extracted') // baseline: nothing internal about a good workbook
+        expect(REASONS.has('internal')).toBe(true)
+    })
+})
+
 describe('attachment — why an extraction is empty', () => {
     it('reports no-text-layer for a PDF whose pages carry no text', async () => {
         const r = await extractAttachment({ content: fixture('blank.pdf'), filename: 'scan.pdf' })
@@ -1216,7 +1276,7 @@ describe('attachment — why an extraction is empty', () => {
         const content = Buffer.concat([ole, Buffer.alloc(400), marker, Buffer.alloc(2_048)])
         const r = await extractAttachment({ content, filename: 'locked.docx' })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toContain('password-protected')
+        expect(r.reason).toBe('password-protected')
     })
 
     // The marker is what earns the label; an OLE file without it is still a legacy binary we may or
@@ -1525,7 +1585,7 @@ describe('attachment — edge cases (regression)', () => {
             await vi.advanceTimersByTimeAsync(HANDLER_TIMEOUT_MS + 10)
             const r = await pending
             expect(r.status).toBe('failed')
-            expect(r.reason).toMatch(new RegExp(`handler exceeded ${HANDLER_TIMEOUT_MS}ms`))
+            expect(r.reason).toBe('timed-out')
             expect(r.extraction).toBeUndefined()
         } finally {
             vi.useRealTimers()
@@ -1699,7 +1759,10 @@ describe('attachextract — OOXML decompression preflight', () => {
         })
         try {
             const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
-            expect(r).toEqual({ status: 'failed', reason: 'inflate setup failed' })
+            // Labeled rather than thrown, which is the whole assertion. It lands on 'malformed'
+            // because an unrecognized throw is attributed to the bytes — see failureReason, and the
+            // note there that a genuine bug of ours reaching here is reported the same way.
+            expect(r).toEqual({ status: 'failed', reason: 'malformed' })
         } finally {
             createInflate.mockRestore()
         }
@@ -1754,7 +1817,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         const bomb = craftOoxmlZip(overCapContent())
         const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toMatch(/decompress/i)
+        expect(r.reason).toBe('expands-too-large')
         expect(r.extraction).toBeUndefined()
     })
 
@@ -1775,7 +1838,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         const bomb = craftOoxmlZip(overCapContent(), { declaredUncompressed: 100 })
         const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toMatch(/decompress/i)
+        expect(r.reason).toBe('expands-too-large')
         expect(r.extraction).toBeUndefined()
     })
 
@@ -1791,7 +1854,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         ]) {
             const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
             expect(r.status).toBe('skipped')
-            expect(r.reason).toMatch(/zip64|out-of-range/i)
+            expect(r.reason).toBe('unsupported-zip-feature')
             expect(r.extraction).toBeUndefined()
         }
     })
@@ -1807,7 +1870,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         for (const [, bomb] of cases) {
             const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
             expect(r.status).toBe('failed')
-            expect(r.reason).toMatch(/malformed zip/i)
+            expect(r.reason).toBe('malformed')
             expect(r.extraction).toBeUndefined()
         }
     })
@@ -1850,7 +1913,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         // the earlier tiny CD and wave it through to a parser that would inflate the bomb.
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toMatch(/decompress/i)
+        expect(r.reason).toBe('expands-too-large')
     })
 
     // AGREEMENT INVARIANT 1 — the central directory must end exactly where the EOCD begins.
@@ -1886,7 +1949,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         // So measuring the decoy at the raw cdOffset would approve a bomb. Reject the layout instead.
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/does not end at the end-of-central-directory/i)
+        expect(r.reason).toBe('malformed')
         expect(r.extraction).toBeUndefined()
     })
 
@@ -1918,7 +1981,7 @@ describe('attachextract — OOXML decompression preflight', () => {
 
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/more records than it declares/i)
+        expect(r.reason).toBe('malformed')
         expect(r.extraction).toBeUndefined()
     })
 
@@ -1950,7 +2013,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         const file = Buffer.concat([junk, eocd(1, junk.length, 0)]) // 0 + junk.length === eocdPos
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/truncated or misaligned central directory/i)
+        expect(r.reason).toBe('malformed')
     })
 
     // When the central directory cannot be walked, ooxmlKind falls back to scanning raw bytes for a
@@ -1987,7 +2050,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         const bomb = craftOoxmlZip(buf('<workbook/>'), { entryCompSize: 0x0ffffff0 }) // huge, but not the ZIP64 sentinel
         const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/runs past end of file/i)
+        expect(r.reason).toBe('malformed')
     })
 
     // Distinct from "too big": the stream cannot be read at all. Fail closed rather than treat an
@@ -1999,14 +2062,14 @@ describe('attachextract — OOXML decompression preflight', () => {
         const file = Buffer.concat([local, cd, eocd(1, cd.length, local.length)])
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/unreadable compressed data/i)
+        expect(r.reason).toBe('malformed')
     })
 
     it('fails closed on a compression method it cannot measure', async () => {
         const zip = craftOoxmlZip(buf('<workbook/>'), { method: 12 }) // 12 = bzip2; we only measure store/deflate
         const r = await extractAttachment({ content: zip, contentType: XLSX_TYPE })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toMatch(/unsupported compression method 12/i)
+        expect(r.reason).toBe('unsupported-zip-feature')
     })
 
     // The budget is ARCHIVE-wide, not per-entry. A stored entry cannot exceed the cap on its own
@@ -2021,7 +2084,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         const file = Buffer.concat([l1, l2, c1, c2, eocd(2, c1.length + c2.length, l1.length + l2.length)])
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toMatch(/decompresses to over/i)
+        expect(r.reason).toBe('expands-too-large')
     })
 
     // An OOXML-shaped zip with NEITHER root part (a .pptx, a .jar, a plain archive) is not something
@@ -3150,7 +3213,7 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         const r = await extractAttachment({ content, contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
         expect(r.extraction).toBeUndefined()
-        expect(r.reason).toMatch(/no worksheet parts could be identified/i)
+        expect(r.reason).toBe('wrong-document-shape')
     })
 
     it('resolves escaped OPC worksheet paths without decoding them away from the ZIP item', async () => {
@@ -3332,7 +3395,7 @@ describe('attachment — the rebuild cannot amplify what the budget measured', (
 
             const r = await extractAttachment({ content, contentType: XLSX_TYPE })
             expect(r.status).toBe('failed')
-            expect(r.reason).toMatch(/duplicate control part xl\/sharedStrings\.xml/i)
+            expect(r.reason).toBe('malformed')
         }
     )
 
@@ -3694,7 +3757,7 @@ describe('attachment — xlsx lost-worksheet backstop', () => {
         vi.resetModules()
 
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/yielded 2 of 3 worksheets/)
+        expect(r.reason).toBe('internal')
     })
 
     it('fails fast when the pinned ExcelJS streaming hooks are unavailable', async () => {
@@ -3718,7 +3781,7 @@ describe('attachment — xlsx lost-worksheet backstop', () => {
             const { extractAttachment: extract } = await import('../attachment')
             const r = await extract({ content, contentType: XLSX_TYPE })
             expect(r.status).toBe('failed')
-            expect(r.reason).toMatch(/no _parseStyles; expected the 4\.4\.0 internals/)
+            expect(r.reason).toBe('internal')
         } finally {
             vi.doUnmock('exceljs')
             vi.resetModules()
@@ -3845,7 +3908,7 @@ describe('attachment — xlsx archive rewrite limits', () => {
             // 65533 real entries + two injected control parts = 65535 = 0xffff.
             const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2), contentType: XLSX_TYPE })
             expect(r.status).toBe('failed')
-            expect(r.reason).toMatch(/0xffff count sentinel/)
+            expect(r.reason).toBe('unsupported-zip-feature')
             expect(r.reason).not.toMatch(/central directory could not be read/)
         },
         BOUNDARY_TIMEOUT_MS

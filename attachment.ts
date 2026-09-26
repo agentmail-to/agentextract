@@ -82,7 +82,7 @@ const MAX_XML_NESTING_DEPTH = 256
 
 const assertXmlDepth = (depth: number): void => {
     if (depth > MAX_XML_NESTING_DEPTH) {
-        throw new Error(`XML nesting exceeds ${MAX_XML_NESTING_DEPTH} elements`)
+        throw new ExtractionFailure('malformed')
     }
 }
 
@@ -120,6 +120,29 @@ const DETECT_SAMPLE_BYTES = 64 * 1024
 
 // The two refusals differ by whose fault it is, so a caller can branch on them: `skipped` is a file
 // we chose not to read, `failed` is one we couldn't. Never collapse them.
+// WHY a file was refused, as a value rather than a sentence. `reason` used to be free text that
+// interpolated numbers the caller already had — its own byte count, its own content type, constants
+// this module exports — so it read like a diagnostic while carrying nothing a consumer could branch
+// on without a regex. These are what a consumer actually needs to tell apart, and each one maps to a
+// different thing to DO about it.
+export type ExtractionReason =
+    // --- skipped: intact, and declined ---
+    | 'too-large' // over MAX_INPUT_BYTES, before any decode or parse
+    | 'expands-too-large' // over MAX_UNCOMPRESSED_BYTES once actually inflated; also the zip-bomb signal
+    | 'unsupported-format' // a type we recognize and do not handle
+    | 'unrecognized' // nothing — type, extension or bytes — identified it
+    | 'password-protected' // readable bytes, locked content: ask the sender, do not retry
+    | 'unsupported-zip-feature' // ZIP64, or a compression method this reader does not implement
+    // --- failed: we could not read it ---
+    | 'malformed' // the bytes are broken and a parser rejected them. Never retryable
+    | 'wrong-document-shape' // parses, but is not the document it claims to be (no w:body, no main part)
+    | 'timed-out' // ran out of time. The ONLY retryable failure here, which is the point of naming it
+    // --- failed: our fault, not the file's ---
+    // An invariant of ours tripped, or a pinned dependency moved under us. Worth separating because
+    // a file-shaped failure is routine and this is not: a spike of these should page someone rather
+    // than feed a retry loop, and no amount of retrying or re-sending the attachment will help.
+    | 'internal'
+
 export type ExtractionStatus =
     | 'extracted' // handler ran; `extraction` holds the text, or is omitted when there was none
     | 'skipped' // intact, but declined: over MAX_INPUT_BYTES or the decompression budget, unsupported, unrecognized
@@ -163,7 +186,7 @@ export type EmptyReason =
 export interface ExtractionResult {
     status: ExtractionStatus
     extraction?: string // omitted entirely (never '') when the handler produced no text
-    reason?: string // set on skipped / failed
+    reason?: ExtractionReason // set on skipped / failed, and never on extracted
     // Whether the document continues past `extraction`. Set on `extracted` only — skipped/failed
     // have no text to have cut. Independent of `trailer`, so a consumer never parses the text for it.
     truncated?: boolean
@@ -504,12 +527,12 @@ const docxHandler: Handler = {
         // archive whose directory NAMES word/document.xml. Costs nothing, and keeps neither of those
         // proofs load-bearing.
         const entries = zipEntries(content)
-        if (!entries) throw new Error('docx central directory could not be read for streaming')
+        if (!entries) throw new ExtractionFailure('malformed')
         // JSZip (and therefore Mammoth's previous reader) resolves duplicate names to the final
         // central-directory record. Preserve that compatibility rather than silently switching the
         // extracted document when an ambiguous archive reaches this lower-level ZIP reader.
         const part = entries.findLast((entry) => opcKey(entry.name) === DOCX_MAIN_PART)
-        if (!part) throw new Error(`docx archive has no ${DOCX_MAIN_PART} entry`)
+        if (!part) throw new ExtractionFailure('wrong-document-shape')
 
         // Decode ACROSS inflate chunks, not per chunk: a 16 KB boundary lands mid-sequence in any
         // document with a non-ASCII character, and chunk.toString('utf8') would turn that one
@@ -563,7 +586,7 @@ const docxHandler: Handler = {
         // part can contain parseable paragraph text, but it is still not a Word document; catching
         // this assertion as though parsing stopped midway would mislabel the foreign content as a
         // useful truncated prefix.
-        if (body.sawContent === false) throw new Error('docx main part has no w:body element')
+        if (body.sawContent === false) throw new ExtractionFailure('wrong-document-shape')
 
         // Concatenated, NOT joined with a separator: the reader already terminates every paragraph
         // with one, so a part's text ends where the next can start. Adding another here is what put
@@ -834,7 +857,7 @@ const xlsxHandler: Handler = {
         const rewritten = await reorderForStreaming(content)
         // Fail closed: the budget measured the central directory, but unzipper inflates what its
         // LOCAL-header walk finds, so the budget binds this path only through the rewritten archive.
-        if (!rewritten.ok) throw new Error(rewritten.reason)
+        if (!rewritten.ok) throw new ExtractionFailure(rewritten.reason)
         // The workbook's worksheets, in tab order — see SHEET IDENTITY. Both the names below and the
         // backstop's count read off this rather than off the archive or the reader.
         const { content: ordered, sheets: resolved } = rewritten
@@ -854,7 +877,7 @@ const xlsxHandler: Handler = {
         const hook = <K extends keyof ExcelJsInternalReader>(name: K): NonNullable<ExcelJsInternalReader[K]> => {
             const method = internal[name]
             if (typeof method !== 'function') {
-                throw new Error(`exceljs stream reader has no ${String(name)}; expected the 4.4.0 internals`)
+                throw new ExtractionFailure('internal')
             }
             return method.bind(internal) as NonNullable<ExcelJsInternalReader[K]>
         }
@@ -878,7 +901,7 @@ const xlsxHandler: Handler = {
                 },
                 flush(done) {
                     if (!scan.complete(allowRootless)) {
-                        done(new Error('unclosed XLSX control XML'))
+                        done(new ExtractionFailure('malformed'))
                         return
                     }
                     done()
@@ -912,7 +935,7 @@ const xlsxHandler: Handler = {
             if (stopped) return
             // Reached only at NATURAL EOF. Abandonment for the cap/deadline skips this assertion,
             // keeping intentional partial reads labeled `truncated` rather than parse failures.
-            if (scan && !scan.complete()) throw new Error('unclosed worksheet XML')
+            if (scan && !scan.complete()) throw new ExtractionFailure('malformed')
         }
         const parseRels = hook('_parseRels')
         internal._parseRels = (entry) => parseRels(decodeEntry(entry, false))
@@ -1092,10 +1115,10 @@ const xlsxHandler: Handler = {
                         const index = cell.sharedIndexSign * cell.sharedIndexValue
                         const sharedStrings = internal.sharedStrings ?? []
                         if (cell.sharedIndexState === 'overflow') {
-                            throw new Error('xlsx shared-string index exceeds the supported range')
+                            throw new ExtractionFailure('malformed')
                         }
                         if (hasIndex && (index < 0 || index >= sharedStrings.length)) {
-                            throw new Error('xlsx cell references a missing shared-string table')
+                            throw new ExtractionFailure('malformed')
                         }
                         if (hasIndex && sharedStrings[index] == null) {
                             const position = excelCellPosition(cell.address)
@@ -1239,7 +1262,7 @@ const xlsxHandler: Handler = {
         // a worksheet the rebuild did not lay out — which would have silently shifted every name
         // above. Unreachable by construction, and cheap enough not to leave that proof load-bearing.
         if (!truncated && seen !== resolved.length) {
-            throw new Error(`xlsx reader yielded ${seen} of ${resolved.length} worksheets`)
+            throw new ExtractionFailure('internal')
         }
 
         return { text: sheets.join(BLOCK_SEPARATOR), truncated }
@@ -1420,10 +1443,10 @@ const EOCD_BYTES = 22
 // `ok` = safe to hand to the parser. Otherwise `status` is which kind of no, since the two differ to
 // a caller: `failed` = the bytes are broken (the parser would have thrown anyway), `skipped` = intact
 // but we decline — over budget, or a variant we don't chase. Mirrors the MAX_INPUT_BYTES precedent.
-type DecompressionCheck = { ok: true } | { ok: false; status: 'failed' | 'skipped'; reason: string }
+type DecompressionCheck = { ok: true } | { ok: false; status: 'failed' | 'skipped'; reason: ExtractionReason }
 
-const corrupt = (reason: string): DecompressionCheck => ({ ok: false, status: 'failed', reason })
-const declined = (reason: string): DecompressionCheck => ({ ok: false, status: 'skipped', reason })
+const corrupt = (reason: ExtractionReason = 'malformed'): DecompressionCheck => ({ ok: false, status: 'failed', reason })
+const declined = (reason: ExtractionReason): DecompressionCheck => ({ ok: false, status: 'skipped', reason })
 
 // Inflate one raw-deflate region onto `runningTotal`, aborting the moment it would exceed `cap`.
 // Returns the new total, or a sentinel — -1 = over budget, -2 = corrupt stream. Byte counts are
@@ -1552,7 +1575,7 @@ const zipEntries = (buf: Buffer): ZipEntry[] | undefined => {
 // neither rotted when the reader changed. Every real archive satisfies them (73 measured, 0 failures).
 const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<DecompressionCheck> => {
     const eocd = findEocd(buf)
-    if (eocd < 0) return corrupt('malformed zip: no end-of-central-directory record')
+    if (eocd < 0) return corrupt()
 
     const entries = buf.readUInt16LE(eocd + 10)
     const cdSize = buf.readUInt32LE(eocd + 12)
@@ -1560,7 +1583,7 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
     // ZIP64 / out-of-range sentinels: the true values live in a ZIP64 record we don't chase. Treat as
     // over-budget rather than trust the classic field or crash on the sentinel.
     if (entries === 0xffff || cdSize === 0xffffffff || cdOffset === 0xffffffff)
-        return declined('zip declares a ZIP64 / out-of-range size')
+        return declined('unsupported-zip-feature')
 
     // Invariant 1: the directory must END exactly where the EOCD begins.
     // Written when .docx went through jszip, which rebases every offset by a positive
@@ -1573,7 +1596,7 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
     // Deliberate: that gap is also how a self-extracting archive legitimately carries its stub, so
     // this calls real files malformed. Accepted — an email attachment has no business being one.
     if (cdOffset + cdSize !== eocd)
-        return corrupt('malformed zip: central directory does not end at the end-of-central-directory record')
+        return corrupt()
 
     let total = 0
     let p = cdOffset
@@ -1581,31 +1604,31 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
         // Guard: a missing/misaligned header means the offset lied. Fail closed — a partial walk must
         // never silently return the total it accumulated so far.
         if (p + CENTRAL_HEADER_BYTES > buf.length || buf.readUInt32LE(p) !== CD_SIG)
-            return corrupt('malformed zip: truncated or misaligned central directory')
+            return corrupt()
         const method = buf.readUInt16LE(p + 10)
         const compSize = buf.readUInt32LE(p + 20)
         const localOffset = buf.readUInt32LE(p + 42)
         if (compSize === 0xffffffff || localOffset === 0xffffffff)
-            return declined('zip declares a ZIP64 / out-of-range size')
+            return declined('unsupported-zip-feature')
         // Read the local header's own name/extra lengths — they can differ from the central copy, and
         // they're what fixes where this entry's compressed bytes actually begin.
         if (localOffset + LOCAL_HEADER_BYTES > buf.length || buf.readUInt32LE(localOffset) !== LOCAL_SIG)
-            return corrupt('malformed zip: bad local header offset')
+            return corrupt()
         const dataStart = localOffset + LOCAL_HEADER_BYTES + buf.readUInt16LE(localOffset + 26) + buf.readUInt16LE(localOffset + 28)
         const comp = buf.subarray(dataStart, dataStart + compSize)
         if (comp.length < compSize)
-            return corrupt('malformed zip: compressed data runs past end of file')
+            return corrupt()
 
         if (method === 0) {
             total += comp.length // stored (no compression): output === input
         } else if (method === 8) {
             total = await inflateCounting(comp, total, cap)
-            if (total === -1) return declined(`decompresses to over ${cap} bytes`)
-            if (total === -2) return corrupt('malformed zip: unreadable compressed data')
+            if (total === -1) return declined('expands-too-large')
+            if (total === -2) return corrupt()
         } else {
-            return declined(`zip uses unsupported compression method ${method}`)
+            return declined('unsupported-zip-feature')
         }
-        if (total > cap) return declined(`decompresses to over ${cap} bytes`)
+        if (total > cap) return declined('expands-too-large')
         p += CENTRAL_HEADER_BYTES + buf.readUInt16LE(p + 28) + buf.readUInt16LE(p + 30) + buf.readUInt16LE(p + 32)
     }
     // Invariant 2: walking exactly `entries` records must land exactly on the EOCD.
@@ -1620,7 +1643,7 @@ const checkDecompressionBudget = async (buf: Buffer, cap: number): Promise<Decom
     // handler inflates one of those entries and the .xlsx preflight re-emits all of them; neither can
     // reach bytes this function did not measure.
     if (p !== eocd)
-        return corrupt('malformed zip: central directory holds more records than it declares')
+        return corrupt()
     return { ok: true }
 }
 
@@ -2108,7 +2131,7 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
     if (!workbookXml || !relsXml) {
         const fallback = await metadataFallbackWorksheets(entries, relsXml, contentTypesXml)
         if (fallback.length === 0) {
-            throw new Error('xlsx metadata exceeded the resolver cap and no worksheet parts could be identified')
+            throw new ExtractionFailure('wrong-document-shape')
         }
         return fallback
     }
@@ -2251,13 +2274,13 @@ const archiveWorksheets = (entries: ZipEntry[]): WorkbookSheet[] =>
 // than falling back to the original bytes (see DECOMPRESSION BUDGET), and says WHICH refusal: a
 // directory we could not read and a rewrite we declined to produce are different facts, and only the
 // first is unreachable — the entry-count bail below has a test driving it.
-type Reorder = { ok: true; content: Buffer; sheets: WorkbookSheet[] } | { ok: false; reason: string }
+type Reorder = { ok: true; content: Buffer; sheets: WorkbookSheet[] } | { ok: false; reason: ExtractionReason }
 
 const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     const entries = zipEntries(buf)
     // Unreachable: every zipEntries bail is also a budget rejection except a name length overrunning
     // the buffer, which Invariant 2 catches. Failing closed keeps that from being load-bearing.
-    if (!entries) return { ok: false, reason: 'xlsx central directory could not be read for streaming' }
+    if (!entries) return { ok: false, reason: 'malformed' }
 
     // A ZIP may carry the same OPC part more than once, but there is no well-defined winner. Passing
     // duplicate controls through is worse than refusing them: ExcelJS consumes every occurrence, so
@@ -2269,10 +2292,9 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
         const folded = opcKey(entry.name)
         if (folded === undefined) continue
         if (!XLSX_READER_CONTROL_PARTS.has(folded)) continue
-        if (seenControls.has(folded)) {
-            const canonical = XLSX_CANONICAL_CONTROL_PARTS.get(folded) ?? entry.name
-            return { ok: false, reason: `xlsx contains duplicate control part ${canonical}` }
-        }
+        // Two records claiming the same control part: the reader would take one and the resolver the
+        // other, so which sheet names come out would depend on zip order.
+        if (seenControls.has(folded)) return { ok: false, reason: 'malformed' }
         seenControls.add(folded)
     }
     // OPC part names compare ASCII-case-insensitively; exceljs's streaming dispatch does not. Give
@@ -2355,7 +2377,7 @@ const reorderForStreaming = async (buf: Buffer): Promise<Reorder> => {
     // instead refused archives whose rewrite lands well under the sentinel, since the third group
     // drops entries — the count that mattered was never the one being checked.
     if (ordered.length >= 0xffff) {
-        return { ok: false, reason: `xlsx would rewrite to ${ordered.length} entries, at the 0xffff count sentinel` }
+        return { ok: false, reason: 'unsupported-zip-feature' }
     }
 
     const locals: Buffer[] = []
@@ -3394,6 +3416,24 @@ export const detectRoute = (input: AttachmentInput): { kind?: HandlerKind; route
 /////////////////////////////////////////////////////////////
 // SAFETY
 
+// Handlers signal WHY by throwing this; the entry point reads `code` off it instead of turning a
+// message into a reason. Anything else that escapes a parser is the file's fault by default, which
+// is the same assumption the old free-text path made — it just says so now.
+class ExtractionFailure extends Error {
+    constructor(readonly code: ExtractionReason) {
+        super(code)
+        this.name = 'ExtractionFailure'
+    }
+}
+
+// KNOWN COST of reasons being codes: an unrecognized throw is attributed to the bytes, so a genuine
+// bug of ours that escapes here is reported as 'malformed' and blames the file. The free-text reason
+// this replaced carried the message, which named it. Accepted rather than hidden — our own invariant
+// sites throw ExtractionFailure('internal') explicitly, and the only losses are the throws we did
+// not anticipate, which were never something a caller could branch on either way.
+const failureReason = (error: unknown): ExtractionReason =>
+    error instanceof ExtractionFailure ? error.code : error instanceof HandlerTimeoutError ? 'timed-out' : 'malformed'
+
 class HandlerTimeoutError extends Error {
     constructor(ms: number) {
         super(`handler exceeded ${ms}ms`)
@@ -3416,9 +3456,6 @@ const withTimeout = <T>(promise: Promise<T>, ms: number): Promise<T> =>
             }
         )
     })
-
-// JS lets you throw non-Errors, so normalize whatever came out.
-const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
 /////////////////////////////////////////////////////////////
 // ENTRY POINT — every step in order, each risky one inside its own safety net.
@@ -3452,7 +3489,7 @@ export const extractAttachment = async (
 
     // Size gate, before any decode or parse.
     if (byteSize > MAX_INPUT_BYTES) {
-        return { status: 'skipped', reason: `${byteSize} bytes exceeds ${MAX_INPUT_BYTES}` }
+        return { status: 'skipped', reason: 'too-large' }
     }
 
     const { type, charset: charsetHint } = parseContentType(input.contentType)
@@ -3465,9 +3502,9 @@ export const extractAttachment = async (
         // and unhelpful about the file, and a caller who knows a document is merely locked can ask
         // its sender for it rather than treating the attachment as unreadable junk.
         if (looksEncryptedOffice(input.content)) {
-            return { status: 'skipped', reason: 'password-protected Office file' }
+            return { status: 'skipped', reason: 'password-protected' }
         }
-        return { status: 'skipped', reason: type ? `unsupported type ${type}` : 'unrecognized attachment' }
+        return { status: 'skipped', reason: type ? 'unsupported-format' : 'unrecognized' }
     }
 
     const maxOutputChars = resolveCap(options.maxOutputChars)
@@ -3532,6 +3569,6 @@ export const extractAttachment = async (
     } catch (error) {
         // The bytes are attacker-controlled, so a throw or timeout is an expected event, not a bug:
         // label it and move on rather than crashing the caller.
-        return { status: 'failed', reason: errorMessage(error) }
+        return { status: 'failed', reason: failureReason(error) }
     }
 }
