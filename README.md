@@ -86,7 +86,8 @@ nothing. Exactly one of `extraction` and `emptyReason` is present whenever `trun
 Both are claims about the whole document, so neither is reported for a truncated read: a result with
 no text, no `emptyReason` and `truncated: true` means we stopped before finding text and cannot say
 whether there is any. Only a handler that can *prove* the distinction reports `'no-text-layer'`;
-today that is PDF, where every page was read and none yielded text. Password-protected files —
+today that is PDF, where no page yielded text and at least one paints an image — a blank page is
+`no-text-content`, not a scan. Password-protected files —
 Office or PDF — are `skipped` with reason `password-protected`, not reported as unreadable.
 
 `trailer` is appended to `extraction` only when the text was actually cut, and sits **outside** cap

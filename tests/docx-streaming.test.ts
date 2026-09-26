@@ -191,6 +191,65 @@ describe('docx — text outside word/document.xml', () => {
         return vi.spyOn(Date, 'now').mockImplementation(() => (++calls < n ? base : base + HANDLER_TIMEOUT_MS + 1))
     }
 
+    // REGRESSION, and the one the first fix missed: a part that breaks AFTER producing text does not
+    // throw — readPart returns it with a flag — so it landed on `truncated`, which ends the walk.
+    // Half-readable is the COMMON shape of a broken part, so this was the same defect as the throw
+    // case, reached by the path the first fix did not cover. `partFailed` now comes back from
+    // readPart too, and only running out of room or time stops the walk.
+    it('keeps reading later parts after one breaks partway through its text', async () => {
+        const r = await extractParts(text('Body.'), {
+            // Well-formed long enough to emit a paragraph, then truncated mid-element.
+            'word/footnotes.xml':
+                `<?xml version="1.0"?><w:footnotes ${NS}><w:footnote w:id="2">${text('Note text.')}` +
+                '<w:p><w:r><w:t>unterminated',
+            'word/header1.xml': auxPart('hdr', text('Header survives.')),
+        })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('Note text.') // the readable prefix is kept
+        expect(r.extraction).toContain('Header survives.') // and the walk went on
+        expect(r.truncated).toBe(true)
+    })
+
+    // REGRESSION: `remaining <= 0` was treated as "there is more to lose", so a body of exactly
+    // maxOutputChars got a "continues past this point" trailer over parts holding nothing. Word
+    // writes empty headers routinely, so this was the ordinary case rather than a contrived one.
+    it('does not report truncation when the parts left over are empty', async () => {
+        const body = text('Body.')
+        const full = 'Body.\n\n'.length
+        const r = await extractParts(body, {
+            'word/header1.xml': auxPart('hdr', ''), // an empty header, as Word writes
+            'word/footnotes.xml': auxPart('footnotes', '<w:footnote w:id="-1" w:type="separator"/>'),
+        }, { maxOutputChars: full })
+        expect(r.extraction).toBe('Body.\n\n')
+        expect(r.truncated).toBe(false)
+    })
+
+    // The third structural note type in ECMA-376's ST_FtnEdn. Word writes it alongside the other
+    // two, and treating it as content emits the same stray blank paragraph the separator skip fixed.
+    it('skips a continuationNotice note', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/footnotes.xml': auxPart(
+                'footnotes',
+                `<w:footnote w:id="1" w:type="continuationNotice">${text('NOTICE')}</w:footnote>` +
+                    `<w:footnote w:id="2">${text('Real note.')}</w:footnote>`
+            ),
+        })
+        expect(r.extraction).toBe('Body.\n\nReal note.\n\n')
+        expect(r.extraction).not.toContain('NOTICE')
+    })
+
+    // Which header survives a cap that runs out partway through must be a property of the DOCUMENT,
+    // not of the order the producer happened to write the archive in. Numeric-aware, so header10
+    // does not sort before header2.
+    it('reads headers in numeric order regardless of archive order', async () => {
+        const r = await extractParts(text('Body.'), {
+            'word/header10.xml': auxPart('hdr', text('TENTH')),
+            'word/header2.xml': auxPart('hdr', text('SECOND')),
+            'word/header1.xml': auxPart('hdr', text('FIRST')),
+        })
+        expect(r.extraction).toBe('Body.\n\nFIRST\n\nSECOND\n\nTENTH\n\n')
+    })
+
     // REGRESSION: `continue` for empty text ran BEFORE the truncation flag was read, so a part the
     // deadline cut off before it emitted anything reported the document as complete. Expiring on
     // call 4 lands inside the footnote's own read, after the gate that would have stopped the walk.

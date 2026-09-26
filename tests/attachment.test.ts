@@ -1257,11 +1257,22 @@ describe('attachment — reason is a code', () => {
 })
 
 describe('attachment — why an extraction is empty', () => {
-    it('reports no-text-layer for a PDF whose pages carry no text', async () => {
-        const r = await extractAttachment({ content: fixture('blank.pdf'), filename: 'scan.pdf' })
+    // scan.pdf's only content is a painted image XObject and no text — the shape of a scanned page.
+    it('reports no-text-layer for a PDF whose only content is an image', async () => {
+        const r = await extractAttachment({ content: fixture('scan.pdf'), filename: 'scan.pdf' })
         expect(r.status).toBe('extracted')
         expect(r.extraction).toBeUndefined()
         expect(r.emptyReason).toBe('no-text-layer')
+    })
+
+    // REGRESSION: "no text on a page" was taken as proof of a scan, so a BLANK page said
+    // 'no-text-layer' and sent an empty document to OCR. A blank page has no text and no image, and
+    // pdf.js names its image operators, so the two are now told apart by asking rather than assuming.
+    it('reports no-text-content for a PDF whose pages are blank rather than scanned', async () => {
+        const r = await extractAttachment({ content: fixture('blank.pdf'), filename: 'blank.pdf' })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBeUndefined()
+        expect(r.emptyReason).toBe('no-text-content')
     })
 
     it('reports no-text-content for a zero-byte attachment', async () => {
@@ -1306,13 +1317,36 @@ describe('attachment — why an extraction is empty', () => {
 
     // A password-protected OOXML file is an OLE container, so routing saw OLE where it wanted PK and
     // called the file unrecognized — true of the bytes, and wrong about the file.
+    // A CFB directory entry as Office actually writes one: a fixed 128-byte record at a 128-byte
+    // boundary, holding the name, its byte length at +64 and the stream type at +66. Built properly
+    // because the detector matches the RECORD — a loose byte search declined any legacy .doc that
+    // merely mentioned the word, since .doc stores its text in the same UTF-16LE encoding.
+    const encryptedOfficeFile = () => {
+        const name = Buffer.from('EncryptedPackage', 'utf16le')
+        const entry = Buffer.alloc(128)
+        name.copy(entry, 0)
+        entry.writeUInt16LE(name.length + 2, 64) // byte length, terminator included
+        entry[66] = 2 // stream
+        const header = Buffer.alloc(512)
+        Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(header, 0)
+        return Buffer.concat([header, Buffer.alloc(128), entry, Buffer.alloc(256)])
+    }
+
     it('names a password-protected Office file rather than calling it unrecognized', async () => {
-        const ole = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
-        const marker = Buffer.from('EncryptedPackage', 'utf16le')
-        const content = Buffer.concat([ole, Buffer.alloc(400), marker, Buffer.alloc(2_048)])
-        const r = await extractAttachment({ content, filename: 'locked.docx' })
+        const r = await extractAttachment({ content: encryptedOfficeFile(), filename: 'locked.docx' })
         expect(r.status).toBe('skipped')
         expect(r.reason).toBe('password-protected')
+    })
+
+    // REGRESSION: the detector searched the head for the UTF-16LE name, and .doc stores body text in
+    // exactly that encoding — so a document ABOUT encrypted packages was declined as one.
+    it('does not call a .doc password-protected for merely containing the words', async () => {
+        const header = Buffer.alloc(512)
+        Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(header, 0)
+        const body = Buffer.from('Please see the EncryptedPackage spec.', 'utf16le')
+        const content = Buffer.concat([header, Buffer.alloc(96), body, Buffer.alloc(1_024)])
+        const r = await extractAttachment({ content, filename: 'notes.doc', contentType: 'application/msword' })
+        expect(r.reason).not.toBe('password-protected')
     })
 
     // The marker is what earns the label; an OLE file without it is still a legacy binary we may or
@@ -1327,12 +1361,59 @@ describe('attachment — why an extraction is empty', () => {
     // word-extractor, threw, and came back 'malformed', which the codes define as never retryable.
     // Whether we happen to have a handler says nothing about whether the content is ours to read.
     it('names a locked file even when its extension routes to a handler', async () => {
-        const ole = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1])
-        const marker = Buffer.from('EncryptedPackage', 'utf16le')
-        const content = Buffer.concat([ole, Buffer.alloc(400), marker, Buffer.alloc(2_048)])
+        const content = encryptedOfficeFile()
         const r = await extractAttachment({ content, filename: 'locked.doc', contentType: 'application/msword' })
         expect(r.status).toBe('skipped')
         expect(r.reason).toBe('password-protected')
+    })
+
+    // REGRESSION: the match was `name === 'PasswordException' || /password/i.test(message)`, so any
+    // parser error quoting a sheet name, field or tag containing the word relabelled a broken file
+    // as an intact locked one — skipped instead of failed, and "ask the sender" instead of "retry".
+    it('does not call a parse error password-protected for mentioning the word', async () => {
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => {
+                throw new Error('bad xref entry near field "Password"')
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content: buf('%PDF-1.4 broken'), contentType: 'application/pdf' })
+            expect(r.status).toBe('failed')
+            expect(r.reason).toBe('malformed')
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
+
+    // A parser that cannot be LOADED never ran, so the attachment is not what is broken. Reporting
+    // 'malformed' told a caller their file was bad and not to retry, when the truth is a deployment
+    // is missing a dependency — the one unexpected-throw class unambiguous enough to name.
+    //
+    // This raises the module-not-found error from inside the handler rather than from a failing
+    // import, because vitest's doMock does not propagate a throwing factory to the importer. So it
+    // pins the MAPPING (an ERR_MODULE_NOT_FOUND-shaped error becomes 'internal') and not the path
+    // that produces it; the origin is a one-line code check either way.
+    it('reports a module-not-found error as internal, not as a malformed file', async () => {
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => {
+                const error = new Error("Cannot find module 'pdfjs-dist'") as Error & { code?: string }
+                error.code = 'ERR_MODULE_NOT_FOUND'
+                throw error
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content: buf('%PDF-1.4 mock'), contentType: 'application/pdf' })
+            expect(r.status).toBe('failed')
+            expect(r.reason).toBe('internal')
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
     })
 
     // pdf.js refuses an encrypted document by throwing, so there is nothing to sniff — the error is

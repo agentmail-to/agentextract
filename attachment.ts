@@ -328,7 +328,10 @@ interface DocxPartShape {
     skipItem?: (attributes: SaxesAttributes) => boolean
 }
 
-const DOCX_SEPARATOR_NOTE_TYPES = new Set(['separator', 'continuationSeparator'])
+// ECMA-376 ST_FtnEdn defines four note types and only 'normal' is content. The other three are the
+// furniture Word draws around the note area — the rule, its continuation, and the notice that a note
+// carries on overleaf — and each emits a stray blank paragraph if treated as a note.
+const DOCX_SEPARATOR_NOTE_TYPES = new Set(['separator', 'continuationSeparator', 'continuationNotice'])
 const isSeparatorNote = (attributes: SaxesAttributes): boolean => {
     const type = wordAttribute(attributes, 'type')
     return type !== undefined && DOCX_SEPARATOR_NOTE_TYPES.has(type)
@@ -472,13 +475,46 @@ const pdfHandler: Handler = {
             // Pages past the ceiling are text we never read.
             if (pageCount < pdf.numPages) truncated = true
             const joined = pages.join(BLOCK_SEPARATOR).trim()
-            // A PDF that HAS pages and yielded no text from any of them is the canonical scan: the
-            // pages carry images, and pdf.js found no text operators to report. That is provable
-            // here in a way it is not in most formats, and it is the difference between "send this
-            // to OCR" and "there was nothing to read". Deliberately requires a page we actually
-            // visited — a zero-page PDF, or one whose pages were all skipped by the deadline, has
-            // shown us nothing to draw a conclusion from.
-            return { text: joined, empty: joined.length === 0, truncated, hasNonTextContent: pagesRead > 0 }
+            // "No text on a page" is not evidence of a scan — a blank page has none either, and
+            // reporting 'no-text-layer' for one sends an empty document to OCR. So when the whole
+            // read came out empty, ASK: does any page we visited actually paint an image? pdf.js
+            // names those operators, so this is a proof rather than the inference it replaces.
+            //
+            // Only reached on an otherwise-empty extraction, and it stops at the first image — for
+            // a real scan that is page one. A genuinely blank document walks its pages instead, and
+            // is bounded by the same deadline as everything else here.
+            let hasNonTextContent = false
+            if (joined.length === 0 && pagesRead > 0) {
+                // Imported HERE, inside the branch: only an empty read needs it, so a document that
+                // produced text never reaches for a symbol it will not use. Absent — a stubbed
+                // module, an older unpdf — means no proof available, and so no claim made.
+                const { getResolvedPDFJS } = await import('unpdf')
+                const OPS = typeof getResolvedPDFJS === 'function' ? (await getResolvedPDFJS()).OPS : undefined
+                const imageOps = new Set<number>(
+                    OPS === undefined
+                        ? []
+                        : [
+                              OPS.paintImageXObject,
+                              OPS.paintInlineImageXObject,
+                              OPS.paintImageMaskXObject,
+                              OPS.paintImageXObjectRepeat,
+                              OPS.paintImageMaskXObjectRepeat,
+                              OPS.paintSolidColorImageMask,
+                          ]
+                )
+                for (let n = 1; imageOps.size > 0 && n <= pagesRead; n++) {
+                    if (Date.now() > deadline) {
+                        truncated = true
+                        break
+                    }
+                    const { fnArray } = await (await pdf.getPage(n)).getOperatorList()
+                    if ((fnArray as number[]).some((op) => imageOps.has(op))) {
+                        hasNonTextContent = true
+                        break
+                    }
+                }
+            }
+            return { text: joined, empty: joined.length === 0, truncated, hasNonTextContent }
         } finally {
             // getDocumentProxy exposes pdf.js's loading task; release its worker handler, document
             // bytes, and page cache on success, early stop, and errors alike. Cleanup is best-effort:
@@ -550,6 +586,7 @@ const docxHandler: Handler = {
             const reader = await createDocxReader(budget, shape)
             const decoder = new StringDecoder('utf8')
             let partTruncated = false
+            let partFailed = false
             let sawContent: boolean | undefined
             try {
                 for await (const chunk of docxMainPartChunks(entry)) {
@@ -579,12 +616,19 @@ const docxHandler: Handler = {
             // parse on; measured, that emits close-tag text as content and descends into elements
             // mammoth drops — silent wrong output, the one outcome this file fails over everywhere else.
                 if (reader.text().trim().length === 0) throw error
-                partTruncated = true
+                // A part that broke AFTER producing text returns rather than throws, so the caller
+                // has to be told WHICH kind of stop this was. Reported as failure, not truncation:
+                // the distinction is the whole reason the caller keeps two flags, and collapsing it
+                // here is what let a half-readable footnotes.xml end the walk over every later part.
+                partFailed = true
             }
-            return { text: reader.text(), truncated: partTruncated, sawContent }
+            return { text: reader.text(), truncated: partTruncated, failed: partFailed, sawContent }
         }
 
         const body = await readPart(part, DOCX_MAIN_SHAPE, maxOutputChars)
+        // For the MAIN part the two are the same answer — a document that broke mid-read continues
+        // past what we return — and this is the behaviour the handler has always had.
+        const bodyTruncated = body.truncated || body.failed
         // Keep this semantic assertion outside the malformed-XML recovery above. A bodyless main
         // part can contain parseable paragraph text, but it is still not a Word document; catching
         // this assertion as though parsing stopped midway would mislabel the foreign content as a
@@ -595,7 +639,7 @@ const docxHandler: Handler = {
         // with one, so a part's text ends where the next can start. Adding another here is what put
         // a pair of blank paragraphs between the body and its own footnotes.
         const sections = [body.text]
-        let truncated = body.truncated
+        let truncated = bodyTruncated
         const used = () => sections.reduce((total, part) => total + part.length, 0)
 
         // Two different reasons to stop, kept apart on purpose. `truncated` means we ran out of room
@@ -604,6 +648,12 @@ const docxHandler: Handler = {
         // or a broken footnotes.xml silently takes the headers and footers with it. Both end up
         // reported as truncation, because either way the document continues past what we return.
         let partFailed = false
+
+        // header10.xml must not sort before header2.xml, and neither may depend on the order the
+        // producer happened to write the archive in: which header survives a cap that runs out
+        // partway through is otherwise a property of the zip rather than of the document.
+        const ordered = (found: Map<string, ZipEntry>): ZipEntry[] =>
+            [...found.entries()].sort(([a], [b]) => a.localeCompare(b, 'en', { numeric: true })).map(([, entry]) => entry)
 
         for (const { pattern, shape, dedupe } of DOCX_AUXILIARY_PARTS) {
             const seen = new Set<string>()
@@ -616,7 +666,7 @@ const docxHandler: Handler = {
                 if (key !== undefined && pattern.test(key)) matches.set(key, entry)
             }
 
-            for (const entry of matches.values()) {
+            for (const entry of ordered(matches)) {
                 if (truncated) break
                 // BELOW the name match, deliberately. Checked against entries we are actually going
                 // to read, because a deadline that passes while walking parts we would skip anyway
@@ -626,17 +676,20 @@ const docxHandler: Handler = {
                     truncated = true
                     break
                 }
-                const remaining = maxOutputChars - used()
-                if (remaining <= 0) {
-                    truncated = true
-                    break
-                }
+                // NOT `if (remaining <= 0) { truncated = true; break }`. Having no room left says
+                // nothing about whether anything remains to LOSE, and Word routinely writes empty
+                // headers and separator-only footnotes — so a body of exactly maxOutputChars got a
+                // "continues past this point" trailer over parts holding nothing. Reading at a
+                // budget of zero answers the question instead of assuming it: the reader charges
+                // for text it finds and reports the overrun, while an empty part charges nothing.
+                const remaining = Math.max(0, maxOutputChars - used())
                 try {
                     const read = await readPart(entry, shape, remaining)
                     // BEFORE the skips below: a part cut off by the cap or the deadline before it
                     // emitted anything is still a part we did not finish, and `continue`ing past
                     // this is what reported a document with an unread footer as complete.
                     if (read.truncated) truncated = true
+                    if (read.failed) partFailed = true
                     // Trimmed for the DECISIONS (is there anything here, have we already emitted
                     // it), raw for the OUTPUT, so a part keeps the paragraph breaks it read.
                     const text = read.text.trim()
@@ -1463,13 +1516,15 @@ const LOCAL_HEADER_BYTES = 30
 const CENTRAL_HEADER_BYTES = 46
 const EOCD_BYTES = 22
 
-// `ok` = safe to hand to the parser. Otherwise `status` is which kind of no, since the two differ to
-// a caller: `failed` = the bytes are broken (the parser would have thrown anyway), `skipped` = intact
-// but we decline — over budget, or a variant we don't chase. Mirrors the MAX_INPUT_BYTES precedent.
-type DecompressionCheck = { ok: true } | { ok: false; status: 'failed' | 'skipped'; reason: ExtractionReason }
+// `ok` = safe to hand to the parser. Otherwise the reason says which kind of no, since the two
+// differ to a caller: 'malformed' = the bytes are broken (the parser would have thrown anyway), a
+// decline = intact but refused, over budget or a variant we don't chase. No `status` of its own —
+// REASON_STATUS already determines one, and a second copy here is how the same fact came back under
+// two different statuses.
+type DecompressionCheck = { ok: true } | { ok: false; reason: ExtractionReason }
 
-const corrupt = (reason: ExtractionReason = 'malformed'): DecompressionCheck => ({ ok: false, status: 'failed', reason })
-const declined = (reason: ExtractionReason): DecompressionCheck => ({ ok: false, status: 'skipped', reason })
+const corrupt = (reason: ExtractionReason = 'malformed'): DecompressionCheck => ({ ok: false, reason })
+const declined = (reason: ExtractionReason): DecompressionCheck => ({ ok: false, reason })
 
 // Inflate one raw-deflate region onto `runningTotal`, aborting the moment it would exceed `cap`.
 // Returns the new total, or a sentinel — -1 = over budget, -2 = corrupt stream. Byte counts are
@@ -3309,12 +3364,34 @@ const NON_DOC_OLE_EXTENSIONS = new Set(['.xls', '.ppt', '.msg'])
 
 // A password-protected OOXML file is not a zip at all: Office wraps the encrypted package in an OLE
 // container, so routing sees OLE magic where it expected PK and declines the file as unrecognized.
-// True, and useless to a caller — the file was recognized fine, it is locked. OLE directory entry
-// names are UTF-16LE, so the marker stream's name appears verbatim in the bytes. Bounded to the head
-// like every other sniff: the directory of a real encrypted package sits well inside it.
-const ENCRYPTED_PACKAGE_MARKER = Buffer.from('EncryptedPackage', 'utf16le')
-const looksEncryptedOffice = (content: Buffer): boolean =>
-    startsWith(content, OLE_MAGIC) && content.subarray(0, DETECT_SAMPLE_BYTES).includes(ENCRYPTED_PACKAGE_MARKER)
+// True, and useless to a caller — the file was recognized fine, it is locked.
+//
+// Found by matching a DIRECTORY ENTRY, not by searching the bytes. A raw scan for the UTF-16LE name
+// declined any legacy .doc that merely mentioned the word, because .doc stores its body text in
+// exactly that encoding — a document ABOUT encrypted packages read as an encrypted package. A CFB
+// directory entry is a fixed 128-byte record: its name occupies the first 64 bytes, its length in
+// bytes sits at +64 and its object type at +66. Requiring all three to line up at a 128-byte
+// boundary is what separates a stream called EncryptedPackage from a sentence containing the word.
+//
+// Every entry is 128-aligned from the start of the file whatever the sector size (the first sector
+// begins at 512 or 4096, both multiples of 128), so the directory can be found without walking the
+// FAT. Bounded to the head like every other sniff.
+const ENCRYPTED_PACKAGE_NAME = Buffer.from('EncryptedPackage', 'utf16le')
+const CFB_ENTRY_BYTES = 128
+const CFB_STREAM_TYPE = 2
+
+const looksEncryptedOffice = (content: Buffer): boolean => {
+    if (!startsWith(content, OLE_MAGIC)) return false
+    const end = Math.min(content.length, DETECT_SAMPLE_BYTES)
+    // +2 for the UTF-16LE terminator the length field counts.
+    const nameBytes = ENCRYPTED_PACKAGE_NAME.length + 2
+    for (let pos = 512; pos + CFB_ENTRY_BYTES <= end; pos += CFB_ENTRY_BYTES) {
+        if (content.readUInt16LE(pos + 64) !== nameBytes) continue
+        if (content[pos + 66] !== CFB_STREAM_TYPE) continue
+        if (content.subarray(pos, pos + ENCRYPTED_PACKAGE_NAME.length).equals(ENCRYPTED_PACKAGE_NAME)) return true
+    }
+    return false
+}
 
 // Do the bytes back up a binary claim? Catches a wrong one before the parser sees it. text/html have
 // no single signature, so they always pass here — lying text claims go to bytesContradictTextClaim.
@@ -3465,11 +3542,19 @@ const REASON_STATUS: Record<ExtractionReason, 'skipped' | 'failed'> = {
     internal: 'failed',
 }
 
-// pdf.js refuses an encrypted document by throwing rather than by anything we can sniff, and its
-// error survives as a name/message pair. A locked PDF is the same situation as a locked .docx — the
-// bytes are fine and the content is not ours to read — so it gets the same answer.
-const isPasswordError = (error: unknown): boolean =>
-    error instanceof Error && (error.name === 'PasswordException' || /password/i.test(error.message))
+// pdf.js refuses an encrypted document by throwing, so the error IS the signal. Matched on the
+// class name alone: a message match also caught any parser error that happened to quote a sheet
+// name, field or tag containing the word, and turned a malformed file into a locked one — which
+// says skipped-and-intact about bytes that are broken.
+const isPasswordError = (error: unknown): boolean => error instanceof Error && error.name === 'PasswordException'
+
+// A dynamic import that fails is not the attachment's fault — the parser never ran. Reporting it as
+// 'malformed' told a caller their file was broken and not to retry, when the truth is a deployment
+// is missing a dependency. The one unexpected-throw class worth naming, because it is unambiguous.
+const isModuleLoadError = (error: unknown): boolean =>
+    error instanceof Error &&
+    (('code' in error && (error.code === 'MODULE_NOT_FOUND' || error.code === 'ERR_MODULE_NOT_FOUND')) ||
+        error.name === 'ERR_MODULE_NOT_FOUND')
 
 // KNOWN COST of reasons being codes: an unrecognized throw is attributed to the bytes, so a genuine
 // bug of ours that escapes here is reported as 'malformed' and blames the file. The free-text reason
@@ -3483,7 +3568,9 @@ const failureReason = (error: unknown): ExtractionReason =>
           ? 'timed-out'
           : isPasswordError(error)
             ? 'password-protected'
-            : 'malformed'
+            : isModuleLoadError(error)
+              ? 'internal'
+              : 'malformed'
 
 class HandlerTimeoutError extends Error {
     constructor(ms: number) {
@@ -3571,7 +3658,8 @@ export const extractAttachment = async (
         // failure, just like a parser rejection.
         if (kind === 'docx' || kind === 'xlsx') {
             const check = await checkDecompressionBudget(input.content, MAX_UNCOMPRESSED_BYTES)
-            if (!check.ok) return { status: check.status, reason: check.reason }
+            // Derived here too, so REASON_STATUS really is the only place the pairing lives.
+            if (!check.ok) return { status: REASON_STATUS[check.reason], reason: check.reason }
         }
 
         const output = await withTimeout(
