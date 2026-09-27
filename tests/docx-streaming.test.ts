@@ -277,6 +277,34 @@ describe('docx — text outside word/document.xml', () => {
         expect(r.extraction).toBe('Only here.\n\n')
     })
 
+    // REGRESSION, and a denial of service from a 709-byte archive: the blank-run collapse was
+    // anchored as `(\n\n)\s+$`, which backtracks from every position when a run of blank
+    // paragraphs is followed by one character. Measured at 252 ms for 16k newlines and 14 s for
+    // 60k, synchronously — so neither the per-chunk deadline nor withTimeout could interrupt it.
+    // Kept small enough to stay fast under the fix and hopeless under the old form.
+    it('collapses a huge blank run without backtracking', async () => {
+        const content = await docxWithParts(text('hi'), {
+            'word/header1.xml': auxPart('hdr', '<w:p/>'.repeat(30_000) + text('x')),
+        })
+        const started = Date.now()
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        expect(Date.now() - started).toBeLessThan(HANDLER_TIMEOUT_MS)
+        expect(r.status).toBe('extracted')
+        // And the runs are GONE rather than merely survived: they used to be charged in full,
+        // pushing later parts past the cap with tens of thousands of newlines.
+        expect((r.extraction ?? '').length).toBeLessThan(100)
+        expect(r.extraction).toContain('x')
+    })
+
+    // REGRESSION: parts asked `overCap` alone where the body asks `overCap && sawText`. A header of
+    // empty paragraphs charges its way past the cap and loses nothing a reader would see.
+    it('does not report truncation for a blank header that exceeds the cap', async () => {
+        const content = await docxWithParts(text('hi'), { 'word/header1.xml': auxPart('hdr', '<w:p/>'.repeat(100)) })
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE }, { maxOutputChars: 100 })
+        expect(r.extraction).toBe('hi\n\n')
+        expect(r.truncated).toBe(false)
+    })
+
     // The reported scenario for "a blank header ends the walk", end to end. What actually fixes it
     // is the blank-tail collapse below — a header of empty paragraphs now contributes nothing and
     // so displaces nothing. Removing the early exit on a full output is a separate correctness fix

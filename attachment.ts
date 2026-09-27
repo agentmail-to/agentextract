@@ -596,11 +596,6 @@ const docxHandler: Handler = {
         // useful truncated prefix.
         if (body.sawContent === false) throw new ExtractionFailure('wrong-document-shape')
 
-        // Concatenated, NOT joined with a separator: the reader already terminates every paragraph
-        // with one, so a part's text ends where the next can start. Dropped entirely when the body
-        // kept no text of its own, because its '\n\n' would otherwise lead a document whose only
-        // text is in a footnote with a blank paragraph. From the text KEPT, not merely emitted: a
-        // suppressed vMerge cell emits text that never reaches the output.
         // Once per entry, not once per entry per family: opcKey builds a URL, and this walked every
         // record five times over.
         const partKeys = new Map(entries.map((entry) => [entry, opcKey(entry.name)]))
@@ -612,21 +607,32 @@ const docxHandler: Handler = {
         // Dropped entirely when the body kept no text of its own: its '\n\n' would otherwise lead a
         // document whose only text is in a footnote with a blank paragraph.
         let output = body.text.trim() === '' ? '' : body.text
-        let truncated = body.stoppedEarly || (body.overCap && body.sawText)
-        let partFailed = body.failed
+        // One flag. `partFailed` was kept apart while the walk BRANCHED on truncation; it no
+        // longer does — every part is reached and the fitting decides — so a second name for
+        // "text is missing" was two things to keep in step for no remaining difference.
+        let truncated = body.stoppedEarly || (body.overCap && body.sawText) || body.failed
 
         const room = () => maxOutputChars - output.length
+        // The ONE separator rule. It used to be written here and again at the fitting below, which
+        // is the duplication that already drifted once — the two copies disagreed on what ends a
+        // paragraph, so a part could be appended without one.
+        const separatorLength = (): number => (output === '' || output.endsWith(BLOCK_SEPARATOR) ? 0 : BLOCK_SEPARATOR.length)
         const append = (text: string): void => {
-            const separator = output === '' || output.endsWith(BLOCK_SEPARATOR) ? '' : BLOCK_SEPARATOR
-            output += separator + text
+            output += (separatorLength() === 0 ? '' : BLOCK_SEPARATOR) + text
         }
 
-        // Runs of empty paragraphs past the first separator. They are charged like any other output
-        // — a header padded with 200 of them spent the whole cap and pushed a later footer out —
-        // while carrying nothing a reader would see. Collapsed to the single break that ends any
-        // part, so what the budget buys is text. Applied to AUXILIARY parts only: the body's exact
-        // breaks are the contract the mammoth fidelity corpus pins.
-        const withoutBlankTail = (text: string): string => text.replace(/(\n\n)\s+$/, '$1')
+        // Runs of empty paragraphs, wherever they are. They are charged like any other output — a
+        // header padded with them spent the whole cap and pushed a later footer out — while
+        // carrying nothing a reader would see. Collapsed to the single break that separates any two
+        // paragraphs, so what the budget buys is text. Applied to AUXILIARY parts only: the body's
+        // exact breaks are the contract the mammoth fidelity corpus pins.
+        //
+        // `\n{3,}` and not `(\n\n)\s+$`. That anchored form was quadratic — a run of blank
+        // paragraphs followed by one character made the engine retry from every position, measured
+        // at 252 ms for 16k newlines and 14 s for 60k, from a 709-byte archive. It runs
+        // synchronously, so neither the per-chunk deadline nor withTimeout could interrupt it. This
+        // one scans once, and catches leading and interior runs the anchored form never reached.
+        const withoutBlankRuns = (text: string): string => text.replace(/\n{3,}/g, BLOCK_SEPARATOR)
 
         // Built once. localeCompare constructs a collator per CALL, so sorting is quadratic in
         // allocation: 20k keys measured at 1441 ms against 67 ms with a shared one, and this runs
@@ -662,10 +668,16 @@ const docxHandler: Handler = {
                     truncated = true
                     break
                 }
+                // NOTHING LEFT TO LEARN: the output is full and the loss is already recorded, so
+                // reading on would decompress and parse every remaining note, comment, header and
+                // footer only to append nothing. The `truncated` half matters — with room gone but
+                // no loss recorded yet, a later part holding text is exactly what we still need to
+                // find out about, and skipping it would drop it silently.
+                if (truncated && room() <= 0) break
                 let read
                 try {
                     read = await readPart(entry, shape, maxOutputChars)
-                    if (read.failed) partFailed = true
+                    if (read.failed) truncated = true
                 } catch (error) {
                     // OUR failures still escape: best-effort is about the FILE being unreadable, and
                     // an invariant of ours tripping is not. Asked through failureReason so this
@@ -673,13 +685,16 @@ const docxHandler: Handler = {
                     if (failureReason(error) === 'internal') throw error
                     // BEST-EFFORT: turning a readable document into a failure over its margins
                     // would trade a whole extraction for a fragment.
-                    partFailed = true
+                    truncated = true
                     continue
                 }
-                // The part hit the GLOBAL cap on its own, so its own text is incomplete. Recorded,
-                // but it does not end the walk — later parts may still fit.
-                if (read.stoppedEarly || read.overCap) truncated = true
-                const text = withoutBlankTail(read.text)
+                const text = withoutBlankRuns(read.text)
+                // The part hit the GLOBAL cap on its own, so its own text may be incomplete —
+                // but only if it HAD text. `overCap` alone is true for a header of empty
+                // paragraphs, which charges its way past the cap and loses nothing a reader would
+                // see; the body has always asked the stronger question and the parts now match it.
+                // Recorded either way, and it does not end the walk: later parts may still fit.
+                if (read.stoppedEarly || (read.overCap && read.sawText)) truncated = true
                 // Decided on the part's FULL text, before any budget is charged against it.
                 const key = text.trim()
                 if (key === '' || (dedupe && seen.has(key))) continue
@@ -691,8 +706,7 @@ const docxHandler: Handler = {
                 // SILENTLY, because a part never read cannot report what it held. Every part is
                 // reached; the fitting below is what decides, and a part with text that cannot fit
                 // both records the loss and ends the walk, since nothing after it would fit either.
-                const separator = output === '' || output.endsWith(BLOCK_SEPARATOR) ? 0 : BLOCK_SEPARATOR.length
-                const overflow = separator + text.length - room()
+                const overflow = separatorLength() + text.length - room()
                 if (overflow <= 0) {
                     append(text)
                     continue
@@ -709,7 +723,7 @@ const docxHandler: Handler = {
         }
 
         // Emptiness is left to the entry point, which omits `extraction` for text that trims to ''.
-        return { text: output, truncated: truncated || partFailed }
+        return { text: output, truncated }
     },
 }
 
