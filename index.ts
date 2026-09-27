@@ -11,7 +11,6 @@ export * from './body'
 export { extractAttachment, detectRoute } from './attachment'
 export type {
     AttachmentInput,
-    EmptyReason,
     ExtractOptions,
     ExtractionReason,
     ExtractionResult,

@@ -39,12 +39,6 @@ const NS = [
     'xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"',
 ].join(' ')
 
-// Only the picture cases need these, and adding them to NS shifts every other fixture's bytes.
-const DRAWING_NS = [
-    'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"',
-    'xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"',
-    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"',
-].join(' ')
 
 // JSZip output satisfies both decompression-budget invariants, so a fixture built here reaches the
 // handler rather than being turned away in front of it. STORE covers the stored-entry path.
@@ -250,45 +244,37 @@ describe('docx — text outside word/document.xml', () => {
         expect(r.extraction).toBe('Only here.\n\n')
     })
 
-    // A .docx whose only content is a picture is not an empty document. Reporting 'no-text-content'
-    // told a caller there was nothing to find, which is exactly the document OCR is for. Spelled out
-    // as Word writes it, because the a:blip lives under wp:inline — a subtree the reader drops — so
-    // a check placed with the extraction logic would never see it.
-    const PICTURE =
-        `<w:p><w:r><w:drawing ${DRAWING_NS}><wp:inline><a:graphic><a:graphicData><pic:pic><pic:blipFill>` +
-        '<a:blip r:embed="rId1"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>'
-
-    it('reports no-text-layer for a picture-only document', async () => {
-        const r = await extractParts(PICTURE, {})
-        expect(r.status).toBe('extracted')
-        expect(r.extraction).toBeUndefined()
-        expect(r.emptyReason).toBe('no-text-layer')
+    // REGRESSION: a part charges for its paragraph terminator like any other output, so an empty
+    // <w:p/> — which Word writes routinely — read at a budget of zero came back over cap and marked
+    // a COMPLETE document truncated. Truncation is about text LOST, not about the cap binding.
+    it('does not report truncation for a header holding only an empty paragraph', async () => {
+        const full = 'Body.\n\n'.length
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': `<?xml version="1.0"?><w:hdr ${NS}><w:p/></w:hdr>`,
+        }, { maxOutputChars: full })
+        expect(r.extraction).toBe('Body.\n\n')
+        expect(r.truncated).toBe(false)
     })
 
-    // REGRESSION: only the Transitional DrawingML namespaces were listed, while the reader accepts
-    // ISO Strict — which re-homes DrawingML under purl.oclc.org just as it does WordprocessingML.
-    // An image-only Strict document was reported as holding nothing.
-    it('recognizes an image in a Strict-format document', async () => {
-        const strict = [
-            'xmlns:a="http://purl.oclc.org/ooxml/drawingml/main"',
-            'xmlns:pic="http://purl.oclc.org/ooxml/drawingml/picture"',
-            'xmlns:r="http://purl.oclc.org/ooxml/officeDocument/relationships"',
-        ].join(' ')
-        const r = await extractParts(
-            `<w:p><w:r><w:drawing ${strict}><wp:inline><a:graphic><a:graphicData><pic:pic><pic:blipFill>` +
-                '<a:blip r:embed="rId1"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>',
-            {}
-        )
-        expect(r.emptyReason).toBe('no-text-layer')
+    // REGRESSION: a duplicate header read with no budget left set truncated and was then discarded
+    // as a duplicate anyway — flagging a loss for text we had already decided not to keep.
+    it('does not report truncation for a duplicate header it discards', async () => {
+        const cap = 'Body.\n\n'.length + 'ACME\n\n'.length
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': auxPart('hdr', text('ACME')),
+            'word/header2.xml': auxPart('hdr', text('ACME')),
+        }, { maxOutputChars: cap })
+        expect(r.extraction).toBe('Body.\n\nACME\n\n')
+        expect(r.truncated).toBe(false)
     })
 
-    // REGRESSION: a header or footer logo counted, so an otherwise-empty document on headed paper
-    // claimed to be a scan. Page furniture is not what the document holds.
-    it('does not call a document with only a header logo a scan', async () => {
-        const r = await extractParts('<w:p/>', { 'word/header1.xml': auxPart('hdr', PICTURE) })
-        expect(r.status).toBe('extracted')
-        expect(r.extraction).toBeUndefined()
-        expect(r.emptyReason).not.toBe('no-text-layer')
+    // REGRESSION: the body's text is '\n\n' when it holds nothing, and prepending that to a
+    // document whose only text lives in a footnote produced a leading blank paragraph.
+    it('does not prepend a blank paragraph when the body is empty', async () => {
+        const r = await extractParts('<w:p/>', {
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${text('Only here.')}</w:footnote>`),
+        })
+        expect(r.extraction).toBe('Only here.\n\n')
     })
 
     // REGRESSION: a part cut short was compared against earlier headers by its stored PREFIX, so a
@@ -301,16 +287,6 @@ describe('docx — text outside word/document.xml', () => {
             'word/header2.xml': auxPart('hdr', text('ACME Corp') + text('DRAFT confidential')),
         }, { maxOutputChars: cap })
         expect(r.truncated).toBe(true)
-    })
-
-    // REGRESSION: any w:drawing counted, and that wraps every DrawingML object — charts, text boxes,
-    // the decorative shapes in a letterhead template. An empty template claimed to be a scan.
-    it('does not call a drawing without an image a scan', async () => {
-        const r = await extractParts(
-            `<w:p><w:r><w:drawing ${DRAWING_NS}><wp:inline><a:graphic><a:graphicData/></a:graphic></wp:inline></w:drawing></w:r></w:p>`,
-            {}
-        )
-        expect(r.emptyReason).toBe('no-text-content')
     })
 
     // REGRESSION: `remaining <= 0` was treated as "there is more to lose", so a body of exactly

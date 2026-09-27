@@ -170,20 +170,6 @@ export interface ExtractOptions {
     trailer?: string
 }
 
-// Why a COMPLETE `extracted` result carries no text. Both values are claims about the whole
-// document, so neither is reported for a truncated read, where "no text so far" is not evidence of
-// "no text". Set because that outcome was the one a caller could not otherwise interpret: before this, a
-// scanned page, a zero-byte file and a whitespace-only file were the same result object, so "we
-// found nothing" and "there is nothing" were indistinguishable, and no consumer could decide
-// whether OCR was worth trying.
-export type EmptyReason =
-    // Read, and genuinely holds no text. Nothing else will get more out of it.
-    | 'no-text-content'
-    // HAS content, but none of it is text — a scan, a photographed page, a deck of images. Text
-    // extraction is the wrong tool here and OCR is the next step. Reported only where the format
-    // lets us PROVE the difference, never guessed.
-    | 'no-text-layer'
-
 export interface ExtractionResult {
     status: ExtractionStatus
     extraction?: string // omitted entirely (never '') when the handler produced no text
@@ -191,11 +177,6 @@ export interface ExtractionResult {
     // Whether the document continues past `extraction`. Set on `extracted` only — skipped/failed
     // have no text to have cut. Independent of `trailer`, so a consumer never parses the text for it.
     truncated?: boolean
-    // Set on a COMPLETE `extracted` result that carries no text, and never alongside text. NOT the
-    // complement of `extraction`, though: most empty results carry no reason either, because most
-    // handlers cannot prove which kind of empty they are looking at. Absent means "we cannot tell",
-    // which for a consumer reads as "may be worth OCR" — never as "there is nothing here".
-    emptyReason?: EmptyReason
 }
 
 interface HandlerContext {
@@ -212,12 +193,6 @@ interface HandlerContext {
 interface HandlerOutput {
     text: string
     empty?: boolean // handler's own emptiness call; defaults to text.trim() === ''
-    // What the handler can PROVE about an extraction that came out empty, used only then. Absent
-    // means it cannot tell, and the entry point then reports no reason at all — because
-    // 'no-text-content' is a claim too, and defaulting to it told callers "there is nothing here"
-    // about image-only documents a handler simply could not read, which suppresses OCR exactly
-    // where it is wanted. A handler sets this only for a document it read to the end.
-    emptyReason?: EmptyReason
     // Set by a handler that stopped early; ORed with the entry point's over-cap check. A handler
     // stopping ON the cap or on the deadline lands under it and would otherwise look complete.
     truncated?: boolean
@@ -329,20 +304,6 @@ interface DocxPartShape {
     skipItem?: (attributes: SaxesAttributes) => boolean
 }
 
-// The elements that reference an actual image, by namespace and local name — a:blip is the blob a
-// picture points at, pic:pic the picture itself, v:imagedata the VML spelling. Matched by URI
-// because OOXML_PREFIXES maps only w/mc/v, so these arrive as {uri}local rather than a prefix.
-const DOCX_IMAGE_ELEMENTS = new Map([
-    ['http://schemas.openxmlformats.org/drawingml/2006/main', 'blip'],
-    ['http://schemas.openxmlformats.org/drawingml/2006/picture', 'pic'],
-    // ISO Strict re-homes DrawingML under purl.oclc.org exactly as it does WordprocessingML. The
-    // reader already accepts Strict documents, so listing only Transitional here reported an
-    // image-only Strict .docx as holding nothing.
-    ['http://purl.oclc.org/ooxml/drawingml/main', 'blip'],
-    ['http://purl.oclc.org/ooxml/drawingml/picture', 'pic'],
-    ['urn:schemas-microsoft-com:vml', 'imagedata'],
-])
-
 // ECMA-376 ST_FtnEdn defines four note types and only 'normal' is content. The other three are the
 // furniture Word draws around the note area — the rule, its continuation, and the notice that a note
 // carries on overleaf — and each emits a stray blank paragraph if treated as a note.
@@ -417,9 +378,7 @@ const textHandler: Handler = {
         '.yaml',
         '.yml',
     ],
-    // Everything is decoded, so nothing came out means nothing was there — a claim this handler can
-    // make, unlike a format whose content it cannot see into.
-    extract: async ({ content, charsetHint }) => ({ text: decodeText(content, charsetHint), emptyReason: 'no-text-content' }),
+    extract: async ({ content, charsetHint }) => ({ text: decodeText(content, charsetHint) }),
 }
 
 // HTML -> visible text.
@@ -443,11 +402,6 @@ const htmlHandler: Handler = {
     extensions: ['.html', '.htm', '.xhtml'],
     extract: async ({ content, charsetHint }) => {
         const decoded = decodeText(content, charsetHint)
-        // NO emptyReason. Deciding it from a /<img/ scan over the raw markup was wrong both ways:
-        // it matched inside comments, <script> and <noscript>, and a tracking pixel — sending empty
-        // marketing mail to OCR — while missing <svg>, <picture>, <canvas> and CSS backgrounds, so a
-        // genuinely image-only page was reported as holding nothing. Answering this properly needs
-        // the DOM that this handler deliberately does not build, so it does not answer.
         return { text: await flattenHtml(decoded) }
     },
 }
@@ -468,7 +422,6 @@ const pdfHandler: Handler = {
             const pages: string[] = []
             let length = 0
             let truncated = false
-            let pagesRead = 0 // pages whose text content we actually asked for, deadline stops excluded
             for (let n = 1; n <= pageCount; n++) {
                 // This loop awaits per page, so the deadline is enforceable here in a way withTimeout's
                 // race is not. Before the fetch: stopping is only useful if it precedes the work.
@@ -478,7 +431,6 @@ const pdfHandler: Handler = {
                 }
                 const page = await pdf.getPage(n)
                 const { items } = await page.getTextContent()
-                pagesRead++
                 // Replicates unpdf's per-page join: str, plus a newline on hasEOL.
                 const pageText = (items as Array<{ str?: string; hasEOL?: boolean }>)
                     .filter((item) => item.str != null)
@@ -497,71 +449,12 @@ const pdfHandler: Handler = {
             // Pages past the ceiling are text we never read.
             if (pageCount < pdf.numPages) truncated = true
             const joined = pages.join(BLOCK_SEPARATOR).trim()
-            // "No text on a page" is not evidence of a scan — a blank page has none either, and
-            // reporting 'no-text-layer' for one sends an empty document to OCR. So when the whole
-            // read came out empty, ASK: does any page we visited actually paint an image? pdf.js
-            // names those operators, so this is a proof rather than the inference it replaces.
-            //
-            // Only reached on an otherwise-empty extraction, and it stops at the first image — for
-            // a real scan that is page one. A genuinely blank document walks its pages instead, and
-            // is bounded by the same deadline as everything else here.
-            // WHAT THE EMPTINESS MEANS, or nothing at all. Returning a boolean here was wrong three
-            // ways at once, because `false` silently became the positive claim 'no-text-content':
-            // a probe that could not run, one that errored, and one that only looked at page 1 of a
-            // multi-page document all ended up asserting the document was genuinely empty — the
-            // claim that tells a caller to throw a scan away. Undefined is the honest third answer.
-            const probeEmptyReason = async (): Promise<EmptyReason | undefined> => {
-                if (truncated || Date.now() > deadline) return undefined
-                try {
-                    const { getResolvedPDFJS } = await import('unpdf')
-                    if (typeof getResolvedPDFJS !== 'function') return undefined
-                    const { OPS } = await getResolvedPDFJS()
-                    if (OPS === undefined) return undefined
-                    const imageOps = new Set<number>([
-                        OPS.paintImageXObject,
-                        OPS.paintInlineImageXObject,
-                        OPS.paintImageMaskXObject,
-                        OPS.paintImageXObjectRepeat,
-                        OPS.paintImageMaskXObjectRepeat,
-                        OPS.paintSolidColorImageMask,
-                    ])
-                    // FIRST PAGE ONLY: getOperatorList builds a display list and decodes images,
-                    // work this handler did not previously do, and per page it could push a large
-                    // scan past HANDLER_TIMEOUT_MS. One page PROVES an image when it finds one —
-                    // but it cannot disprove one for a document with more pages, so a scan behind a
-                    // blank cover answers "unknown" rather than "empty".
-                    //
-                    // RACED against the deadline as well as guarded by it. A single image decode can
-                    // outlast the time left, and withTimeout would then reject the whole extraction
-                    // — turning a document that read fine into 'timed-out' because the thing that
-                    // LABELS its emptiness was slow. The label is optional; the extraction is not.
-                    const operators = await Promise.race([
-                        pdf.getPage(1).then((page) => page.getOperatorList()),
-                        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), Math.max(0, deadline - Date.now())).unref?.()),
-                    ])
-                    if (operators === undefined) return undefined
-                    const fnArray = operators.fnArray as number[]
-                    if (fnArray.some((op) => imageOps.has(op))) return 'no-text-layer'
-                    // NOTHING DRAWN is the only proof of emptiness available here. A page that paints
-                    // without an image operator is drawing something we cannot read — text outlined
-                    // as vector paths, a form field's appearance stream — and calling that
-                    // 'no-text-content' told a caller to discard a page with visible words on it.
-                    // (tests/fixtures/blank.pdf is exactly this: no text items, 564 operators.)
-                    return fnArray.length === 0 && pagesRead === 1 ? 'no-text-content' : undefined
-                } catch {
-                    // The probe is an extra: a document that used to come back empty must not start
-                    // coming back failed because the thing that labels its emptiness threw.
-                    return undefined
-                }
-            }
-            const emptyReason = joined.length === 0 && pagesRead > 0 ? await probeEmptyReason() : undefined
-
-            return {
-                text: joined,
-                empty: joined.length === 0,
-                truncated,
-                emptyReason,
-            }
+            // No attempt to say WHY this is empty when it is. A probe that reads pdf.js's image
+            // operators was tried and removed: it could prove a scan on page one, but could not
+            // disprove one anywhere else, and every shape of "could not tell" kept collapsing into
+            // a positive claim that the document held nothing — which tells a caller to discard the
+            // scans it was added for. See the git history before dropping one in again.
+            return { text: joined, empty: joined.length === 0, truncated }
         } finally {
             // getDocumentProxy exposes pdf.js's loading task; release its worker handler, document
             // bytes, and page cache on success, early stop, and errors alike. Cleanup is best-effort:
@@ -684,7 +577,6 @@ const docxHandler: Handler = {
                 failed: partFailed,
                 sawContent,
                 sawText: reader.sawText(),
-                sawPicture: reader.sawPicture(),
             }
         }
 
@@ -720,10 +612,6 @@ const docxHandler: Handler = {
         // or a broken footnotes.xml silently takes the headers and footers with it. Both end up
         // reported as truncation, because either way the document continues past what we return.
         let partFailed = false
-        // BODY ONLY. A header or footer logo is page furniture that appears on every page of a
-        // template, so counting it made an otherwise-empty document on headed paper claim to be a
-        // scan and sent it to OCR. What the document itself holds is what answers the question.
-        const sawPicture = body.sawPicture
 
         // header10.xml must not sort before header2.xml, and neither may depend on the order the
         // producer happened to write the archive in: which header survives a cap that runs out
@@ -810,14 +698,7 @@ const docxHandler: Handler = {
         // A .docx whose only content is an image is not an empty document, and saying so is what
         // stops a scanned page being dropped rather than sent to OCR — the same proof the PDF
         // handler makes from its image operators.
-        return {
-            text: sections.join(''),
-            truncated: truncated || partFailed,
-            // The reader walks the whole document, so an image-only .docx is distinguishable from an
-            // empty one — the same distinction the PDF handler proves from its image operators, and
-            // the reason a scanned page pasted into Word is no longer reported as holding nothing.
-            emptyReason: sawPicture ? 'no-text-layer' : 'no-text-content',
-        }
+        return { text: sections.join(''), truncated: truncated || partFailed }
     },
 }
 
@@ -830,9 +711,6 @@ const docHandler: Handler = {
     extract: async ({ content }) => {
         const { default: WordExtractor } = await import('word-extractor')
         const doc = await new WordExtractor().extract(content)
-        // NO emptyReason, deliberately. word-extractor hands back text or nothing and says nothing
-        // about what else the document holds, so an image-only .doc and an empty one are the same
-        // answer from here. Claiming either would be a guess, and the entry point reports neither.
         return { text: doc.getBody() } // main body only; headers/footers/notes are separate streams
     },
 }
@@ -1454,10 +1332,6 @@ const xlsxHandler: Handler = {
             throw new ExtractionFailure('internal')
         }
 
-        // NO emptyReason. Rows are all this reader looks at, and a sheet holding nothing but a
-        // pasted screenshot has no rows — so claiming 'no-text-content' told a caller to discard
-        // exactly the workbook that wanted OCR. Drawings live in parts this handler never opens,
-        // so the honest answer is that we cannot tell.
         return { text: sheets.join(BLOCK_SEPARATOR), truncated }
     },
 }
@@ -2856,9 +2730,6 @@ interface DocxReader {
     // charged like any other output, so "did the cap bind" and "was there anything to lose" are
     // different questions, and only this one decides whether a document was really truncated.
     sawText: () => boolean
-    // Whether a picture was opened. Lets an image-only .docx be told apart from an empty one, the
-    // same distinction the PDF handler proves from its image operators.
-    sawPicture: () => boolean
     overCap: () => boolean
     shouldStop: () => boolean // cap crossed and any output-order-sensitive frame has closed
     end: (tail: string) => boolean // flush/close; whether the part contained its content container
@@ -2880,7 +2751,6 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
     let rowDeleted = false // a w:trPr said its row is deleted; act on it once that w:trPr closes
     let sawBody = false
     let sawText = false
-    let sawPicture = false
     let inBody = false
     let chars = 0
     // Mammoth holds a deleted-mark paragraph until the following paragraph is read. Its value
@@ -3081,16 +2951,6 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
         const name = uri === '' ? tag.local : prefix === undefined ? `{${uri}}${tag.local}` : `${prefix}:${tag.local}`
         stack.push(name)
         assertXmlDepth(stack.length)
-
-        // AHEAD of the skip gate below, because this is an observation about the document rather
-        // than a decision about its text. A picture's own elements live under wp:inline, whose
-        // subtree is deliberately dropped, so a check placed with the extraction logic would never
-        // run — and quietly report every scanned document as holding nothing.
-        //
-        // The IMAGE, not its container: w:drawing wraps every DrawingML object, charts and text
-        // boxes and a letterhead's decorative shapes included, so flagging that made an empty
-        // template claim to be a scan.
-        if (DOCX_IMAGE_ELEMENTS.get(uri) === tag.local) sawPicture = true
 
         if (skip >= 0) {
             // Inside a dropped subtree nothing is emitted, and only the two ancestor-affecting
@@ -3476,7 +3336,6 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
         write: (chunk) => void parser.write(chunk),
         chars: () => chars,
         sawText: () => sawText,
-        sawPicture: () => sawPicture,
         overCap: () => capExceeded,
         shouldStop: () => capExceeded && drainUntil === undefined && !drainPendingDeletedContent,
         end: (tail) => {
@@ -3859,7 +3718,7 @@ export const extractAttachment = async (
     // `truncated: false` is stated because this is the one 'extracted' return that never reaches the
     // cap logic below, and omitting it would hand `undefined` to a consumer testing `=== false`.
     if (byteSize === 0) {
-        return { status: 'extracted', truncated: false, emptyReason: 'no-text-content' }
+        return { status: 'extracted', truncated: false }
     }
 
     // Size gate, before any decode or parse.
@@ -3939,18 +3798,7 @@ export const extractAttachment = async (
         // A present `extraction` reads as "has text"; its absence as "ran, but empty". The trailer
         // goes on AFTER the cap slice, so it never displaces extracted text.
         return isEmpty
-            ? {
-                  status: 'extracted',
-                  truncated,
-                  // ONLY on a complete read. Both values are claims about the whole document — "it
-                  // holds nothing", "none of it is text" — and neither is knowable from a read that
-                  // stopped early: a cap of 0 or a deadline hit on a blank cover page leaves no text
-                  // behind while the document is full of it. Reporting one there told a caller to
-                  // discard, or to OCR, a document nobody had read. `truncated` alone already says
-                  // the honest thing: we stopped before finding text, and there may be more.
-                  // Whatever the handler could prove, and nothing when it could prove nothing.
-                  ...(truncated || output.emptyReason === undefined ? {} : { emptyReason: output.emptyReason }),
-              }
+            ? { status: 'extracted', truncated }
             : { status: 'extracted', extraction: truncated && options.trailer ? text + options.trailer : text, truncated }
     } catch (error) {
         // The bytes are attacker-controlled, so a throw or timeout is an expected event, not a bug:

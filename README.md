@@ -79,19 +79,10 @@ and on no `extracted` one, so it is safe to branch on. Two are worth knowing: `t
 failure worth retrying, and `internal` means one of our invariants tripped or a pinned dependency
 moved — not a bad file, so retrying or re-requesting the attachment cannot help.
 
-When a **complete** read yields no text, `extraction` is omitted and `emptyReason` says why:
-`'no-text-layer'` means the document has content but none of it is text — a scan, a photographed
-page — so OCR is the next step, while `'no-text-content'` means it was read and genuinely holds
-nothing. `emptyReason` is only ever set alongside an absent `extraction`, never with text — but the
-two are not exhaustive: an empty result may carry no reason at all, and that is the common case.
-Both are claims about the whole document, so neither is reported for a truncated read: a result with
-no text, no `emptyReason` and `truncated: true` means we stopped before finding text and cannot say
-whether there is any. Only a handler that can *prove* the distinction reports `'no-text-layer'`;
-today PDF (its first page paints an image) and `.docx` (the document references a picture). Where a
-handler cannot prove EITHER — a multi-page PDF whose first page is blank, `.xlsx` and HTML, whose
-images live where these readers do not look, and `.doc`, whose parser reports text or nothing and
-nothing about the rest — **neither value is reported**, and that absence means exactly what it says:
-we cannot tell. Treat a missing `emptyReason` as "may be worth OCR", never as "empty".
+When a read yields no text at all, `extraction` is omitted entirely — it is never `''`. The library
+does **not** tell you which kind of empty that is: a scanned page with no text layer and a genuinely
+blank document look the same from here. If OCR matters to you, treat every empty `extracted` result
+as a candidate rather than assuming there is nothing to find.
 
 Password-protected **OOXML** files (`.docx`/`.xlsx`/`.pptx`, which Office wraps in an OLE container)
 and password-protected PDFs are `skipped` with reason `password-protected`. Legacy `.doc` files
