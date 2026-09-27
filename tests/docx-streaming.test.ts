@@ -277,6 +277,33 @@ describe('docx — text outside word/document.xml', () => {
         expect(r.extraction).toBe('Only here.\n\n')
     })
 
+    // REGRESSION, and a silent loss: `sawText` only covers the chunks read BEFORE the cap stopped
+    // the read. A header that charges its way past the cap on empty paragraphs in an early chunk
+    // stops before the chunk holding its text, reports sawText:false, and the text vanishes with
+    // the result saying the document is complete. Padded past 16 KB so the stop lands mid-part.
+    it('reports truncation for a part stopped before the chunk holding its text', async () => {
+        const padding = '<w:p/>'.repeat(9_000) // ~54 KB of markup, 2 charged characters each
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': auxPart('hdr', padding + text('LATE HEADER TEXT')),
+        }, { maxOutputChars: 'Body.\n\n'.length + 10 })
+        expect(r.extraction).not.toContain('LATE HEADER TEXT')
+        expect(r.truncated).toBe(true) // the text is gone; saying otherwise hides the loss
+    })
+
+    // REGRESSION: the body's own parse failure was folded into `truncated`, which ends the walk —
+    // so a document that broke mid-body lost every footnote, comment and header behind it. The
+    // same rule the auxiliary parts already follow: a failure says nothing about the next part.
+    it('reads auxiliary parts after the body itself breaks', async () => {
+        const content = await docxWithParts(`${text('Body text.')}<w:p><w:r><w:t>unclosed`, {
+            'word/header1.xml': auxPart('hdr', text('HEADER SURVIVES')),
+        })
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('Body text.')
+        expect(r.extraction).toContain('HEADER SURVIVES')
+        expect(r.truncated).toBe(true)
+    })
+
     // REGRESSION: a part cut short was compared against earlier headers by its stored PREFIX, so a
     // clipped "ACME Corp\n\nDRAFT..." matched the letterhead before it — dropping the rest AND
     // suppressing the truncation, which loses text while reporting a complete document.

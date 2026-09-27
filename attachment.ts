@@ -128,7 +128,10 @@ const DETECT_SAMPLE_BYTES = 64 * 1024
 export type ExtractionReason =
     // --- skipped: intact, and declined ---
     | 'too-large' // over MAX_INPUT_BYTES, before any decode or parse
-    | 'expands-too-large' // over MAX_UNCOMPRESSED_BYTES once actually inflated; also the zip-bomb signal
+    // Over a decompression ceiling once actually inflated — MAX_UNCOMPRESSED_BYTES for the archive,
+    // MAX_METADATA_BYTES for a single workbook part we must materialize whole. The zip-bomb signal,
+    // and also an ordinary file that is simply larger than we will expand.
+    | 'expands-too-large'
     | 'unsupported-format' // a type we recognize and do not handle
     | 'unrecognized' // nothing — type, extension or bytes — identified it
     | 'password-protected' // readable bytes, locked content: ask the sender, do not retry
@@ -525,9 +528,14 @@ const docxHandler: Handler = {
         const readPart = async (entry: ZipEntry, shape: DocxPartShape, budget: number) => {
             const reader = await createDocxReader(budget, shape)
             const decoder = new StringDecoder('utf8')
-            let partTruncated = false
-            let stoppedForTime = false
+            // STOPPED EARLY means we abandoned the part mid-read, so whatever follows is unknown.
+            // Distinct from `overCap`, which means we read the part to its END and the reader
+            // clipped what it kept — there the reader knows whether any of it was text. Collapsing
+            // the two let a header pad past the cap with empty paragraphs in an early chunk, stop
+            // before the chunk holding its text, report sawText:false, and lose that text silently.
+            let stoppedEarly = false
             let partFailed = false
+            let overCap = false
             let sawContent: boolean | undefined
             try {
                 for await (const chunk of docxMainPartChunks(entry)) {
@@ -543,18 +551,18 @@ const docxHandler: Handler = {
                     // means we stopped reading and cannot know what was left; running out of ROOM
                     // means the reader knows what it saw and can say whether any of it was text.
                     if (Date.now() > deadline) {
-                        stoppedForTime = true
+                        stoppedEarly = true
                         break
                     }
                     if (reader.shouldStop()) {
-                        partTruncated = true
+                        stoppedEarly = true
                         break
                     }
                     reader.write(decoder.write(chunk))
                 }
                 // Only a read that ran to the end may assert the part ended cleanly.
-                if (!partTruncated && !stoppedForTime) sawContent = reader.end(decoder.end())
-                if (reader.overCap()) partTruncated = true
+                if (!stoppedEarly) sawContent = reader.end(decoder.end())
+                overCap = reader.overCap()
             } catch (error) {
             // saxes is conformant where mammoth's DOM parser recovered, so a document the old reader
             // read to the end can stop short here. Text already extracted is still text, and the
@@ -572,8 +580,8 @@ const docxHandler: Handler = {
             }
             return {
                 text: reader.text(),
-                truncated: partTruncated || stoppedForTime,
-                stoppedForTime,
+                stoppedEarly,
+                overCap,
                 failed: partFailed,
                 sawContent,
                 sawText: reader.sawText(),
@@ -581,9 +589,6 @@ const docxHandler: Handler = {
         }
 
         const body = await readPart(part, DOCX_MAIN_SHAPE, maxOutputChars)
-        // For the MAIN part the two are the same answer — a document that broke mid-read continues
-        // past what we return — and this is the behaviour the handler has always had.
-        const bodyTruncated = body.truncated || body.failed
         // Keep this semantic assertion outside the malformed-XML recovery above. A bodyless main
         // part can contain parseable paragraph text, but it is still not a Word document; catching
         // this assertion as though parsing stopped midway would mislabel the foreign content as a
@@ -591,27 +596,22 @@ const docxHandler: Handler = {
         if (body.sawContent === false) throw new ExtractionFailure('wrong-document-shape')
 
         // Concatenated, NOT joined with a separator: the reader already terminates every paragraph
-        // with one, so a part's text ends where the next can start. Adding another here is what put
-        // a pair of blank paragraphs between the body and its own footnotes.
-        // The body's own text is '\n\n' when it holds nothing, and prepending that to a document
-        // whose only text is in a footnote produced a leading blank paragraph. Dropped when the body
-        // has no text of its own; an entirely empty document then joins to '' rather than '\n\n',
-        // which the entry point reads as empty in exactly the same way.
-        // From the text the body actually KEPT, not from whether any was emitted: a suppressed
-        // vMerge cell or a discarded frame emits text that never reaches the output, and counting
-        // it here put back the leading blank paragraph this is meant to remove. The body is read
-        // with the full budget, so its own text is the honest answer. (Truncation below still uses
-        // the emitted signal, where over-counting errs toward reporting a loss rather than hiding one.)
+        // with one, so a part's text ends where the next can start. Dropped entirely when the body
+        // kept no text of its own, because its '\n\n' would otherwise lead a document whose only
+        // text is in a footnote with a blank paragraph. From the text KEPT, not merely emitted: a
+        // suppressed vMerge cell emits text that never reaches the output.
         const sections = body.text.trim() === '' ? [] : [body.text]
-        let truncated = bodyTruncated
-        const used = () => sections.reduce((total, part) => total + part.length, 0)
+        // Kept as a running total: recomputing it per part is quadratic in the number of headers.
+        let usedChars = sections.reduce((total, part) => total + part.length, 0)
 
         // Two different reasons to stop, kept apart on purpose. `truncated` means we ran out of room
         // or time, and nothing after it can be read either — so it ends the walk. `partFailed` means
-        // one part was unreadable, which says nothing about the next one; it must NOT end the walk,
-        // or a broken footnotes.xml silently takes the headers and footers with it. Both end up
-        // reported as truncation, because either way the document continues past what we return.
-        let partFailed = false
+        // something was unreadable, which says nothing about the next part; it must NOT end the walk.
+        // That applies to the BODY too: folding a body that broke mid-read into `truncated` skipped
+        // every footnote, comment and header behind it, which is the very rule this pair encodes.
+        // Both are reported as truncation in the end, because either way text is missing.
+        let truncated = body.stoppedEarly || (body.overCap && body.sawText)
+        let partFailed = body.failed
 
         // header10.xml must not sort before header2.xml, and neither may depend on the order the
         // producer happened to write the archive in: which header survives a cap that runs out
@@ -633,17 +633,17 @@ const docxHandler: Handler = {
             const seenBytes = new Set<string>()
             for (const entry of ordered(matches)) {
                 if (truncated) break
-                // Identical parts are recognized BEFORE reading, by their stored CRC and size. Word
-                // writes the same header into a part per section, and text-level dedupe cannot help
-                // here: with no budget left the reader stores nothing, so the copy comes back as ''
-                // and looks like new text rather than the duplicate it is — charging the cap and
-                // reporting a truncation for a part we were always going to throw away.
-                // Only when the archive actually committed to a checksum. A writer that defers the
-                // CRC to a data descriptor leaves zero in the central directory, and treating that
-                // as an identity dropped every later header as a copy of the first.
-                if (entry.crc !== 0 && entry.compSize > 0) {
-                    const fingerprint = `${entry.crc}:${entry.uncompSize}`
-                    if (dedupe && seenBytes.has(fingerprint)) continue
+                // Identical parts are recognized BEFORE reading. Word writes the same header into a
+                // part per section, and text-level dedupe cannot help: with no budget left the
+                // reader stores nothing, so the copy comes back as '' and looks like new text.
+                //
+                // From the STORED BYTES, not from the CRC and size the archive declares about
+                // itself. Those are metadata the producer chose and nothing here verifies, so a
+                // crafted package could give header2 header1's checksum and have its different text
+                // dropped without a word. The compressed bytes are what the parts actually are.
+                if (dedupe) {
+                    const fingerprint = entry.data.toString('latin1')
+                    if (seenBytes.has(fingerprint)) continue
                     seenBytes.add(fingerprint)
                 }
                 // BELOW the name match, deliberately. Checked against entries we are actually going
@@ -660,30 +660,25 @@ const docxHandler: Handler = {
                 // "continues past this point" trailer over parts holding nothing. Reading at a
                 // budget of zero answers the question instead of assuming it: the reader charges
                 // for text it finds and reports the overrun, while an empty part charges nothing.
-                const remaining = Math.max(0, maxOutputChars - used())
+                const remaining = Math.max(0, maxOutputChars - usedChars)
                 try {
                     const read = await readPart(entry, shape, remaining)
                     if (read.failed) partFailed = true
+                    // TRUNCATION IS ABOUT TEXT LOST. Two ways to lose some, and they are asked
+                    // differently: abandoning the part mid-read leaves what follows UNKNOWN, so it
+                    // counts whatever we managed to see; reading the part to its end and clipping
+                    // only loses something if any of what was clipped was text. A part charges for
+                    // its paragraph terminator like any other output, so without that second
+                    // distinction an empty <w:p/> read at a budget of zero marked a COMPLETE
+                    // document truncated.
+                    if (read.stoppedEarly || (read.overCap && read.sawText)) truncated = true
                     // Trimmed for the DECISIONS (is there anything here, have we already emitted
                     // it), raw for the OUTPUT, so a part keeps the paragraph breaks it read.
                     const text = read.text.trim()
-                    // A part cut short cannot be judged a duplicate: its stored prefix is only
-                    // the beginning, and a header reading "ACME Corp\n\nDRAFT..." clipped to
-                    // "ACME Corp" matched the letterhead before it — so the rest was dropped AND
-                    // the truncation suppressed, losing text while reporting a complete document.
-                    const duplicate = dedupe && !read.truncated && !read.stoppedForTime && seen.has(text)
-                    // TRUNCATION IS ABOUT TEXT LOST, so it is decided here rather than from the cap
-                    // alone. A part charges for its paragraph terminator like any other output, so
-                    // an empty <w:p/> — which Word writes routinely — read at a budget of zero came
-                    // back over cap and marked a COMPLETE document truncated. And a duplicate header
-                    // is discarded on purpose, so nothing is lost by not keeping it either.
-                    // Out of TIME: we stopped reading, so what the part held is unknown and the
-                    // document does continue past what we return. Out of ROOM: only a loss if there
-                    // was text to lose and we were going to keep it.
-                    if (read.stoppedForTime || (read.truncated && read.sawText && !duplicate)) truncated = true
-                    if (text === '' || duplicate) continue
+                    if (text === '' || seen.has(text)) continue
                     seen.add(text)
                     sections.push(read.text)
+                    usedChars += read.text.length
                 } catch {
                     // BEST-EFFORT, and the reason the main part is read separately above: a broken
                     // footnotes part costs its own text and nothing else. Turning a readable document
@@ -694,10 +689,7 @@ const docxHandler: Handler = {
             if (truncated) break
         }
 
-        // Emptiness is left to the entry point: an empty document is exactly '\n\n', which trims to ''.
-        // A .docx whose only content is an image is not an empty document, and saying so is what
-        // stops a scanned page being dropped rather than sent to OCR — the same proof the PDF
-        // handler makes from its image operators.
+        // Emptiness is left to the entry point, which omits `extraction` for text that trims to ''.
         return { text: sections.join(''), truncated: truncated || partFailed }
     },
 }
@@ -1928,7 +1920,7 @@ const MAX_METADATA_BYTES = 4 * 1024 * 1024
 // code. The caller used to tell them apart by comparing the entry's self-declared uncompSize against
 // the cap, which is a field the archive chooses: a lying header gave the wrong answer in both
 // directions, and the guard here never trusted it in the first place.
-type InflatedEntry = { ok: true; data: Buffer } | { ok: false; reason: 'expands-too-large' | 'malformed' }
+type InflatedEntry = { ok: true; data: Buffer } | { ok: false; reason: ExtractionReason }
 
 const inflateEntry = (entry: ZipEntry): Promise<InflatedEntry> => {
     // Stored: output === input, and the subarray is a view on bytes already resident.
@@ -1939,7 +1931,10 @@ const inflateEntry = (entry: ZipEntry): Promise<InflatedEntry> => {
                 : { ok: false as const, reason: 'expands-too-large' as const }
         )
     }
-    if (entry.method !== 8) return Promise.resolve({ ok: false as const, reason: 'malformed' as const }) // budget refuses these
+    // 'unsupported-zip-feature', matching what the decompression budget calls the same archive. A
+    // compression method we do not implement is a variant declined, not broken bytes, and the two
+    // answers carry different statuses — which is exactly what REASON_STATUS exists to prevent.
+    if (entry.method !== 8) return Promise.resolve({ ok: false as const, reason: 'unsupported-zip-feature' as const })
     // maxOutputLength, not a post-hoc length check: it errors on the chunk that would cross the cap,
     // so the allocation never happens. uncompSize is self-declared and cannot be the guard.
     return new Promise((resolve) =>
@@ -2720,7 +2715,6 @@ interface PendingDeletedParagraph {
     chars: number
 }
 
-
 interface DocxReader {
     write: (chunk: string) => void // one decoded slice of document.xml; THROWS on malformed XML
     chars: () => number // characters emitted so far — what the handler's cap check reads
@@ -2870,7 +2864,7 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
         charge(text.length)
     }
 
-    const emitSymbol = (attributes: Record<string, string | { uri?: string; local?: string; value: string }>): void => {
+    const emitSymbol = (attributes: SaxesAttributes): void => {
         const font = wordAttribute(attributes, 'font')
         const char = wordAttribute(attributes, 'char')
         if (!font || !char) return
@@ -3114,7 +3108,6 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
             skip = stack.length - 1 // the symbol is attribute-only; illegal children stay ignored
             return
         }
-
 
         if (name === 'w:p' || name === 'w:pict') {
             if (name === 'w:pict') {
@@ -3368,7 +3361,6 @@ const createDocxReader = async (maxOutputChars: number, shape: DocxPartShape = D
         },
     }
 }
-
 
 const storedDocxChunks = function* (data: Buffer): Iterable<Buffer> {
     for (let offset = 0; offset < data.length; offset += STREAM_SLICE_UNITS) {
