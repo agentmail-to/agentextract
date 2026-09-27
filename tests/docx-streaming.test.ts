@@ -277,6 +277,33 @@ describe('docx — text outside word/document.xml', () => {
         expect(r.extraction).toBe('Only here.\n\n')
     })
 
+    // The reported scenario for "a blank header ends the walk", end to end. What actually fixes it
+    // is the blank-tail collapse below — a header of empty paragraphs now contributes nothing and
+    // so displaces nothing. Removing the early exit on a full output is a separate correctness fix
+    // and is pinned by 'spends the cap on the body before the margins', which asserts that a part
+    // with text that cannot fit still reports the loss.
+    it('reads later parts past a blank header that spent its own read limit', async () => {
+        const content = await docxWithParts(text('Body'), {
+            'word/header1.xml': auxPart('hdr', '<w:p/>'.repeat(200)),
+            'word/footer1.xml': auxPart('ftr', text('Footer')),
+        })
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE }, { maxOutputChars: 100 })
+        expect(r.extraction).toContain('Footer')
+    })
+
+    // REGRESSION: the empty and duplicate checks used the trimmed text, but the UNTRIMMED text was
+    // what got appended and charged — so a run of empty paragraphs bought nothing and pushed a
+    // later part's real text out of the budget.
+    it('does not let a part\'s trailing blank paragraphs spend the budget', async () => {
+        const content = await docxWithParts(text('Body'), {
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${text('Note')}${'<w:p/>'.repeat(30)}</w:footnote>`),
+            'word/footer1.xml': auxPart('ftr', text('Footer')),
+        })
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE }, { maxOutputChars: 60 })
+        expect(r.extraction).toContain('Note')
+        expect(r.extraction).toContain('Footer')
+    })
+
     // REGRESSION: dedupe compared text that had ALREADY been clipped by the remaining budget, so a
     // second section header came back as its own prefix, failed to match the first, and was emitted
     // as new text — visibly, as "ACME Corp\n\nACME ". Parts are read whole now, so a duplicate is

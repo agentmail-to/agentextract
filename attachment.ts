@@ -568,6 +568,11 @@ const docxHandler: Handler = {
             // parse on; measured, that emits close-tag text as content and descends into elements
             // mammoth drops — silent wrong output, the one outcome this file fails over everywhere else.
                 if (reader.text().trim().length === 0) throw error
+                // OURS still escapes, even with text in hand. This catch exists for a FILE that
+                // stops being parseable partway; an invariant of ours tripping is not that, and
+                // swallowing it here reported ordinary truncation while the 'internal' alert the
+                // README describes never fired — the same hole as the caller's catch, one level in.
+                if (failureReason(error) === 'internal') throw error
                 // A part that broke AFTER producing text returns rather than throws, so the caller
                 // has to be told WHICH kind of stop this was. Reported as failure, not truncation:
                 // the distinction is the whole reason the caller keeps two flags, and collapsing it
@@ -600,34 +605,44 @@ const docxHandler: Handler = {
         // record five times over.
         const partKeys = new Map(entries.map((entry) => [entry, opcKey(entry.name)]))
 
-        const sections = body.text.trim() === '' ? [] : [body.text]
-        // Kept as a running total: recomputing it per part is quadratic in the number of headers.
-        let usedChars = sections.reduce((total, part) => total + part.length, 0)
-
-        // Two different reasons to stop, kept apart on purpose. `truncated` means we ran out of room
-        // or time, and nothing after it can be read either — so it ends the walk. `partFailed` means
-        // something was unreadable, which says nothing about the next part; it must NOT end the walk.
-        // That applies to the BODY too: folding a body that broke mid-read into `truncated` skipped
-        // every footnote, comment and header behind it, which is the very rule this pair encodes.
-        // Both are reported as truncation in the end, because either way text is missing.
+        // ONE output string, not an array plus a running count plus a join. Those three had to be
+        // kept in step by hand, and they drifted: the separator rule was written twice and the two
+        // copies disagreed, so a section cut right after a line break got a single '\n' and the next
+        // part read as a continuation of its last paragraph.
+        // Dropped entirely when the body kept no text of its own: its '\n\n' would otherwise lead a
+        // document whose only text is in a footnote with a blank paragraph.
+        let output = body.text.trim() === '' ? '' : body.text
         let truncated = body.stoppedEarly || (body.overCap && body.sawText)
         let partFailed = body.failed
 
+        const room = () => maxOutputChars - output.length
+        const append = (text: string): void => {
+            const separator = output === '' || output.endsWith(BLOCK_SEPARATOR) ? '' : BLOCK_SEPARATOR
+            output += separator + text
+        }
+
+        // Runs of empty paragraphs past the first separator. They are charged like any other output
+        // — a header padded with 200 of them spent the whole cap and pushed a later footer out —
+        // while carrying nothing a reader would see. Collapsed to the single break that ends any
+        // part, so what the budget buys is text. Applied to AUXILIARY parts only: the body's exact
+        // breaks are the contract the mammoth fidelity corpus pins.
+        const withoutBlankTail = (text: string): string => text.replace(/(\n\n)\s+$/, '$1')
+
+        // Built once. localeCompare constructs a collator per CALL, so sorting is quadratic in
+        // allocation: 20k keys measured at 1441 ms against 67 ms with a shared one, and this runs
+        // before any deadline check — a crafted package of 60k tiny header entries would block the
+        // event loop for seconds with withTimeout unable to fire.
+        const byPartNumber = new Intl.Collator('en', { numeric: true })
         // header10.xml must not sort before header2.xml, and neither may depend on the order the
         // producer happened to write the archive in: which header survives a cap that runs out
         // partway through is otherwise a property of the zip rather than of the document.
         const ordered = (found: Map<string, ZipEntry>): ZipEntry[] =>
-            [...found.entries()].sort(([a], [b]) => a.localeCompare(b, 'en', { numeric: true })).map(([, entry]) => entry)
+            [...found.entries()].sort(([a], [b]) => byPartNumber.compare(a, b)).map(([, entry]) => entry)
 
-        // EACH PART IS READ WHOLE, then fitted — rather than read into whatever budget was left.
-        // Reading into the remainder made a part's text depend on how much room happened to be
-        // free, and every question asked afterwards inherited that: a duplicate header compared as
-        // its own clipped prefix and slipped through as new text, a blank 16 KB header exhausted
-        // the budget and reported a loss it had not caused, and "was anything cut" could only be
-        // guessed from whether the part contained text at all. Read whole, all three are facts —
-        // the text is the part's own, duplicates compare exactly, and what was cut is
-        // `full length` minus `room`. Peak is bounded the same way the body already is: one part at
-        // most maxOutputChars, which is the ceiling the whole extraction is held to anyway.
+        // EACH PART IS READ WHOLE, then fitted. Reading into whatever budget was left made a part's
+        // text depend on how much room happened to be free, and every question asked afterwards
+        // inherited that. Read whole, all three are facts — the text is the part's own, duplicates
+        // compare exactly, and what is cut is `length` minus `room`.
         for (const { pattern, shape, dedupe } of DOCX_AUXILIARY_PARTS) {
             // `dedupe` doubles as "this family can have more than one part". Footnotes, endnotes and
             // comments each live in exactly one, so ordering and duplicate-matching are machinery
@@ -643,10 +658,6 @@ const docxHandler: Handler = {
             }
 
             for (const entry of dedupe ? ordered(matches) : [...matches.values()]) {
-                if (truncated) break
-                // BELOW the name match, deliberately. Checked against entries we are actually going
-                // to read, because a deadline that passes while walking parts we would skip anyway
-                // has cost the output nothing.
                 if (Date.now() > deadline) {
                     truncated = true
                     break
@@ -656,66 +667,49 @@ const docxHandler: Handler = {
                     read = await readPart(entry, shape, maxOutputChars)
                     if (read.failed) partFailed = true
                 } catch (error) {
-                    // OUR failures still escape. Best-effort is about the FILE being unreadable —
-                    // a broken footnotes part costs its own text and nothing else. An invariant of
-                    // ours tripping, or a parser that will not load, is not that: swallowing it
-                    // reported 'extracted' with a truncation flag, and the 'internal' spike the
-                    // README says should page someone would never have fired.
-                    if (error instanceof ExtractionFailure && error.code === 'internal') throw error
-                    if (isModuleLoadError(error)) throw error
+                    // OUR failures still escape: best-effort is about the FILE being unreadable, and
+                    // an invariant of ours tripping is not. Asked through failureReason so this
+                    // cannot drift from the classification every other caller uses.
+                    if (failureReason(error) === 'internal') throw error
                     // BEST-EFFORT: turning a readable document into a failure over its margins
                     // would trade a whole extraction for a fragment.
                     partFailed = true
                     continue
                 }
-                // The part hit the GLOBAL cap on its own, so its own text is incomplete.
+                // The part hit the GLOBAL cap on its own, so its own text is incomplete. Recorded,
+                // but it does not end the walk — later parts may still fit.
                 if (read.stoppedEarly || read.overCap) truncated = true
+                const text = withoutBlankTail(read.text)
                 // Decided on the part's FULL text, before any budget is charged against it.
-                const text = read.text.trim()
-                if (text === '' || (dedupe && seen.has(text))) continue
-                if (dedupe) seen.add(text)
+                const key = text.trim()
+                if (key === '' || (dedupe && seen.has(key))) continue
+                if (dedupe) seen.add(key)
 
-                // The separator is output too, so it is charged like output. Leaving it out let the
-                // joined text run past the cap, and the central trim then cut the tail off the last
-                // part — reporting a truncation this loop had already decided against.
-                const separator = sections.length === 0 || sections[sections.length - 1].endsWith('\n') ? 0 : BLOCK_SEPARATOR.length
-                const overflow = Math.min(separator + read.text.length + usedChars - maxOutputChars, read.text.length)
+                // NO EARLY EXIT ON A FULL OUTPUT. A part that contributes nothing leaves as much
+                // room behind it as in front, so stopping the walk when the budget ran dry dropped
+                // later parts a blank header had never actually displaced — and dropped them
+                // SILENTLY, because a part never read cannot report what it held. Every part is
+                // reached; the fitting below is what decides, and a part with text that cannot fit
+                // both records the loss and ends the walk, since nothing after it would fit either.
+                const separator = output === '' || output.endsWith(BLOCK_SEPARATOR) ? 0 : BLOCK_SEPARATOR.length
+                const overflow = separator + text.length - room()
                 if (overflow <= 0) {
-                    sections.push(read.text)
-                    usedChars += separator + read.text.length
+                    append(text)
                     continue
                 }
-                // MEASURED, not inferred: what does not fit is exactly what is lost, and it is a
-                // loss only if any of it is content. Reading the part whole is what makes that
-                // answerable — the overflow is a substring we hold, not a guess.
-                //
-                // Whitespace-only overflow is TRIMMED here rather than handed on: a footer ending
-                // one paragraph break past the cap has everything a reader would see, but passing
-                // it up would have the entry point slice it and set `truncated` on its own, which
-                // is the "continues past this point" this is trying not to say.
-                const fitted = read.text.slice(0, read.text.length - overflow)
-                if (/\S/.test(read.text.slice(read.text.length - overflow))) truncated = true
-                if (fitted !== '') {
-                    sections.push(fitted)
-                    usedChars += separator + fitted.length
-                }
-                break // no room for the parts after this one either way
+                // MEASURED: what does not fit is exactly what is lost, and it is a loss only if any
+                // of it is content. Whitespace-only overflow is trimmed here rather than passed up,
+                // where the entry point would slice it and set `truncated` on its own.
+                const cut = Math.min(overflow, text.length)
+                if (/\S/.test(text.slice(text.length - cut))) truncated = true
+                const fitted = text.slice(0, text.length - cut)
+                if (fitted !== '') append(fitted)
+                break // the output is full; nothing after this can fit either
             }
-            if (truncated) break
         }
 
-        // A separator goes BETWEEN sections that need one, never after the last. Parts are
-        // concatenated because the reader terminates every paragraph — but a part that broke
-        // mid-paragraph ends without one, and its last word then ran straight into the next part's
-        // first: a body ending "Body text" followed by a footnote "Note" read as "Body textNote".
-        // Only between, because the final section may legitimately end unterminated: a document
-        // whose last paragraph carries a deleted mark keeps its text without a trailing break.
-        const joined = sections.reduce(
-            (all, part) => (all === '' || all.endsWith('\n') ? all + part : all + BLOCK_SEPARATOR + part),
-            ''
-        )
         // Emptiness is left to the entry point, which omits `extraction` for text that trims to ''.
-        return { text: joined, truncated: truncated || partFailed }
+        return { text: output, truncated: truncated || partFailed }
     },
 }
 
