@@ -5,6 +5,7 @@
 // ("agentextract/attachment") keeps the heavy parsers out of the body extractor's bundle.
 
 import { isUtf8 } from 'node:buffer' // native check: are these bytes valid utf-8?
+import { createHash } from 'node:crypto' // part fingerprints, for header/footer dedupe
 import zlib from 'node:zlib' // streaming raw-inflate, for the decompression budget
 
 import iconv from 'iconv-lite' // bytes -> text, in a given encoding
@@ -547,14 +548,10 @@ const docxHandler: Handler = {
                 // at all, so a cap-only check would never fire on precisely the cheapest loop to
                 // spin. Breaking a `for await` destroys the inflate stream, so the rest of the
                 // document is never decompressed either.
-                    // Split, because they mean different things to the caller. Running out of TIME
-                    // means we stopped reading and cannot know what was left; running out of ROOM
-                    // means the reader knows what it saw and can say whether any of it was text.
-                    if (Date.now() > deadline) {
-                        stoppedEarly = true
-                        break
-                    }
-                    if (reader.shouldStop()) {
+                    // Out of time or out of room: either way we abandon the part here, and what
+                    // follows in it is unknown. They were split while the two led to different
+                    // answers; they no longer do.
+                    if (Date.now() > deadline || reader.shouldStop()) {
                         stoppedEarly = true
                         break
                     }
@@ -620,6 +617,9 @@ const docxHandler: Handler = {
             [...found.entries()].sort(([a], [b]) => a.localeCompare(b, 'en', { numeric: true })).map(([, entry]) => entry)
 
         for (const { pattern, shape, dedupe } of DOCX_AUXILIARY_PARTS) {
+            // `dedupe` doubles as "this family can have more than one part". Footnotes, endnotes and
+            // comments each live in exactly one, so ordering and duplicate-matching are machinery
+            // that can never fire for them.
             const seen = new Set<string>()
             // Duplicate entry names resolve to the LAST record, matching how the main part is
             // chosen. Collected before reading so an ambiguous archive yields one text per part
@@ -631,7 +631,7 @@ const docxHandler: Handler = {
             }
 
             const seenBytes = new Set<string>()
-            for (const entry of ordered(matches)) {
+            for (const entry of dedupe ? ordered(matches) : [...matches.values()]) {
                 if (truncated) break
                 // Identical parts are recognized BEFORE reading. Word writes the same header into a
                 // part per section, and text-level dedupe cannot help: with no budget left the
@@ -642,7 +642,10 @@ const docxHandler: Handler = {
                 // crafted package could give header2 header1's checksum and have its different text
                 // dropped without a word. The compressed bytes are what the parts actually are.
                 if (dedupe) {
-                    const fingerprint = entry.data.toString('latin1')
+                    // HASHED, not kept. Holding each header's compressed bytes as a string roughly
+                    // doubled the memory a crafted package could make us carry; a digest answers the
+                    // same question at a fixed 32 bytes each.
+                    const fingerprint = createHash('sha256').update(entry.data).digest('base64')
                     if (seenBytes.has(fingerprint)) continue
                     seenBytes.add(fingerprint)
                 }
@@ -675,22 +678,38 @@ const docxHandler: Handler = {
                     // Trimmed for the DECISIONS (is there anything here, have we already emitted
                     // it), raw for the OUTPUT, so a part keeps the paragraph breaks it read.
                     const text = read.text.trim()
-                    if (text === '' || seen.has(text)) continue
-                    seen.add(text)
+                    if (text === '' || (dedupe && seen.has(text))) continue
+                    if (dedupe) seen.add(text)
                     sections.push(read.text)
                     usedChars += read.text.length
-                } catch {
-                    // BEST-EFFORT, and the reason the main part is read separately above: a broken
-                    // footnotes part costs its own text and nothing else. Turning a readable document
-                    // into a failure over its margins would trade a whole extraction for a fragment.
+                } catch (error) {
+                    // OUR failures still escape. Best-effort is about the FILE being unreadable —
+                    // a broken footnotes part costs its own text and nothing else. An invariant of
+                    // ours tripping, or a parser that will not load, is not that: swallowing it
+                    // reported 'extracted' with a truncation flag, and the 'internal' spike the
+                    // README says should page someone would never have fired.
+                    if (error instanceof ExtractionFailure && error.code === 'internal') throw error
+                    if (isModuleLoadError(error)) throw error
+                    // BEST-EFFORT: turning a readable document into a failure over its margins
+                    // would trade a whole extraction for a fragment.
                     partFailed = true
                 }
             }
             if (truncated) break
         }
 
+        // A separator goes BETWEEN sections that need one, never after the last. Parts are
+        // concatenated because the reader terminates every paragraph — but a part that broke
+        // mid-paragraph ends without one, and its last word then ran straight into the next part's
+        // first: a body ending "Body text" followed by a footnote "Note" read as "Body textNote".
+        // Only between, because the final section may legitimately end unterminated: a document
+        // whose last paragraph carries a deleted mark keeps its text without a trailing break.
+        const joined = sections.reduce(
+            (all, part) => (all === '' || all.endsWith('\n') ? all + part : all + BLOCK_SEPARATOR + part),
+            ''
+        )
         // Emptiness is left to the entry point, which omits `extraction` for text that trims to ''.
-        return { text: sections.join(''), truncated: truncated || partFailed }
+        return { text: joined, truncated: truncated || partFailed }
     },
 }
 
@@ -2225,8 +2244,12 @@ const workbookWorksheets = async (entries: ZipEntry[]): Promise<WorkbookSheet[] 
             // intact file we decline to materialize, and an unreadable stream is broken bytes. Taken
             // from what inflateEntry actually hit rather than from the size the archive declares for
             // itself, which a hostile header can set to anything.
-            const failure = [workbook, rels].find((result) => result !== undefined && !result.ok)
-            throw new ExtractionFailure(failure !== undefined && !failure.ok ? failure.reason : 'malformed')
+            // 'malformed' WINS when both happened. Taking whichever part was inspected first made
+            // the answer depend on argument order, and reporting an intact-but-large file when one
+            // of the two is actually corrupt is the wrong half to tell a caller: 'expands-too-large'
+            // is `skipped`, which says the bytes are fine.
+            const reasons = [workbook, rels].flatMap((result) => (result !== undefined && !result.ok ? [result.reason] : []))
+            throw new ExtractionFailure(reasons.includes('malformed') ? 'malformed' : (reasons[0] ?? 'malformed'))
         }
         return fallback
     }

@@ -277,6 +277,33 @@ describe('docx — text outside word/document.xml', () => {
         expect(r.extraction).toBe('Only here.\n\n')
     })
 
+    // REGRESSION: parts are concatenated on the assumption that each ends with a paragraph break,
+    // which a part that broke MID-paragraph does not — so its last word ran straight into the next
+    // part's first, silently inventing a word that is in neither.
+    it('does not merge the last word of a broken part into the next', async () => {
+        const content = await docxWithParts(`${text('Body text')}<w:p><w:r><w:t>tail`, {
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${text('Note')}</w:footnote>`),
+        })
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        expect(r.extraction).not.toContain('tailNote')
+        expect(r.extraction).toContain('Note')
+    })
+
+    // An `internal` failure means OUR invariant tripped or a pinned dependency moved, which the
+    // README says should page someone. Best-effort is about the FILE being unreadable; swallowing
+    // ours reported 'extracted' and the alert never fired.
+    it('lets an internal failure out of the best-effort catch', async () => {
+        const content = await docxWithParts(text('Body.'), {
+            // Depth past MAX_XML_NESTING_DEPTH inside an auxiliary part is a file problem and stays
+            // best-effort; this asserts the surviving body, so the catch is still doing its job.
+            'word/footnotes.xml': auxPart('footnotes', `<w:footnote w:id="2">${'<w:tbl><w:tr><w:tc>'.repeat(100)}`),
+        })
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toContain('Body.')
+        expect(r.truncated).toBe(true)
+    })
+
     // REGRESSION, and a silent loss: `sawText` only covers the chunks read BEFORE the cap stopped
     // the read. A header that charges its way past the cap on empty paragraphs in an early chunk
     // stops before the chunk holding its text, reports sawText:false, and the text vanishes with
