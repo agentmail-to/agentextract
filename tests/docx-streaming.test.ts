@@ -277,6 +277,43 @@ describe('docx — text outside word/document.xml', () => {
         expect(r.extraction).toBe('Only here.\n\n')
     })
 
+    // REGRESSION: dedupe compared text that had ALREADY been clipped by the remaining budget, so a
+    // second section header came back as its own prefix, failed to match the first, and was emitted
+    // as new text — visibly, as "ACME Corp\n\nACME ". Parts are read whole now, so a duplicate is
+    // compared as what it is.
+    it('recognizes a duplicate header that the budget would have clipped', async () => {
+        const content = await docxWithParts(text('Body.'), {
+            'word/header1.xml': auxPart('hdr', text('ACME Corp')),
+            'word/header2.xml': auxPart('hdr', text('ACME Corp') + '<w:p/>'), // same text, different bytes
+        })
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE }, { maxOutputChars: 23 })
+        expect(r.extraction).toBe('Body.\n\nACME Corp\n\n')
+        expect(r.truncated).toBe(false)
+    })
+
+    // REGRESSION: the truncation flag was set before the duplicate check, so a copy we were always
+    // going to discard reported the document as continuing past this point.
+    it('does not report truncation for a duplicate it discards', async () => {
+        const content = await docxWithParts(text('Body.'), {
+            'word/header1.xml': auxPart('hdr', text('ACME Corp')),
+            'word/header2.xml': auxPart('hdr', text('ACME Corp') + '<w:p/>'),
+        })
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE }, { maxOutputChars: 18 })
+        expect(r.truncated).toBe(false)
+    })
+
+    // REGRESSION: a part whose overflow past the cap is only a paragraph break has lost nothing a
+    // reader would see, but any overflow counted — and the separator between sections was not
+    // charged at all, so the joined text could run past the cap and be cut by the central trim.
+    it('does not report truncation when only whitespace falls past the cap', async () => {
+        const content = await docxWithParts(text('Body.'), {
+            'word/footer1.xml': auxPart('ftr', text('Page') + '<w:p/>'),
+        })
+        const r = await extractAttachment({ content, contentType: DOCX_TYPE }, { maxOutputChars: 14 })
+        expect(r.extraction).toContain('Page')
+        expect(r.truncated).toBe(false)
+    })
+
     // REGRESSION: parts are concatenated on the assumption that each ends with a paragraph break,
     // which a part that broke MID-paragraph does not — so its last word ran straight into the next
     // part's first, silently inventing a word that is in neither.

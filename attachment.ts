@@ -5,7 +5,6 @@
 // ("agentextract/attachment") keeps the heavy parsers out of the body extractor's bundle.
 
 import { isUtf8 } from 'node:buffer' // native check: are these bytes valid utf-8?
-import { createHash } from 'node:crypto' // part fingerprints, for header/footer dedupe
 import zlib from 'node:zlib' // streaming raw-inflate, for the decompression budget
 
 import iconv from 'iconv-lite' // bytes -> text, in a given encoding
@@ -539,7 +538,7 @@ const docxHandler: Handler = {
             let overCap = false
             let sawContent: boolean | undefined
             try {
-                for await (const chunk of docxMainPartChunks(entry)) {
+                for await (const chunk of docxPartChunks(entry)) {
                 // Both guards here, ahead of the work, at one inflate chunk of granularity. Finer
                 // than the pdf per-page and xlsx per-row checks, and the only place a stop is
                 // possible: saxes has no abort, so the way to stop parsing is to stop feeding it.
@@ -597,6 +596,10 @@ const docxHandler: Handler = {
         // kept no text of its own, because its '\n\n' would otherwise lead a document whose only
         // text is in a footnote with a blank paragraph. From the text KEPT, not merely emitted: a
         // suppressed vMerge cell emits text that never reaches the output.
+        // Once per entry, not once per entry per family: opcKey builds a URL, and this walked every
+        // record five times over.
+        const partKeys = new Map(entries.map((entry) => [entry, opcKey(entry.name)]))
+
         const sections = body.text.trim() === '' ? [] : [body.text]
         // Kept as a running total: recomputing it per part is quadratic in the number of headers.
         let usedChars = sections.reduce((total, part) => total + part.length, 0)
@@ -616,6 +619,15 @@ const docxHandler: Handler = {
         const ordered = (found: Map<string, ZipEntry>): ZipEntry[] =>
             [...found.entries()].sort(([a], [b]) => a.localeCompare(b, 'en', { numeric: true })).map(([, entry]) => entry)
 
+        // EACH PART IS READ WHOLE, then fitted — rather than read into whatever budget was left.
+        // Reading into the remainder made a part's text depend on how much room happened to be
+        // free, and every question asked afterwards inherited that: a duplicate header compared as
+        // its own clipped prefix and slipped through as new text, a blank 16 KB header exhausted
+        // the budget and reported a loss it had not caused, and "was anything cut" could only be
+        // guessed from whether the part contained text at all. Read whole, all three are facts —
+        // the text is the part's own, duplicates compare exactly, and what was cut is
+        // `full length` minus `room`. Peak is bounded the same way the body already is: one part at
+        // most maxOutputChars, which is the ceiling the whole extraction is held to anyway.
         for (const { pattern, shape, dedupe } of DOCX_AUXILIARY_PARTS) {
             // `dedupe` doubles as "this family can have more than one part". Footnotes, endnotes and
             // comments each live in exactly one, so ordering and duplicate-matching are machinery
@@ -626,62 +638,23 @@ const docxHandler: Handler = {
             // name rather than one per record.
             const matches = new Map<string, ZipEntry>()
             for (const entry of entries) {
-                const key = opcKey(entry.name)
+                const key = partKeys.get(entry)
                 if (key !== undefined && pattern.test(key)) matches.set(key, entry)
             }
 
-            const seenBytes = new Set<string>()
             for (const entry of dedupe ? ordered(matches) : [...matches.values()]) {
                 if (truncated) break
-                // Identical parts are recognized BEFORE reading. Word writes the same header into a
-                // part per section, and text-level dedupe cannot help: with no budget left the
-                // reader stores nothing, so the copy comes back as '' and looks like new text.
-                //
-                // From the STORED BYTES, not from the CRC and size the archive declares about
-                // itself. Those are metadata the producer chose and nothing here verifies, so a
-                // crafted package could give header2 header1's checksum and have its different text
-                // dropped without a word. The compressed bytes are what the parts actually are.
-                if (dedupe) {
-                    // HASHED, not kept. Holding each header's compressed bytes as a string roughly
-                    // doubled the memory a crafted package could make us carry; a digest answers the
-                    // same question at a fixed 32 bytes each.
-                    const fingerprint = createHash('sha256').update(entry.data).digest('base64')
-                    if (seenBytes.has(fingerprint)) continue
-                    seenBytes.add(fingerprint)
-                }
                 // BELOW the name match, deliberately. Checked against entries we are actually going
                 // to read, because a deadline that passes while walking parts we would skip anyway
-                // has cost the output nothing, and marking a complete document truncated there
-                // appends a "continues past this point" trailer to a document that does not.
+                // has cost the output nothing.
                 if (Date.now() > deadline) {
                     truncated = true
                     break
                 }
-                // NOT `if (remaining <= 0) { truncated = true; break }`. Having no room left says
-                // nothing about whether anything remains to LOSE, and Word routinely writes empty
-                // headers and separator-only footnotes — so a body of exactly maxOutputChars got a
-                // "continues past this point" trailer over parts holding nothing. Reading at a
-                // budget of zero answers the question instead of assuming it: the reader charges
-                // for text it finds and reports the overrun, while an empty part charges nothing.
-                const remaining = Math.max(0, maxOutputChars - usedChars)
+                let read
                 try {
-                    const read = await readPart(entry, shape, remaining)
+                    read = await readPart(entry, shape, maxOutputChars)
                     if (read.failed) partFailed = true
-                    // TRUNCATION IS ABOUT TEXT LOST. Two ways to lose some, and they are asked
-                    // differently: abandoning the part mid-read leaves what follows UNKNOWN, so it
-                    // counts whatever we managed to see; reading the part to its end and clipping
-                    // only loses something if any of what was clipped was text. A part charges for
-                    // its paragraph terminator like any other output, so without that second
-                    // distinction an empty <w:p/> read at a budget of zero marked a COMPLETE
-                    // document truncated.
-                    if (read.stoppedEarly || (read.overCap && read.sawText)) truncated = true
-                    // Trimmed for the DECISIONS (is there anything here, have we already emitted
-                    // it), raw for the OUTPUT, so a part keeps the paragraph breaks it read.
-                    const text = read.text.trim()
-                    if (text === '' || (dedupe && seen.has(text))) continue
-                    if (dedupe) seen.add(text)
-                    sections.push(read.text)
-                    usedChars += read.text.length
                 } catch (error) {
                     // OUR failures still escape. Best-effort is about the FILE being unreadable —
                     // a broken footnotes part costs its own text and nothing else. An invariant of
@@ -693,7 +666,40 @@ const docxHandler: Handler = {
                     // BEST-EFFORT: turning a readable document into a failure over its margins
                     // would trade a whole extraction for a fragment.
                     partFailed = true
+                    continue
                 }
+                // The part hit the GLOBAL cap on its own, so its own text is incomplete.
+                if (read.stoppedEarly || read.overCap) truncated = true
+                // Decided on the part's FULL text, before any budget is charged against it.
+                const text = read.text.trim()
+                if (text === '' || (dedupe && seen.has(text))) continue
+                if (dedupe) seen.add(text)
+
+                // The separator is output too, so it is charged like output. Leaving it out let the
+                // joined text run past the cap, and the central trim then cut the tail off the last
+                // part — reporting a truncation this loop had already decided against.
+                const separator = sections.length === 0 || sections[sections.length - 1].endsWith('\n') ? 0 : BLOCK_SEPARATOR.length
+                const overflow = Math.min(separator + read.text.length + usedChars - maxOutputChars, read.text.length)
+                if (overflow <= 0) {
+                    sections.push(read.text)
+                    usedChars += separator + read.text.length
+                    continue
+                }
+                // MEASURED, not inferred: what does not fit is exactly what is lost, and it is a
+                // loss only if any of it is content. Reading the part whole is what makes that
+                // answerable — the overflow is a substring we hold, not a guess.
+                //
+                // Whitespace-only overflow is TRIMMED here rather than handed on: a footer ending
+                // one paragraph break past the cap has everything a reader would see, but passing
+                // it up would have the entry point slice it and set `truncated` on its own, which
+                // is the "continues past this point" this is trying not to say.
+                const fitted = read.text.slice(0, read.text.length - overflow)
+                if (/\S/.test(read.text.slice(read.text.length - overflow))) truncated = true
+                if (fitted !== '') {
+                    sections.push(fitted)
+                    usedChars += separator + fitted.length
+                }
+                break // no room for the parts after this one either way
             }
             if (truncated) break
         }
@@ -3391,10 +3397,11 @@ const storedDocxChunks = function* (data: Buffer): Iterable<Buffer> {
     }
 }
 
-// One shape for both storage methods, so the handler's loop has a single form. Stored parts are
+// One shape for both storage methods, so the handler's loop has a single form. Used for EVERY
+// part the docx handler reads, not just the main one. Stored parts are
 // sliced rather than handed over whole, keeping cap/deadline checks enforceable at the same bounded
 // granularity as deflate's output. Method 8 yields under backpressure from zlib.
-const docxMainPartChunks = (part: ZipEntry): AsyncIterable<Buffer> | Iterable<Buffer> => {
+const docxPartChunks = (part: ZipEntry): AsyncIterable<Buffer> | Iterable<Buffer> => {
     if (part.method === 0) return storedDocxChunks(part.data)
     const inflate = zlib.createInflateRaw()
     inflate.end(part.data) // pushes the compressed bytes; the readable side inflates only on demand
@@ -3640,6 +3647,8 @@ class ExtractionFailure extends Error {
 // Which status a reason belongs to. TOTAL, and the single authority — a reason is either a decline
 // or an inability, never both, and pairing the two by hand at each return site is what let one fact
 // ('unsupported-zip-feature') come back as `skipped` from the budget and `failed` from the rewrite.
+// Every refusal goes through here, so a status is never written beside a reason by hand — which is
+// how one fact came back under two statuses before REASON_STATUS existed.
 const REASON_STATUS: Record<ExtractionReason, 'skipped' | 'failed'> = {
     'too-large': 'skipped',
     'expands-too-large': 'skipped',
@@ -3652,6 +3661,8 @@ const REASON_STATUS: Record<ExtractionReason, 'skipped' | 'failed'> = {
     'timed-out': 'failed',
     internal: 'failed',
 }
+
+const refusal = (reason: ExtractionReason): ExtractionResult => ({ status: REASON_STATUS[reason], reason })
 
 // pdf.js refuses an encrypted document by throwing, so the error IS the signal. Matched on the
 // class name alone: a message match also caught any parser error that happened to quote a sheet
@@ -3738,7 +3749,7 @@ export const extractAttachment = async (
 
     // Size gate, before any decode or parse.
     if (byteSize > MAX_INPUT_BYTES) {
-        return { status: REASON_STATUS['too-large'], reason: 'too-large' }
+        return refusal('too-large')
     }
 
     const { type, charset: charsetHint } = parseContentType(input.contentType)
@@ -3752,12 +3763,11 @@ export const extractAttachment = async (
     // define as never retryable. Whether we happen to have a handler says nothing about whether the
     // content is ours to read.
     if (looksEncryptedOffice(input.content)) {
-        return { status: REASON_STATUS['password-protected'], reason: 'password-protected' }
+        return refusal('password-protected')
     }
 
     if (!handler) {
-        const reason = type ? 'unsupported-format' : 'unrecognized'
-        return { status: REASON_STATUS[reason], reason }
+        return refusal(type ? 'unsupported-format' : 'unrecognized')
     }
 
     const maxOutputChars = resolveCap(options.maxOutputChars)
@@ -3770,7 +3780,7 @@ export const extractAttachment = async (
         if (kind === 'docx' || kind === 'xlsx') {
             const check = await checkDecompressionBudget(input.content, MAX_UNCOMPRESSED_BYTES)
             // Derived here too, so REASON_STATUS really is the only place the pairing lives.
-            if (!check.ok) return { status: REASON_STATUS[check.reason], reason: check.reason }
+            if (!check.ok) return refusal(check.reason)
         }
 
         const output = await withTimeout(
@@ -3818,8 +3828,6 @@ export const extractAttachment = async (
     } catch (error) {
         // The bytes are attacker-controlled, so a throw or timeout is an expected event, not a bug:
         // label it and move on rather than crashing the caller.
-        // Status derived from the reason, never chosen alongside it, so the two cannot disagree.
-        const reason = failureReason(error)
-        return { status: REASON_STATUS[reason], reason }
+        return refusal(failureReason(error))
     }
 }
