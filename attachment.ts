@@ -191,10 +191,10 @@ export interface ExtractionResult {
     // Whether the document continues past `extraction`. Set on `extracted` only — skipped/failed
     // have no text to have cut. Independent of `trailer`, so a consumer never parses the text for it.
     truncated?: boolean
-    // Set on a COMPLETE `extracted` result that carries no text, and never otherwise — so exactly
-    // one of `extraction` and `emptyReason` is present whenever `truncated` is false. A truncated
-    // result with neither is the third case, and means what it says: we stopped before finding text
-    // and cannot tell you whether there is any.
+    // Set on a COMPLETE `extracted` result that carries no text, and never alongside text. NOT the
+    // complement of `extraction`, though: most empty results carry no reason either, because most
+    // handlers cannot prove which kind of empty they are looking at. Absent means "we cannot tell",
+    // which for a consumer reads as "may be worth OCR" — never as "there is nothing here".
     emptyReason?: EmptyReason
 }
 
@@ -329,18 +329,23 @@ interface DocxPartShape {
     skipItem?: (attributes: SaxesAttributes) => boolean
 }
 
-// ECMA-376 ST_FtnEdn defines four note types and only 'normal' is content. The other three are the
-// furniture Word draws around the note area — the rule, its continuation, and the notice that a note
-// carries on overleaf — and each emits a stray blank paragraph if treated as a note.
 // The elements that reference an actual image, by namespace and local name — a:blip is the blob a
 // picture points at, pic:pic the picture itself, v:imagedata the VML spelling. Matched by URI
 // because OOXML_PREFIXES maps only w/mc/v, so these arrive as {uri}local rather than a prefix.
 const DOCX_IMAGE_ELEMENTS = new Map([
     ['http://schemas.openxmlformats.org/drawingml/2006/main', 'blip'],
     ['http://schemas.openxmlformats.org/drawingml/2006/picture', 'pic'],
+    // ISO Strict re-homes DrawingML under purl.oclc.org exactly as it does WordprocessingML. The
+    // reader already accepts Strict documents, so listing only Transitional here reported an
+    // image-only Strict .docx as holding nothing.
+    ['http://purl.oclc.org/ooxml/drawingml/main', 'blip'],
+    ['http://purl.oclc.org/ooxml/drawingml/picture', 'pic'],
     ['urn:schemas-microsoft-com:vml', 'imagedata'],
 ])
 
+// ECMA-376 ST_FtnEdn defines four note types and only 'normal' is content. The other three are the
+// furniture Word draws around the note area — the rule, its continuation, and the notice that a note
+// carries on overleaf — and each emits a stray blank paragraph if treated as a note.
 const DOCX_SEPARATOR_NOTE_TYPES = new Set(['separator', 'continuationSeparator', 'continuationNotice'])
 const isSeparatorNote = (attributes: SaxesAttributes): boolean => {
     const type = wordAttribute(attributes, 'type')
@@ -525,9 +530,24 @@ const pdfHandler: Handler = {
                     // scan past HANDLER_TIMEOUT_MS. One page PROVES an image when it finds one —
                     // but it cannot disprove one for a document with more pages, so a scan behind a
                     // blank cover answers "unknown" rather than "empty".
-                    const { fnArray } = await (await pdf.getPage(1)).getOperatorList()
-                    if ((fnArray as number[]).some((op) => imageOps.has(op))) return 'no-text-layer'
-                    return pagesRead === 1 ? 'no-text-content' : undefined
+                    //
+                    // RACED against the deadline as well as guarded by it. A single image decode can
+                    // outlast the time left, and withTimeout would then reject the whole extraction
+                    // — turning a document that read fine into 'timed-out' because the thing that
+                    // LABELS its emptiness was slow. The label is optional; the extraction is not.
+                    const operators = await Promise.race([
+                        pdf.getPage(1).then((page) => page.getOperatorList()),
+                        new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), Math.max(0, deadline - Date.now())).unref?.()),
+                    ])
+                    if (operators === undefined) return undefined
+                    const fnArray = operators.fnArray as number[]
+                    if (fnArray.some((op) => imageOps.has(op))) return 'no-text-layer'
+                    // NOTHING DRAWN is the only proof of emptiness available here. A page that paints
+                    // without an image operator is drawing something we cannot read — text outlined
+                    // as vector paths, a form field's appearance stream — and calling that
+                    // 'no-text-content' told a caller to discard a page with visible words on it.
+                    // (tests/fixtures/blank.pdf is exactly this: no text items, 564 operators.)
+                    return fnArray.length === 0 && pagesRead === 1 ? 'no-text-content' : undefined
                 } catch {
                     // The probe is an extra: a document that used to come back empty must not start
                     // coming back failed because the thing that labels its emptiness threw.
@@ -700,7 +720,10 @@ const docxHandler: Handler = {
         // or a broken footnotes.xml silently takes the headers and footers with it. Both end up
         // reported as truncation, because either way the document continues past what we return.
         let partFailed = false
-        let sawPicture = body.sawPicture
+        // BODY ONLY. A header or footer logo is page furniture that appears on every page of a
+        // template, so counting it made an otherwise-empty document on headed paper claim to be a
+        // scan and sent it to OCR. What the document itself holds is what answers the question.
+        const sawPicture = body.sawPicture
 
         // header10.xml must not sort before header2.xml, and neither may depend on the order the
         // producer happened to write the archive in: which header survives a cap that runs out
@@ -727,9 +750,14 @@ const docxHandler: Handler = {
                 // here: with no budget left the reader stores nothing, so the copy comes back as ''
                 // and looks like new text rather than the duplicate it is — charging the cap and
                 // reporting a truncation for a part we were always going to throw away.
-                const fingerprint = `${entry.crc}:${entry.uncompSize}`
-                if (dedupe && seenBytes.has(fingerprint)) continue
-                seenBytes.add(fingerprint)
+                // Only when the archive actually committed to a checksum. A writer that defers the
+                // CRC to a data descriptor leaves zero in the central directory, and treating that
+                // as an identity dropped every later header as a copy of the first.
+                if (entry.crc !== 0 && entry.compSize > 0) {
+                    const fingerprint = `${entry.crc}:${entry.uncompSize}`
+                    if (dedupe && seenBytes.has(fingerprint)) continue
+                    seenBytes.add(fingerprint)
+                }
                 // BELOW the name match, deliberately. Checked against entries we are actually going
                 // to read, because a deadline that passes while walking parts we would skip anyway
                 // has cost the output nothing, and marking a complete document truncated there
@@ -748,11 +776,14 @@ const docxHandler: Handler = {
                 try {
                     const read = await readPart(entry, shape, remaining)
                     if (read.failed) partFailed = true
-                    if (read.sawPicture) sawPicture = true
                     // Trimmed for the DECISIONS (is there anything here, have we already emitted
                     // it), raw for the OUTPUT, so a part keeps the paragraph breaks it read.
                     const text = read.text.trim()
-                    const duplicate = dedupe && seen.has(text)
+                    // A part cut short cannot be judged a duplicate: its stored prefix is only
+                    // the beginning, and a header reading "ACME Corp\n\nDRAFT..." clipped to
+                    // "ACME Corp" matched the letterhead before it — so the rest was dropped AND
+                    // the truncation suppressed, losing text while reporting a complete document.
+                    const duplicate = dedupe && !read.truncated && !read.stoppedForTime && seen.has(text)
                     // TRUNCATION IS ABOUT TEXT LOST, so it is decided here rather than from the cap
                     // alone. A part charges for its paragraph terminator like any other output, so
                     // an empty <w:p/> — which Word writes routinely — read at a budget of zero came
@@ -3512,18 +3543,22 @@ const NON_DOC_OLE_EXTENSIONS = new Set(['.xls', '.ppt', '.msg'])
 // declined any legacy .doc that merely mentioned the word, because .doc stores its body text in
 // exactly that encoding — a document ABOUT encrypted packages read as an encrypted package. A CFB
 // directory entry is a fixed 128-byte record: its name occupies the first 64 bytes, its length in
-// bytes sits at +64 and its object type at +66. Requiring all three to line up at a 128-byte
-// boundary is what separates a stream called EncryptedPackage from a sentence containing the word.
+// bytes sits at +64 and its object type at +66.
 //
-// Every entry is 128-aligned from the start of the file whatever the sector size (the first sector
-// begins at 512 or 4096, both multiples of 128), so the directory can be found without walking the
-// FAT. Bounded to the head like every other sniff.
+// The whole directory is walked through the FAT, because one 512-byte sector holds four entries and
+// a real encrypted package has about ten — reading a single sector missed the files this exists to
+// recognize. Only CHILDREN OF THE ROOT count: every storage in a compound file shares this one
+// directory, so accepting a match anywhere also accepted an encrypted object EMBEDDED in a readable
+// document, and declined that document as locked while its own text went unread.
 const ENCRYPTED_PACKAGE_NAME = Buffer.from('EncryptedPackage', 'utf16le')
 const CFB_ENTRY_BYTES = 128
 const CFB_HEADER_BYTES = 512
 // Sector numbers above this are the format's sentinels (FREESECT, ENDOFCHAIN, FATSECT, ...).
 const CFB_MAX_SECTOR = 0xfffffff9
 const CFB_END_OF_CHAIN = 0xfffffffe
+// A ceiling on how much directory to read: this only ever looks for one top-level stream, and a
+// malformed chain must not walk an attacker-sized file into memory.
+const CFB_MAX_DIRECTORY_ENTRIES = 4096
 const CFB_STREAM_TYPE = 2
 
 const looksEncryptedOffice = (content: Buffer): boolean => {
@@ -3547,7 +3582,12 @@ const looksEncryptedOffice = (content: Buffer): boolean => {
     }
     const nextSector = (sector: number): number => {
         const perSector = sectorSize / 4
-        const fat = readSector(fatSectors[Math.floor(sector / perSector)] ?? -1)
+        // END THE CHAIN when the FAT sector is not listed. `?? -1` looked like a miss, but at(-1)
+        // is 0 — so readSector(-1) handed back the file HEADER and the walk followed header bytes
+        // as if they were a FAT, chasing arbitrary sectors.
+        const fatSector = fatSectors[Math.floor(sector / perSector)]
+        if (fatSector === undefined) return CFB_END_OF_CHAIN
+        const fat = readSector(fatSector)
         return fat === undefined ? CFB_END_OF_CHAIN : fat.readUInt32LE((sector % perSector) * 4)
     }
 
@@ -3555,19 +3595,37 @@ const looksEncryptedOffice = (content: Buffer): boolean => {
     // real encrypted package has around ten, so EncryptedPackage usually sits in the SECOND sector —
     // reading one sector missed exactly the files this exists to recognize, and the tests missed it
     // too because they put the entry at index 1.
-    const nameBytes = ENCRYPTED_PACKAGE_NAME.length + 2 // +2 for the UTF-16LE terminator
+    // Read the whole directory in, so entries can be addressed by index the way the tree does.
+    const directory: Buffer[] = []
+    const visited = new Set<number>()
     const entriesPerSector = sectorSize / CFB_ENTRY_BYTES
+    for (let sector = content.readUInt32LE(48); sector <= CFB_MAX_SECTOR && !visited.has(sector); sector = nextSector(sector)) {
+        visited.add(sector) // a malformed FAT can point a chain at itself
+        const bytes = readSector(sector)
+        if (bytes === undefined) break
+        for (let i = 0; i < entriesPerSector; i++) directory.push(bytes.subarray(i * CFB_ENTRY_BYTES, (i + 1) * CFB_ENTRY_BYTES))
+        if (directory.length > CFB_MAX_DIRECTORY_ENTRIES) break
+    }
+    if (directory.length === 0) return false
+
+    // Entry 0 is the root storage; its children hang off the red-black tree rooted at its CHILD ID
+    // (+76), whose nodes link through left (+68) and right (+72) siblings. Walking that tree is
+    // what keeps this to the file's OWN top-level streams rather than every storage's contents.
+    const nameBytes = ENCRYPTED_PACKAGE_NAME.length + 2 // +2 for the UTF-16LE terminator
+    const isEncryptedPackage = (entry: Buffer): boolean =>
+        entry.readUInt16LE(64) === nameBytes &&
+        entry[66] === CFB_STREAM_TYPE &&
+        entry.subarray(0, ENCRYPTED_PACKAGE_NAME.length).equals(ENCRYPTED_PACKAGE_NAME)
+
     const seen = new Set<number>()
-    for (let sector = content.readUInt32LE(48); sector <= CFB_MAX_SECTOR && !seen.has(sector); sector = nextSector(sector)) {
-        seen.add(sector) // a malformed FAT can point a chain at itself
-        const directory = readSector(sector)
-        if (directory === undefined) break
-        for (let i = 0; i < entriesPerSector; i++) {
-            const pos = i * CFB_ENTRY_BYTES
-            if (directory.readUInt16LE(pos + 64) !== nameBytes) continue
-            if (directory[pos + 66] !== CFB_STREAM_TYPE) continue
-            if (directory.subarray(pos, pos + ENCRYPTED_PACKAGE_NAME.length).equals(ENCRYPTED_PACKAGE_NAME)) return true
-        }
+    const pending = [directory[0].readUInt32LE(76)] // the root storage's child
+    while (pending.length > 0) {
+        const id = pending.pop() as number
+        if (id >= directory.length || seen.has(id)) continue
+        seen.add(id)
+        const entry = directory[id]
+        if (isEncryptedPackage(entry)) return true
+        pending.push(entry.readUInt32LE(68), entry.readUInt32LE(72)) // left and right siblings
     }
     return false
 }

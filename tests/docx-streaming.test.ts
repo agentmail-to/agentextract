@@ -265,6 +265,44 @@ describe('docx — text outside word/document.xml', () => {
         expect(r.emptyReason).toBe('no-text-layer')
     })
 
+    // REGRESSION: only the Transitional DrawingML namespaces were listed, while the reader accepts
+    // ISO Strict — which re-homes DrawingML under purl.oclc.org just as it does WordprocessingML.
+    // An image-only Strict document was reported as holding nothing.
+    it('recognizes an image in a Strict-format document', async () => {
+        const strict = [
+            'xmlns:a="http://purl.oclc.org/ooxml/drawingml/main"',
+            'xmlns:pic="http://purl.oclc.org/ooxml/drawingml/picture"',
+            'xmlns:r="http://purl.oclc.org/ooxml/officeDocument/relationships"',
+        ].join(' ')
+        const r = await extractParts(
+            `<w:p><w:r><w:drawing ${strict}><wp:inline><a:graphic><a:graphicData><pic:pic><pic:blipFill>` +
+                '<a:blip r:embed="rId1"/></pic:blipFill></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r></w:p>',
+            {}
+        )
+        expect(r.emptyReason).toBe('no-text-layer')
+    })
+
+    // REGRESSION: a header or footer logo counted, so an otherwise-empty document on headed paper
+    // claimed to be a scan. Page furniture is not what the document holds.
+    it('does not call a document with only a header logo a scan', async () => {
+        const r = await extractParts('<w:p/>', { 'word/header1.xml': auxPart('hdr', PICTURE) })
+        expect(r.status).toBe('extracted')
+        expect(r.extraction).toBeUndefined()
+        expect(r.emptyReason).not.toBe('no-text-layer')
+    })
+
+    // REGRESSION: a part cut short was compared against earlier headers by its stored PREFIX, so a
+    // clipped "ACME Corp\n\nDRAFT..." matched the letterhead before it — dropping the rest AND
+    // suppressing the truncation, which loses text while reporting a complete document.
+    it('does not mistake a clipped header for a duplicate', async () => {
+        const cap = 'Body.\n\n'.length + 'ACME Corp\n\n'.length + 11
+        const r = await extractParts(text('Body.'), {
+            'word/header1.xml': auxPart('hdr', text('ACME Corp')),
+            'word/header2.xml': auxPart('hdr', text('ACME Corp') + text('DRAFT confidential')),
+        }, { maxOutputChars: cap })
+        expect(r.truncated).toBe(true)
+    })
+
     // REGRESSION: any w:drawing counted, and that wraps every DrawingML object — charts, text boxes,
     // the decorative shapes in a letterhead template. An empty template claimed to be a scan.
     it('does not call a drawing without an image a scan', async () => {

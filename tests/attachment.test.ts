@@ -1265,14 +1265,16 @@ describe('attachment — why an extraction is empty', () => {
         expect(r.emptyReason).toBe('no-text-layer')
     })
 
-    // REGRESSION: "no text on a page" was taken as proof of a scan, so a BLANK page said
-    // 'no-text-layer' and sent an empty document to OCR. A blank page has no text and no image, and
-    // pdf.js names its image operators, so the two are now told apart by asking rather than assuming.
-    it('reports no-text-content for a PDF whose pages are blank rather than scanned', async () => {
+    // REGRESSION, twice over. First "no text on a page" was taken as proof of a scan, so this file
+    // said 'no-text-layer' and went to OCR. Then the opposite: "no image operator" was taken as
+    // proof of emptiness, so it said 'no-text-content' and would be discarded. It is NEITHER —
+    // measured, this page yields no text items and 564 drawing operators, which is what text
+    // outlined as vector paths looks like. The only honest answer is that we cannot tell.
+    it('reports no reason for a PDF page that draws something it cannot read', async () => {
         const r = await extractAttachment({ content: fixture('blank.pdf'), filename: 'blank.pdf' })
         expect(r.status).toBe('extracted')
         expect(r.extraction).toBeUndefined()
-        expect(r.emptyReason).toBe('no-text-content')
+        expect(r.emptyReason).toBeUndefined()
     })
 
     it('reports no-text-content for a zero-byte attachment', async () => {
@@ -1436,24 +1438,36 @@ describe('attachment — why an extraction is empty', () => {
     // boundary, holding the name, its byte length at +64 and the stream type at +66. Built properly
     // because the detector matches the RECORD — a loose byte search declined any legacy .doc that
     // merely mentioned the word, since .doc stores its text in the same UTF-16LE encoding.
-    const encryptedOfficeFile = ({ directorySector = 0 } = {}) => {
-        const name = Buffer.from('EncryptedPackage', 'utf16le')
-        // The Root Entry always comes first; EncryptedPackage is a sibling after it.
-        const root = Buffer.alloc(128)
-        Buffer.from('Root Entry', 'utf16le').copy(root, 0)
-        root.writeUInt16LE('Root Entry'.length * 2 + 2, 64)
-        root[66] = 5 // root storage
-        const entry = Buffer.alloc(128)
-        name.copy(entry, 0)
-        entry.writeUInt16LE(name.length + 2, 64) // byte length, terminator included
-        entry[66] = 2 // stream
+    // A CFB directory entry. left/right/child default to NOSTREAM rather than 0, because 0 is the
+    // root's own ID — zero-filled records make every entry claim the root as its child.
+    const cfbEntry = (name: string, type: number, links: { child?: number; left?: number; right?: number } = {}) => {
+        const b = Buffer.alloc(128)
+        const n = Buffer.from(name, 'utf16le')
+        n.copy(b, 0)
+        b.writeUInt16LE(n.length + 2, 64) // byte length, terminator included
+        b[66] = type
+        b.writeUInt32LE(links.left ?? 0xffffffff, 68)
+        b.writeUInt32LE(links.right ?? 0xffffffff, 72)
+        b.writeUInt32LE(links.child ?? 0xffffffff, 76)
+        return b
+    }
+    const cfbHeader = (directorySector: number, fatSector?: number) => {
         const header = Buffer.alloc(512)
         Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(header, 0)
         header.writeUInt16LE(9, 30) // 512-byte sectors
-        header.writeUInt32LE(directorySector, 48) // where the directory starts
-        const directory = Buffer.concat([root, entry, Buffer.alloc(512 - 256)])
+        header.writeUInt32LE(directorySector, 48)
+        header.writeUInt32LE(fatSector ?? 0xfffffffe, 76)
+        return header
+    }
+    const encryptedOfficeFile = ({ directorySector = 0 } = {}) => {
+        // Root storage, whose child is the EncryptedPackage stream — the link the walk follows.
+        const directory = Buffer.concat([
+            cfbEntry('Root Entry', 5, { child: 1 }),
+            cfbEntry('EncryptedPackage', 2),
+            Buffer.alloc(512 - 256),
+        ])
         // Sector N begins at (N + 1) * sectorSize, so pad out whatever precedes the directory.
-        return Buffer.concat([header, Buffer.alloc(directorySector * 512), directory])
+        return Buffer.concat([cfbHeader(directorySector), Buffer.alloc(directorySector * 512), directory])
     }
 
     it('names a password-protected Office file rather than calling it unrecognized', async () => {
@@ -1467,28 +1481,45 @@ describe('attachment — why an extraction is empty', () => {
     // second sector and went undetected, which is the whole situation this code exists for. The
     // earlier tests missed it because they put the entry at index 1.
     it('names a locked file whose EncryptedPackage sits in a later directory sector', async () => {
-        const entry = (name: string, type: number) => {
-            const b = Buffer.alloc(128)
-            const n = Buffer.from(name, 'utf16le')
-            n.copy(b, 0)
-            b.writeUInt16LE(n.length + 2, 64)
-            b[66] = type
-            return b
-        }
-        const header = Buffer.alloc(512)
-        Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(header, 0)
-        header.writeUInt16LE(9, 30)
-        header.writeUInt32LE(1, 48) // directory starts at sector 1
-        header.writeUInt32LE(0, 76) // the FAT itself lives in sector 0
         const fat = Buffer.alloc(512, 0xff)
         fat.writeUInt32LE(0xfffffffd, 0) // sector 0 is the FAT
         fat.writeUInt32LE(2, 4) // directory sector 1 chains to 2
         fat.writeUInt32LE(0xfffffffe, 8) // and ends there
-        const first = Buffer.concat([entry('Root Entry', 5), entry('DataSpaces', 1), entry('Version', 2), entry('DataSpaceMap', 2)])
-        const second = Buffer.concat([entry('StrongEncryptionDataSpace', 2), entry('EncryptedPackage', 2), Buffer.alloc(256)])
-        const r = await extractAttachment({ content: Buffer.concat([header, fat, first, second]), filename: 'locked.docx' })
+        // Root's children, chained right-sibling to right-sibling across both sectors, so the
+        // EncryptedPackage at index 5 is only reachable by following the tree AND the FAT.
+        const first = Buffer.concat([
+            cfbEntry('Root Entry', 5, { child: 1 }),
+            cfbEntry('DataSpaces', 1, { right: 2 }),
+            cfbEntry('Version', 2, { right: 3 }),
+            cfbEntry('DataSpaceMap', 2, { right: 4 }),
+        ])
+        const second = Buffer.concat([
+            cfbEntry('StrongEncryptionDataSpace', 2, { right: 5 }),
+            cfbEntry('EncryptedPackage', 2),
+            Buffer.alloc(256),
+        ])
+        const content = Buffer.concat([cfbHeader(1, 0), fat, first, second])
+        const r = await extractAttachment({ content, filename: 'locked.docx' })
         expect(r.status).toBe('skipped')
         expect(r.reason).toBe('password-protected')
+    })
+
+    // REGRESSION: every storage in a compound file shares one directory, so matching an entry
+    // anywhere also matched an encrypted object EMBEDDED in a readable document — declining the
+    // carrier as locked while its own text went unread. Only the root's own children count.
+    it('does not call a document locked for embedding an encrypted object', async () => {
+        const directory = Buffer.concat([
+            cfbEntry('Root Entry', 5, { child: 1 }),
+            cfbEntry('WordDocument', 2), // the root's only child: no EncryptedPackage here
+            cfbEntry('ObjectPool', 1), // unreferenced by the root's tree
+            cfbEntry('EncryptedPackage', 2), // the embedded object's stream, inside that pool
+        ])
+        const r = await extractAttachment({
+            content: Buffer.concat([cfbHeader(0), directory]),
+            filename: 'carrier.doc',
+            contentType: 'application/msword',
+        })
+        expect(r.reason).not.toBe('password-protected')
     })
 
     // REGRESSION: the scan was bounded to the first 64 KB, so a real encrypted file whose directory

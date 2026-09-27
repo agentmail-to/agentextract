@@ -82,7 +82,8 @@ moved — not a bad file, so retrying or re-requesting the attachment cannot hel
 When a **complete** read yields no text, `extraction` is omitted and `emptyReason` says why:
 `'no-text-layer'` means the document has content but none of it is text — a scan, a photographed
 page — so OCR is the next step, while `'no-text-content'` means it was read and genuinely holds
-nothing. Exactly one of `extraction` and `emptyReason` is present whenever `truncated` is false.
+nothing. `emptyReason` is only ever set alongside an absent `extraction`, never with text — but the
+two are not exhaustive: an empty result may carry no reason at all, and that is the common case.
 Both are claims about the whole document, so neither is reported for a truncated read: a result with
 no text, no `emptyReason` and `truncated: true` means we stopped before finding text and cannot say
 whether there is any. Only a handler that can *prove* the distinction reports `'no-text-layer'`;
