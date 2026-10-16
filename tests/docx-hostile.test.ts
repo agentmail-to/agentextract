@@ -121,7 +121,7 @@ describe('docx — malformed XML', () => {
     ])('fails on %s rather than extracting nothing', async (_name, documentXml) => {
         const r = await extract(documentXml)
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/w:body/)
+        expect(r.reason).toBe('wrong-document-shape')
     })
 
     // The body assertion is semantic, not a parse error. Visible text directly under w:document
@@ -130,7 +130,7 @@ describe('docx — malformed XML', () => {
         const r = await extract(`<?xml version="1.0"?><w:document ${W}>${para('outside body')}</w:document>`)
         expect(r.status).toBe('failed')
         expect(r.extraction).toBeUndefined()
-        expect(r.reason).toMatch(/w:body/)
+        expect(r.reason).toBe('wrong-document-shape')
     })
 })
 
@@ -197,7 +197,7 @@ describe('docx — archives the handler never sees', () => {
         const content = await zipWith('word/document2.xml', body(para('unreachable')))
         const r = await extractAttachment({ content, contentType: DOCX_TYPE })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toMatch(/unsupported type/)
+        expect(r.reason).toBe('unsupported-format')
     })
 
     // The decompression preflight inflates every entry to measure it, so a corrupt deflate stream is
@@ -214,6 +214,6 @@ describe('docx — archives the handler never sees', () => {
 
         const r = await extractAttachment({ content: corrupt, contentType: DOCX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toBe('malformed zip: unreadable compressed data')
+        expect(r.reason).toBe('malformed')
     })
 })
