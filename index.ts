@@ -12,6 +12,7 @@ export { extractAttachment, detectRoute } from './attachment'
 export type {
     AttachmentInput,
     ExtractOptions,
+    ExtractionReason,
     ExtractionResult,
     ExtractionStatus,
     HandlerKind,

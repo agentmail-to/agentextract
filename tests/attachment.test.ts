@@ -17,9 +17,10 @@ import {
     MAX_UNCOMPRESSED_BYTES,
 } from '../attachment'
 
-// NOTE: result shape is { status, extraction?, reason?, truncated? }; `extraction` is omitted (never
-// '') when a handler runs but produces no text, and `truncated` says whether the document continues
-// past it. Nested emails (.eml) are out of scope in this version and skip.
+// NOTE: result shape is { status, extraction?, reason?, truncated? }; `extraction` is omitted
+// (never '') when a handler runs but produces no text, `truncated` says whether the document
+// continues past it, and `reason` is a CODE on every refusal. Nested emails (.eml) are out of
+// scope in this version and skip.
 
 // Real fixtures generated once with macOS textutil (.docx) and cupsfilter (.pdf), and exceljs (.xlsx).
 // vitest runs from the repo root, so resolve against cwd.
@@ -447,7 +448,7 @@ describe('attachment — safety gates', () => {
         const r = await extractAttachment({ content, contentType: 'text/plain', filename: 'big.txt' })
         expect(r.status).toBe('skipped')
         expect(r.extraction).toBeUndefined()
-        expect(r.reason).toContain(`${MAX_INPUT_BYTES + 1}`)
+        expect(r.reason).toBe('too-large')
     })
 
     // A handler that succeeds but yields no text is a terminal, valid outcome: extracted, no extraction.
@@ -577,7 +578,10 @@ describe('attachment — pdf handler', () => {
                 truncated: false,
             })
             fail = true
-            expect(await extract(input)).toMatchObject({ status: 'failed', reason: 'page failed' })
+            // An error escaping a third-party parser is the file's fault by default, which is what
+            // 'malformed' says. The point of the case is that teardown rejecting afterwards does not
+            // replace it, so the reason belongs to the parse and not to the cleanup.
+            expect(await extract(input)).toMatchObject({ status: 'failed', reason: 'malformed' })
         } finally {
             vi.doUnmock('unpdf')
             vi.resetModules()
@@ -833,7 +837,7 @@ describe('attachment — xlsx handler', () => {
             contentType: XLSX_TYPE,
         })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/shared-string index exceeds/i)
+        expect(r.reason).toBe('malformed')
     })
 
     it('fails explicitly when cells reference a missing shared-string table', async () => {
@@ -849,7 +853,7 @@ describe('attachment — xlsx handler', () => {
         })
         expect(r.status).toBe('failed')
         expect(r.extraction).toBeUndefined()
-        expect(r.reason).toMatch(/missing shared-string table/i)
+        expect(r.reason).toBe('malformed')
     })
 
     // A formula cell must extract its computed VALUE, not the "=SUM(...)" formula string.
@@ -1068,7 +1072,7 @@ describe('attachment — xlsx handler', () => {
             contentType: XLSX_TYPE,
         })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/XML nesting exceeds 256 elements/)
+        expect(r.reason).toBe('malformed')
     })
 
     it('rejects an incomplete shared-string table instead of silently dropping later cells', async () => {
@@ -1087,7 +1091,7 @@ describe('attachment — xlsx handler', () => {
             contentType: XLSX_TYPE,
         })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/unclosed XLSX control XML/)
+        expect(r.reason).toBe('malformed')
     })
 
     it('rejects an incomplete styles table at natural EOF', async () => {
@@ -1105,7 +1109,7 @@ describe('attachment — xlsx handler', () => {
             contentType: XLSX_TYPE,
         })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/unclosed XLSX control XML/)
+        expect(r.reason).toBe('malformed')
     })
 
     // A workbook with only empty sheets parses fine but yields no rows: extracted, no extraction.
@@ -1165,13 +1169,234 @@ describe('attachment — xlsx handler', () => {
         expect(detectRoute(input).kind).toBe('xlsx')
         const r = await extractAttachment(input)
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/malformed zip/i)
+        expect(r.reason).toBe('malformed')
     })
 })
 
 // Output cap -----------------------------------------------------------------
 // Input is byte-capped, but output isn't proportional to input — cap it centrally so a
 // pathological/large document can't dump megabytes of text into S3 + the search index.
+
+// Password-protected files are intact bytes we decline, not broken ones we failed on, and routing
+// sees an OLE container where it expected a zip. These pin that the refusal says so.
+describe('attachment — password-protected files', () => {
+    // A CFB directory entry as Office actually writes one: a fixed 128-byte record at a 128-byte
+    // boundary, holding the name, its byte length at +64 and the stream type at +66. Built properly
+    // because the detector matches the RECORD — a loose byte search declined any legacy .doc that
+    // merely mentioned the word, since .doc stores its text in the same UTF-16LE encoding.
+    // A CFB directory entry. left/right/child default to NOSTREAM rather than 0, because 0 is the
+    // root's own ID — zero-filled records make every entry claim the root as its child.
+    const cfbEntry = (name: string, type: number, links: { child?: number; left?: number; right?: number } = {}) => {
+        const b = Buffer.alloc(128)
+        const n = Buffer.from(name, 'utf16le')
+        n.copy(b, 0)
+        b.writeUInt16LE(n.length + 2, 64) // byte length, terminator included
+        b[66] = type
+        b.writeUInt32LE(links.left ?? 0xffffffff, 68)
+        b.writeUInt32LE(links.right ?? 0xffffffff, 72)
+        b.writeUInt32LE(links.child ?? 0xffffffff, 76)
+        return b
+    }
+    const cfbHeader = (directorySector: number, fatSector?: number) => {
+        const header = Buffer.alloc(512)
+        Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(header, 0)
+        header.writeUInt16LE(9, 30) // 512-byte sectors
+        header.writeUInt32LE(directorySector, 48)
+        header.writeUInt32LE(fatSector ?? 0xfffffffe, 76)
+        return header
+    }
+    const encryptedOfficeFile = ({ directorySector = 0 } = {}) => {
+        // Root storage, whose child is the EncryptedPackage stream — the link the walk follows.
+        const directory = Buffer.concat([
+            cfbEntry('Root Entry', 5, { child: 1 }),
+            cfbEntry('EncryptedPackage', 2),
+            Buffer.alloc(512 - 256),
+        ])
+        // Sector N begins at (N + 1) * sectorSize, so pad out whatever precedes the directory.
+        return Buffer.concat([cfbHeader(directorySector), Buffer.alloc(directorySector * 512), directory])
+    }
+
+    it('names a password-protected Office file rather than calling it unrecognized', async () => {
+        const r = await extractAttachment({ content: encryptedOfficeFile(), filename: 'locked.docx' })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toBe('password-protected')
+    })
+
+    // REGRESSION: only the FIRST directory sector was read, and a 512-byte sector holds four
+    // entries while a real encrypted package has about ten — so EncryptedPackage usually sits in the
+    // second sector and went undetected, which is the whole situation this code exists for. The
+    // earlier tests missed it because they put the entry at index 1.
+    it('names a locked file whose EncryptedPackage sits in a later directory sector', async () => {
+        const fat = Buffer.alloc(512, 0xff)
+        fat.writeUInt32LE(0xfffffffd, 0) // sector 0 is the FAT
+        fat.writeUInt32LE(2, 4) // directory sector 1 chains to 2
+        fat.writeUInt32LE(0xfffffffe, 8) // and ends there
+        // Root's children, chained right-sibling to right-sibling across both sectors, so the
+        // EncryptedPackage at index 5 is only reachable by following the tree AND the FAT.
+        const first = Buffer.concat([
+            cfbEntry('Root Entry', 5, { child: 1 }),
+            cfbEntry('DataSpaces', 1, { right: 2 }),
+            cfbEntry('Version', 2, { right: 3 }),
+            cfbEntry('DataSpaceMap', 2, { right: 4 }),
+        ])
+        const second = Buffer.concat([
+            cfbEntry('StrongEncryptionDataSpace', 2, { right: 5 }),
+            cfbEntry('EncryptedPackage', 2),
+            Buffer.alloc(256),
+        ])
+        const content = Buffer.concat([cfbHeader(1, 0), fat, first, second])
+        const r = await extractAttachment({ content, filename: 'locked.docx' })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toBe('password-protected')
+    })
+
+    // REGRESSION: every storage in a compound file shares one directory, so matching an entry
+    // anywhere also matched an encrypted object EMBEDDED in a readable document — declining the
+    // carrier as locked while its own text went unread. Only the root's own children count.
+    it('does not call a document locked for embedding an encrypted object', async () => {
+        const directory = Buffer.concat([
+            cfbEntry('Root Entry', 5, { child: 1 }),
+            cfbEntry('WordDocument', 2), // the root's only child: no EncryptedPackage here
+            cfbEntry('ObjectPool', 1), // unreferenced by the root's tree
+            cfbEntry('EncryptedPackage', 2), // the embedded object's stream, inside that pool
+        ])
+        const r = await extractAttachment({
+            content: Buffer.concat([cfbHeader(0), directory]),
+            filename: 'carrier.doc',
+            contentType: 'application/msword',
+        })
+        expect(r.reason).not.toBe('password-protected')
+    })
+
+    // REGRESSION: the scan was bounded to the first 64 KB, so a real encrypted file whose directory
+    // sits further in came back unrecognized. The header names where its directory is, so distance
+    // stopped mattering once we seek there instead of hunting for records that look like one.
+    it('names a locked file whose directory sits well past the sniff window', async () => {
+        const content = encryptedOfficeFile({ directorySector: 300 }) // ~150 KB in
+        expect(content.length).toBeGreaterThan(64 * 1024)
+        const r = await extractAttachment({ content, filename: 'locked.docx' })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toBe('password-protected')
+    })
+
+    // REGRESSION: matching any record-shaped bytes anywhere also matched the directory of an OLE
+    // object EMBEDDED in another file — so a .doc carrying an encrypted attachment was declined as
+    // locked and its own text went unread. Only the directory this file's header points at is its.
+    it('does not call a file locked for embedding an encrypted object', async () => {
+        const header = Buffer.alloc(512)
+        Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(header, 0)
+        header.writeUInt16LE(9, 30)
+        header.writeUInt32LE(0, 48) // this file's own directory: sector 0, holding no such stream
+        const ownDirectory = Buffer.alloc(512)
+        Buffer.from('Root Entry', 'utf16le').copy(ownDirectory, 0)
+        ownDirectory.writeUInt16LE('Root Entry'.length * 2 + 2, 64)
+        ownDirectory[66] = 5
+        // A whole encrypted package sitting in one of this file's streams, further in.
+        const content = Buffer.concat([header, ownDirectory, encryptedOfficeFile()])
+        const r = await extractAttachment({ content, filename: 'carrier.doc', contentType: 'application/msword' })
+        expect(r.reason).not.toBe('password-protected')
+    })
+
+    // REGRESSION: the detector searched the head for the UTF-16LE name, and .doc stores body text in
+    // exactly that encoding — so a document ABOUT encrypted packages was declined as one.
+    it('does not call a .doc password-protected for merely containing the words', async () => {
+        const header = Buffer.alloc(512)
+        Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]).copy(header, 0)
+        const body = Buffer.from('Please see the EncryptedPackage spec.', 'utf16le')
+        const content = Buffer.concat([header, Buffer.alloc(96), body, Buffer.alloc(1_024)])
+        const r = await extractAttachment({ content, filename: 'notes.doc', contentType: 'application/msword' })
+        expect(r.reason).not.toBe('password-protected')
+    })
+
+    // The marker is what earns the label; an OLE file without it is still a legacy binary we may or
+    // may not read, and must not be relabeled as locked.
+    it('does not call an ordinary OLE file password-protected', async () => {
+        const r = await extractAttachment({ content: fixture('sample.doc'), filename: 'sample.doc' })
+        expect(r.status).toBe('extracted')
+    })
+
+    // REGRESSION: the check sat inside the no-handler branch, so an encrypted package named .doc —
+    // an OLE container, which carries exactly the magic the legacy handler routes on — reached
+    // word-extractor, threw, and came back 'malformed', which the codes define as never retryable.
+    // Whether we happen to have a handler says nothing about whether the content is ours to read.
+    it('names a locked file even when its extension routes to a handler', async () => {
+        const content = encryptedOfficeFile()
+        const r = await extractAttachment({ content, filename: 'locked.doc', contentType: 'application/msword' })
+        expect(r.status).toBe('skipped')
+        expect(r.reason).toBe('password-protected')
+    })
+
+    // REGRESSION: the match was `name === 'PasswordException' || /password/i.test(message)`, so any
+    // parser error quoting a sheet name, field or tag containing the word relabelled a broken file
+    // as an intact locked one — skipped instead of failed, and "ask the sender" instead of "retry".
+    it('does not call a parse error password-protected for mentioning the word', async () => {
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => {
+                throw new Error('bad xref entry near field "Password"')
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content: buf('%PDF-1.4 broken'), contentType: 'application/pdf' })
+            expect(r.status).toBe('failed')
+            expect(r.reason).toBe('malformed')
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
+
+    // A parser that cannot be LOADED never ran, so the attachment is not what is broken. Reporting
+    // 'malformed' told a caller their file was bad and not to retry, when the truth is a deployment
+    // is missing a dependency — the one unexpected-throw class unambiguous enough to name.
+    //
+    // This raises the module-not-found error from inside the handler rather than from a failing
+    // import, because vitest's doMock does not propagate a throwing factory to the importer. So it
+    // pins the MAPPING (an ERR_MODULE_NOT_FOUND-shaped error becomes 'internal') and not the path
+    // that produces it; the origin is a one-line code check either way.
+    it('reports a module-not-found error as internal, not as a malformed file', async () => {
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => {
+                const error = new Error("Cannot find module 'pdfjs-dist'") as Error & { code?: string }
+                error.code = 'ERR_MODULE_NOT_FOUND'
+                throw error
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content: buf('%PDF-1.4 mock'), contentType: 'application/pdf' })
+            expect(r.status).toBe('failed')
+            expect(r.reason).toBe('internal')
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
+
+    // pdf.js refuses an encrypted document by throwing, so there is nothing to sniff — the error is
+    // the signal. Same situation, same answer: skipped and locked, not failed and broken.
+    it('names a password-protected PDF rather than calling it malformed', async () => {
+        vi.resetModules()
+        vi.doMock('unpdf', () => ({
+            getDocumentProxy: async () => {
+                const error = new Error('No password given')
+                error.name = 'PasswordException'
+                throw error
+            },
+        }))
+        try {
+            const { extractAttachment: extract } = await import('../attachment')
+            const r = await extract({ content: buf('%PDF-1.4 locked'), contentType: 'application/pdf' })
+            expect(r.status).toBe('skipped')
+            expect(r.reason).toBe('password-protected')
+        } finally {
+            vi.doUnmock('unpdf')
+            vi.resetModules()
+        }
+    })
+})
 
 describe('attachment — output cap', () => {
     // Over-cap output is bounded to exactly MAX_OUTPUT_CHARS (silently — no truncation flag).
@@ -1471,7 +1696,7 @@ describe('attachment — edge cases (regression)', () => {
             await vi.advanceTimersByTimeAsync(HANDLER_TIMEOUT_MS + 10)
             const r = await pending
             expect(r.status).toBe('failed')
-            expect(r.reason).toMatch(new RegExp(`handler exceeded ${HANDLER_TIMEOUT_MS}ms`))
+            expect(r.reason).toBe('timed-out')
             expect(r.extraction).toBeUndefined()
         } finally {
             vi.useRealTimers()
@@ -1645,7 +1870,10 @@ describe('attachextract — OOXML decompression preflight', () => {
         })
         try {
             const r = await extractAttachment({ content: fixture('sample.xlsx'), contentType: XLSX_TYPE })
-            expect(r).toEqual({ status: 'failed', reason: 'inflate setup failed' })
+            // Labeled rather than thrown, which is the whole assertion. It lands on 'malformed'
+            // because an unrecognized throw is attributed to the bytes — see failureReason, and the
+            // note there that a genuine bug of ours reaching here is reported the same way.
+            expect(r).toEqual({ status: 'failed', reason: 'malformed' })
         } finally {
             createInflate.mockRestore()
         }
@@ -1700,7 +1928,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         const bomb = craftOoxmlZip(overCapContent())
         const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toMatch(/decompress/i)
+        expect(r.reason).toBe('expands-too-large')
         expect(r.extraction).toBeUndefined()
     })
 
@@ -1721,7 +1949,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         const bomb = craftOoxmlZip(overCapContent(), { declaredUncompressed: 100 })
         const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toMatch(/decompress/i)
+        expect(r.reason).toBe('expands-too-large')
         expect(r.extraction).toBeUndefined()
     })
 
@@ -1737,7 +1965,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         ]) {
             const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
             expect(r.status).toBe('skipped')
-            expect(r.reason).toMatch(/zip64|out-of-range/i)
+            expect(r.reason).toBe('unsupported-zip-feature')
             expect(r.extraction).toBeUndefined()
         }
     })
@@ -1753,7 +1981,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         for (const [, bomb] of cases) {
             const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
             expect(r.status).toBe('failed')
-            expect(r.reason).toMatch(/malformed zip/i)
+            expect(r.reason).toBe('malformed')
             expect(r.extraction).toBeUndefined()
         }
     })
@@ -1796,7 +2024,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         // the earlier tiny CD and wave it through to a parser that would inflate the bomb.
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toMatch(/decompress/i)
+        expect(r.reason).toBe('expands-too-large')
     })
 
     // AGREEMENT INVARIANT 1 — the central directory must end exactly where the EOCD begins.
@@ -1832,7 +2060,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         // So measuring the decoy at the raw cdOffset would approve a bomb. Reject the layout instead.
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/does not end at the end-of-central-directory/i)
+        expect(r.reason).toBe('malformed')
         expect(r.extraction).toBeUndefined()
     })
 
@@ -1864,7 +2092,7 @@ describe('attachextract — OOXML decompression preflight', () => {
 
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/more records than it declares/i)
+        expect(r.reason).toBe('malformed')
         expect(r.extraction).toBeUndefined()
     })
 
@@ -1896,7 +2124,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         const file = Buffer.concat([junk, eocd(1, junk.length, 0)]) // 0 + junk.length === eocdPos
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/truncated or misaligned central directory/i)
+        expect(r.reason).toBe('malformed')
     })
 
     // When the central directory cannot be walked, ooxmlKind falls back to scanning raw bytes for a
@@ -1933,7 +2161,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         const bomb = craftOoxmlZip(buf('<workbook/>'), { entryCompSize: 0x0ffffff0 }) // huge, but not the ZIP64 sentinel
         const r = await extractAttachment({ content: bomb, contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/runs past end of file/i)
+        expect(r.reason).toBe('malformed')
     })
 
     // Distinct from "too big": the stream cannot be read at all. Fail closed rather than treat an
@@ -1945,14 +2173,14 @@ describe('attachextract — OOXML decompression preflight', () => {
         const file = Buffer.concat([local, cd, eocd(1, cd.length, local.length)])
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/unreadable compressed data/i)
+        expect(r.reason).toBe('malformed')
     })
 
     it('fails closed on a compression method it cannot measure', async () => {
         const zip = craftOoxmlZip(buf('<workbook/>'), { method: 12 }) // 12 = bzip2; we only measure store/deflate
         const r = await extractAttachment({ content: zip, contentType: XLSX_TYPE })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toMatch(/unsupported compression method 12/i)
+        expect(r.reason).toBe('unsupported-zip-feature')
     })
 
     // The budget is ARCHIVE-wide, not per-entry. A stored entry cannot exceed the cap on its own
@@ -1967,7 +2195,7 @@ describe('attachextract — OOXML decompression preflight', () => {
         const file = Buffer.concat([l1, l2, c1, c2, eocd(2, c1.length + c2.length, l1.length + l2.length)])
         const r = await extractAttachment({ content: file, contentType: XLSX_TYPE })
         expect(r.status).toBe('skipped')
-        expect(r.reason).toMatch(/decompresses to over/i)
+        expect(r.reason).toBe('expands-too-large')
     })
 
     // An OOXML-shaped zip with NEITHER root part (a .pptx, a .jar, a plain archive) is not something
@@ -3094,9 +3322,12 @@ describe('attachment — xlsx sheet identity comes from the workbook', () => {
         })
 
         const r = await extractAttachment({ content, contentType: XLSX_TYPE })
-        expect(r.status).toBe('failed')
+        // The workbook part is padded past MAX_METADATA_BYTES, so this is OUR cap declining to
+        // materialize it — not the workbook being the wrong shape. `skipped`, because the file is
+        // intact and we refused it, which is the same answer every other budget gives.
+        expect(r.status).toBe('skipped')
         expect(r.extraction).toBeUndefined()
-        expect(r.reason).toMatch(/no worksheet parts could be identified/i)
+        expect(r.reason).toBe('expands-too-large')
     })
 
     it('resolves escaped OPC worksheet paths without decoding them away from the ZIP item', async () => {
@@ -3278,7 +3509,7 @@ describe('attachment — the rebuild cannot amplify what the budget measured', (
 
             const r = await extractAttachment({ content, contentType: XLSX_TYPE })
             expect(r.status).toBe('failed')
-            expect(r.reason).toMatch(/duplicate control part xl\/sharedStrings\.xml/i)
+            expect(r.reason).toBe('malformed')
         }
     )
 
@@ -3640,7 +3871,7 @@ describe('attachment — xlsx lost-worksheet backstop', () => {
         vi.resetModules()
 
         expect(r.status).toBe('failed')
-        expect(r.reason).toMatch(/yielded 2 of 3 worksheets/)
+        expect(r.reason).toBe('internal')
     })
 
     it('fails fast when the pinned ExcelJS streaming hooks are unavailable', async () => {
@@ -3664,7 +3895,7 @@ describe('attachment — xlsx lost-worksheet backstop', () => {
             const { extractAttachment: extract } = await import('../attachment')
             const r = await extract({ content, contentType: XLSX_TYPE })
             expect(r.status).toBe('failed')
-            expect(r.reason).toMatch(/no _parseStyles; expected the 4\.4\.0 internals/)
+            expect(r.reason).toBe('internal')
         } finally {
             vi.doUnmock('exceljs')
             vi.resetModules()
@@ -3790,9 +4021,11 @@ describe('attachment — xlsx archive rewrite limits', () => {
         async () => {
             // 65533 real entries + two injected control parts = 65535 = 0xffff.
             const r = await extractAttachment({ content: zipWithEntryCount(0xffff - 2), contentType: XLSX_TYPE })
-            expect(r.status).toBe('failed')
-            expect(r.reason).toMatch(/0xffff count sentinel/)
-            expect(r.reason).not.toMatch(/central directory could not be read/)
+            // `skipped`, not `failed`: the archive is intact and we decline the variant, which is
+            // the same answer the decompression budget gives ZIP64 for the same reason. The status
+            // is derived from the reason now, so one fact cannot come back under two statuses.
+            expect(r.status).toBe('skipped')
+            expect(r.reason).toBe('unsupported-zip-feature')
         },
         BOUNDARY_TIMEOUT_MS
     )
